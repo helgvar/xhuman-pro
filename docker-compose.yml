@@ -1,0 +1,49 @@
+services:
+  db:
+    hostname: "${WARDEN_ENV_NAME}-db"
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-xhumanpro}
+      POSTGRES_USER: ${POSTGRES_USER:-xhumanpro}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-xhumanpro2026}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U xhumanpro"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  backend:
+    hostname: "${WARDEN_ENV_NAME}-backend"
+    build: ./backend
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-xhumanpro}:${POSTGRES_PASSWORD:-xhumanpro2026}@db:5432/${POSTGRES_DB:-xhumanpro}
+      JWT_SECRET: ${JWT_SECRET:-xhp-jwt-secret-change-in-production-2026}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:-xhp-encryption-key-change-in-prod-32ch}
+      PORT: "3001"
+      PUPPETEER_EXECUTABLE_PATH: /usr/bin/chromium-browser
+      ZOMBIE_FTP_HOST: ${ZOMBIE_FTP_HOST:-}
+      ZOMBIE_FTP_USER: ${ZOMBIE_FTP_USER:-}
+      ZOMBIE_FTP_PASSWORD: ${ZOMBIE_FTP_PASSWORD:-}
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  frontend:
+    hostname: "${WARDEN_ENV_NAME}-frontend"
+    build: ./frontend
+    depends_on:
+      - backend
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.${WARDEN_ENV_NAME}-frontend.tls=true
+      - traefik.http.routers.${WARDEN_ENV_NAME}-frontend.rule=Host(`${TRAEFIK_SUBDOMAIN}.${TRAEFIK_DOMAIN}`)
+      - traefik.http.services.${WARDEN_ENV_NAME}-frontend.loadbalancer.server.port=3000
+      - traefik.docker.network=${WARDEN_ENV_NAME}_default
+    restart: unless-stopped
+
+volumes:
+  pgdata:

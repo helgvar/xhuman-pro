@@ -1,0 +1,85 @@
+const express = require('express');
+const cors = require('cors');
+const fs = require('fs');
+const path = require('path');
+
+// Load .env
+const envPath = path.join(__dirname, '.env');
+if (fs.existsSync(envPath)) {
+  fs.readFileSync(envPath, 'utf8').split('\n').forEach(line => {
+    const [key, ...val] = line.split('=');
+    if (key && val.length) process.env[key.trim()] = val.join('=').trim();
+  });
+}
+
+const { initDB } = require('./db/pool');
+
+const app = express();
+const PORT = process.env.PORT || 3001;
+
+app.use(cors());
+app.use(express.json());
+
+// Health check
+app.get('/api/health', (req, res) => {
+  res.json({ status: 'ok', app: 'xHUMANPRO', version: '1.0.0' });
+});
+
+// Auth routes (public)
+const authRoutes = require('./routes/auth');
+app.use('/api/auth', authRoutes);
+
+// Protected routes
+const tenantsRoutes = require('./routes/tenants');
+const usersRoutes = require('./routes/users');
+const ordersRoutes = require('./routes/orders');
+const productsRoutes = require('./routes/products');
+const scraperRoutes = require('./routes/scraper');
+const trovaprezziRoutes = require('./routes/trovaprezzi');
+const merchantCenterRoutes = require('./routes/merchantCenter');
+const optimizationRoutes = require('./routes/optimization');
+const ga4Routes = require('./routes/ga4');
+const externalApiRoutes = require('./routes/externalApi');
+app.use('/api/tenants', tenantsRoutes);
+app.use('/api/users', usersRoutes);
+app.use('/api/orders', ordersRoutes);
+app.use('/api/products', productsRoutes);
+app.use('/api/scraper', scraperRoutes);
+app.use('/api/trovaprezzi', trovaprezziRoutes);
+app.use('/api/merchant-center', merchantCenterRoutes);
+app.use('/api/optimization', optimizationRoutes);
+app.use('/api/ga4', ga4Routes);
+app.use('/api/external/v1', externalApiRoutes);
+
+// Start server
+async function start() {
+  try {
+    await initDB();
+    console.log('[DB] Database initialized');
+
+    // Start order sync cron
+    const { startOrderSync } = require('./services/orderSync');
+    startOrderSync();
+
+    // Start product sync cron (every 2h, offset 1h from startup)
+    const { startProductSync } = require('./services/productSync');
+    startProductSync();
+
+    // Start zombie Trovaprezzi cron (daily at 00:05)
+    const { startZombieCron } = require('./services/zombieCron');
+    startZombieCron();
+
+    // Start product health enrichment cron (every 4h)
+    const { startHealthCron } = require('./services/healthCron');
+    startHealthCron();
+
+    app.listen(PORT, '0.0.0.0', () => {
+      console.log(`[xHUMANPRO] Backend running on http://0.0.0.0:${PORT}`);
+    });
+  } catch (err) {
+    console.error('[xHUMANPRO] Failed to start:', err.message);
+    process.exit(1);
+  }
+}
+
+start();

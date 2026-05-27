@@ -4,7 +4,7 @@ const { isJobRunning } = require('./requestQueue');
 
 const SYNC_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
 const SYNC_DAYS_BACK = 3;
-const STAGGER_DELAY_MS = 30 * 1000;      // 30s delay between tenants (avoid parallel API calls)
+const STAGGER_DELAY_MS = 60 * 1000;      // 60s delay between tenants (avoid parallel API calls)
 
 let syncRunning = false;
 
@@ -73,7 +73,11 @@ async function syncAllTenants() {
 }
 
 function startOrderSync() {
-  console.log(`[OrderSync] Cron started - every ${SYNC_INTERVAL_MS / 60000}min, ${SYNC_DAYS_BACK} days back, ${STAGGER_DELAY_MS / 1000}s stagger`);
+  console.log(`[OrderSync] Cron started - every ${SYNC_INTERVAL_MS / 60000}min, ${SYNC_DAYS_BACK} days back, ${STAGGER_DELAY_MS / 1000}s stagger; first run in 30s`);
+  // First run immediate (30s dopo boot per dare tempo al DB), poi ogni SYNC_INTERVAL_MS
+  setTimeout(() => {
+    syncAllTenants().catch(e => console.error('[OrderSync] First-run error:', e.message));
+  }, 30000);
   setInterval(syncAllTenants, SYNC_INTERVAL_MS);
 }
 

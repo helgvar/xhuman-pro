@@ -60,15 +60,18 @@ router.get('/overview', requireRole('superadmin', 'admin', 'viewer'), async (req
       [tenantId]
     );
 
-    // Top 10 most clicked products (latest date)
+    // Top 10 most clicked products (all days aggregated)
     const { rows: topClicked } = await pool.query(
-      `SELECT zc.product_code, zc.product_name, zc.trovaprezzi_category, zc.clicks,
+      `SELECT zc.product_code,
+              (array_agg(zc.product_name ORDER BY zc.fetch_date DESC))[1] as product_name,
+              (array_agg(zc.trovaprezzi_category ORDER BY zc.fetch_date DESC))[1] as trovaprezzi_category,
+              SUM(zc.clicks) as clicks,
               p.sell_price, p.erp_cost, p.margin_pct, p.erp_stock, p.supplier_stock
        FROM zombie_clicks zc
        LEFT JOIN products p ON p.sku = zc.product_code AND p.tenant_id = $1
        WHERE zc.tenant_id = $1
-         AND zc.fetch_date = (SELECT MAX(fetch_date) FROM zombie_clicks WHERE tenant_id = $1)
-       ORDER BY zc.clicks DESC
+       GROUP BY zc.product_code, p.sell_price, p.erp_cost, p.margin_pct, p.erp_stock, p.supplier_stock
+       ORDER BY SUM(zc.clicks) DESC
        LIMIT 10`,
       [tenantId]
     );
@@ -128,6 +131,67 @@ router.get('/overview', requireRole('superadmin', 'admin', 'viewer'), async (req
     });
   } catch (err) {
     console.error('[Trovaprezzi] Overview error:', err.message);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// GET /api/trovaprezzi/rivals - Direct rivals: merchants competing on the same products
+router.get('/rivals', requireRole('superadmin', 'admin', 'viewer'), async (req, res) => {
+  try {
+    const tenantId = req.tenantId;
+
+    // Get tenant's seller name
+    const { rows: sellerRows } = await pool.query(
+      `SELECT config_value FROM tenant_configs WHERE tenant_id = $1 AND config_key = 'trovaprezzi_seller_name'`,
+      [tenantId]
+    );
+    if (sellerRows.length === 0) return res.json({ rivals: [], sellerName: null });
+
+    let sellerName;
+    try { sellerName = require('../services/crypto').decrypt(sellerRows[0].config_value); }
+    catch { sellerName = sellerRows[0].config_value; }
+
+    // Find all products where this seller appears
+    // Then find all OTHER sellers on those same products
+    // Count battles, wins (our position < their position), losses
+    // Use exact match for better index performance on large tables
+    const { rows: rivals } = await pool.query(`
+      WITH my_products AS (
+        SELECT product_code, position as my_position, base_price as my_price
+        FROM scraper_competitors
+        WHERE merchant = $1
+      ),
+      battles AS (
+        SELECT
+          sc.merchant as rival,
+          COUNT(*) as battles,
+          COUNT(*) FILTER (WHERE mp.my_position < sc.position) as i_win,
+          COUNT(*) FILTER (WHERE mp.my_position > sc.position) as they_win,
+          COUNT(*) FILTER (WHERE mp.my_position = sc.position) as tie,
+          ROUND(AVG(sc.base_price)::numeric, 2) as rival_avg_price,
+          ROUND(AVG(mp.my_price)::numeric, 2) as my_avg_price,
+          ROUND(AVG(sc.position)::numeric, 1) as rival_avg_position,
+          ROUND(AVG(mp.my_position)::numeric, 1) as my_avg_position,
+          COUNT(DISTINCT sc.product_code) as shared_products
+        FROM my_products mp
+        JOIN scraper_competitors sc ON sc.product_code = mp.product_code
+          AND sc.merchant != $1
+        GROUP BY sc.merchant
+      )
+      SELECT rival, battles, i_win, they_win, tie, shared_products,
+             rival_avg_price, my_avg_price,
+             rival_avg_position, my_avg_position,
+             ROUND((i_win::numeric / NULLIF(battles, 0) * 100), 1) as win_rate,
+             ROUND(((my_avg_price - rival_avg_price) / NULLIF(rival_avg_price, 0) * 100)::numeric, 1) as price_gap_pct
+      FROM battles
+      WHERE battles >= 10
+      ORDER BY battles DESC
+      LIMIT 30
+    `, [sellerName]);
+
+    res.json({ sellerName, rivals, totalProducts: rivals.length > 0 ? rivals[0].shared_products : 0 });
+  } catch (err) {
+    console.error('[Trovaprezzi] Rivals error:', err.message);
     res.status(500).json({ error: 'Internal server error' });
   }
 });

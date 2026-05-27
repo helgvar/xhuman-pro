@@ -80,10 +80,29 @@ export default function TenantConfig() {
     setMessage('');
     try {
       const toSave = {};
+      const urlsAutoFixed = [];
       for (const field of CONFIG_FIELDS) {
-        if (config[field.key] && config[field.key] !== '********') {
-          toSave[field.key] = config[field.key];
+        let value = config[field.key];
+        if (value && value !== '********') {
+          // Notifica + auto-fix campi URL senza schema (https://)
+          const isUrlField = /url/i.test(field.key);
+          if (isUrlField && !/^https?:\/\//i.test(String(value).trim())) {
+            const fixed = 'https://' + String(value).trim().replace(/^\/+/, '');
+            urlsAutoFixed.push(`${field.label}: "${value}" → "${fixed}"`);
+            value = fixed;
+            setConfig(prev => ({ ...prev, [field.key]: fixed }));
+          }
+          toSave[field.key] = value;
         }
+      }
+
+      if (urlsAutoFixed.length > 0) {
+        const proceed = window.confirm(
+          'Attenzione: i seguenti URL non includevano "https://" e sono stati corretti automaticamente:\n\n' +
+          urlsAutoFixed.join('\n') +
+          '\n\nVuoi salvare con i valori corretti?'
+        );
+        if (!proceed) { setSaving(false); return; }
       }
 
       const res = await authFetch(`/api/tenants/${effectiveTenantId}/config`, {

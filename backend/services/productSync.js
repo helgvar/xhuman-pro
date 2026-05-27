@@ -1,9 +1,10 @@
 const { pool } = require('../db/pool');
 const { importProducts } = require('./farmaboosterProducts');
 const { isJobRunning } = require('./requestQueue');
+const { withTenantLock, farmaboosterQueue } = require('./apiQueue');
 
-const SYNC_INTERVAL_MS = 2 * 60 * 60 * 1000; // 2 hours
-const STAGGER_DELAY_MS = 30 * 1000;           // 30s delay between tenants
+const SYNC_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6 hours (catalogo non cambia spesso, riduce carico su FB)
+const STAGGER_DELAY_MS = 60 * 1000;           // 60s delay between tenants (protegge FB server)
 
 let syncRunning = false;
 
@@ -34,27 +35,31 @@ async function syncAllProducts() {
     for (let i = 0; i < tenants.length; i++) {
       const tenant = tenants[i];
 
+      // Skip if circuit breaker is open
+      if (farmaboosterQueue.isOpen()) {
+        console.log(`[ProductSync] Circuit breaker OPEN, skipping remaining tenants`);
+        break;
+      }
+
       if (isJobRunning(tenant.id, 'products_import')) {
         console.log(`[ProductSync] Tenant "${tenant.name}" has import running, skipping`);
         continue;
       }
 
       try {
-        const { rows } = await pool.query(
-          `INSERT INTO import_jobs (tenant_id, job_type, status, metadata)
-           VALUES ($1, 'products_sync', 'pending', $2) RETURNING id`,
-          [tenant.id, JSON.stringify({ trigger: 'cron' })]
-        );
+        // Tenant serialization: one at a time via global lock
+        await withTenantLock(tenant.id, async () => {
+          const { rows } = await pool.query(
+            `INSERT INTO import_jobs (tenant_id, job_type, status, metadata)
+             VALUES ($1, 'products_sync', 'pending', $2) RETURNING id`,
+            [tenant.id, JSON.stringify({ trigger: 'cron' })]
+          );
 
-        await importProducts(tenant.id, rows[0].id);
-        console.log(`[ProductSync] Tenant "${tenant.name}" sync complete`);
+          await importProducts(tenant.id, rows[0].id);
+          console.log(`[ProductSync] Tenant "${tenant.name}" sync complete`);
+        });
       } catch (err) {
         console.error(`[ProductSync] Tenant "${tenant.name}" sync failed:`, err.message);
-      }
-
-      if (i < tenants.length - 1 && STAGGER_DELAY_MS > 0) {
-        console.log(`[ProductSync] Waiting ${STAGGER_DELAY_MS / 1000}s before next tenant...`);
-        await new Promise(r => setTimeout(r, STAGGER_DELAY_MS));
       }
     }
 
@@ -67,11 +72,11 @@ async function syncAllProducts() {
 }
 
 function startProductSync() {
-  // Offset by 1 hour from orders to avoid simultaneous API calls
-  const INITIAL_DELAY_MS = 60 * 60 * 1000; // 1 hour after startup
+  // First run in 5 min (offset da OrderSync che parte a 30s), poi ogni SYNC_INTERVAL_MS
+  const INITIAL_DELAY_MS = 5 * 60 * 1000;
   console.log(`[ProductSync] Cron started - every ${SYNC_INTERVAL_MS / 60000}min (first run in ${INITIAL_DELAY_MS / 60000}min), ${STAGGER_DELAY_MS / 1000}s stagger`);
   setTimeout(() => {
-    syncAllProducts();
+    syncAllProducts().catch(e => console.error('[ProductSync] First-run error:', e.message));
     setInterval(syncAllProducts, SYNC_INTERVAL_MS);
   }, INITIAL_DELAY_MS);
 }

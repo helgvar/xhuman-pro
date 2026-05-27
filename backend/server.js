@@ -14,6 +14,31 @@ if (fs.existsSync(envPath)) {
 
 const { initDB } = require('./db/pool');
 
+// Defensive: log unhandled rejections instead of crashing the process.
+// A single tenant misconfiguration (e.g. missing API permission) must not take down
+// the entire backend and bring all crons to a halt.
+process.on('unhandledRejection', (reason, promise) => {
+  const msg = reason?.message || String(reason);
+  console.error('[UnhandledRejection]', msg, reason?.stack?.split('\n').slice(0, 4).join(' | '));
+  try {
+    const { sendTelegram } = require('./services/telegramNotifier');
+    sendTelegram(`🚨 <b>xHumanPro unhandledRejection</b>\n<code>${msg.slice(0, 500)}</code>`, {
+      key: 'unhandled:' + msg.slice(0, 80),
+      throttleMs: 30 * 60 * 1000,
+    }).catch(() => {});
+  } catch {}
+});
+process.on('uncaughtException', (err) => {
+  console.error('[UncaughtException]', err.message, err.stack?.split('\n').slice(0, 4).join(' | '));
+  try {
+    const { sendTelegram } = require('./services/telegramNotifier');
+    sendTelegram(`🔥 <b>xHumanPro uncaughtException</b>\n<code>${err.message.slice(0, 500)}</code>`, {
+      key: 'uncaught:' + err.message.slice(0, 80),
+      throttleMs: 30 * 60 * 1000,
+    }).catch(() => {});
+  } catch {}
+});
+
 const app = express();
 const PORT = process.env.PORT || 3001;
 
@@ -23,6 +48,12 @@ app.use(express.json());
 // Health check
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', app: 'xHUMANPRO', version: '1.0.0' });
+});
+
+// API Queue status (monitor circuit breaker + load)
+app.get('/api/queue-status', (req, res) => {
+  const { getQueueStatus } = require('./services/apiQueue');
+  res.json(getQueueStatus());
 });
 
 // Auth routes (public)
@@ -40,6 +71,13 @@ const merchantCenterRoutes = require('./routes/merchantCenter');
 const optimizationRoutes = require('./routes/optimization');
 const ga4Routes = require('./routes/ga4');
 const externalApiRoutes = require('./routes/externalApi');
+const onboardingRoutes = require('./routes/onboarding');
+const agentRoutes = require('./routes/agent');
+const supervisorRoutes = require('./routes/supervisor');
+const paretoRoutes = require('./routes/pareto');
+const ruleOptimizerRoutes = require('./routes/ruleOptimizer');
+const abTestsRoutes = require('./routes/abTests');
+const crossChannelRoutes = require('./routes/crossChannel');
 app.use('/api/tenants', tenantsRoutes);
 app.use('/api/users', usersRoutes);
 app.use('/api/orders', ordersRoutes);
@@ -50,6 +88,13 @@ app.use('/api/merchant-center', merchantCenterRoutes);
 app.use('/api/optimization', optimizationRoutes);
 app.use('/api/ga4', ga4Routes);
 app.use('/api/external/v1', externalApiRoutes);
+app.use('/api/onboarding', onboardingRoutes);
+app.use('/api/agent', agentRoutes);
+app.use('/api/supervisor', supervisorRoutes);
+app.use('/api/pareto', paretoRoutes);
+app.use('/api/rule-optimizer', ruleOptimizerRoutes);
+app.use('/api/ab-tests', abTestsRoutes);
+app.use('/api/cross-channel', crossChannelRoutes);
 
 // Start server
 async function start() {
@@ -72,6 +117,10 @@ async function start() {
     // Start product health enrichment cron (every 4h)
     const { startHealthCron } = require('./services/healthCron');
     startHealthCron();
+
+    // Start alert monitor (every 2h, email on failures)
+    const { startAlertMonitor } = require('./services/alertMonitor');
+    startAlertMonitor();
 
     app.listen(PORT, '0.0.0.0', () => {
       console.log(`[xHUMANPRO] Backend running on http://0.0.0.0:${PORT}`);

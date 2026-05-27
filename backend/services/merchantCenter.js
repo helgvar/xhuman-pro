@@ -23,30 +23,31 @@ const BATCH_SIZE = 200;
  * Get authenticated Content API client for a tenant
  */
 async function getMerchantClient(tenantId) {
+  // google_merchant_id is per-tenant; the service account JSON is GLOBAL.
   const { rows } = await pool.query(
-    `SELECT config_key, config_value FROM tenant_configs
-     WHERE tenant_id = $1 AND config_key IN ('google_service_account_json', 'google_merchant_id')`,
+    `SELECT config_value FROM tenant_configs
+     WHERE tenant_id = $1 AND config_key = 'google_merchant_id'`,
     [tenantId]
   );
+  let merchantId = rows[0]?.config_value;
+  try { merchantId = decrypt(merchantId); } catch {}
 
-  const config = {};
-  for (const r of rows) {
-    try { config[r.config_key] = decrypt(r.config_value); }
-    catch { config[r.config_key] = r.config_value; }
+  const { getGlobal } = require('./globalConfig');
+  const saJson = await getGlobal('google_service_account_json')
+    || await getGlobal('ga4_credentials_json');
+
+  if (!saJson || !merchantId) {
+    throw new Error('Google Merchant Center not configured (missing global service account or per-tenant merchant ID)');
   }
 
-  if (!config.google_service_account_json || !config.google_merchant_id) {
-    throw new Error('Google Merchant Center not configured (missing service account or merchant ID)');
-  }
-
-  const credentials = JSON.parse(config.google_service_account_json);
+  const credentials = JSON.parse(saJson);
   const auth = new google.auth.GoogleAuth({
     credentials,
     scopes: ['https://www.googleapis.com/auth/content'],
   });
 
   const content = google.content({ version: 'v2.1', auth });
-  return { content, merchantId: config.google_merchant_id };
+  return { content, merchantId };
 }
 
 /**
@@ -163,7 +164,10 @@ async function importMerchantCenter(tenantId, jobId = null) {
     console.log(`[MerchantCenter] ${statuses.length} product statuses`);
 
     for (const s of statuses) {
-      const offerId = s.productId?.replace('online:it:IT:', '') || '';
+      // productId format: "channel:contentLang:targetCountry:offerId"
+      // es: "online:it:IT:904336498" oppure "online:it:-:904336498" (se targetCountry non settato)
+      // Estraiamo sempre l'ultima sezione dopo l'ultimo ":"
+      const offerId = s.productId ? s.productId.split(':').pop() : '';
       if (!offerId || !productIndex[offerId]) continue;
 
       const destStatuses = s.destinationStatuses || [];
@@ -375,24 +379,49 @@ async function importMerchantCenter(tenantId, jobId = null) {
     // Persist daily trend
     if (dailyRows.length > 0) {
       console.log('[MerchantCenter] Persisting daily trend...');
-      for (let i = 0; i < dailyRows.length; i += BATCH_SIZE) {
-        const batch = dailyRows.slice(i, i + BATCH_SIZE);
+      // Dedup: GMC API a volte ritorna stesso (date, offer_id) in più righe (varianti destination).
+      // Aggreghiamo le metriche, poi un'unica riga per (date, offer_id) → no conflict batch.
+      const dedupMap = new Map();
+      for (const row of dailyRows) {
+        const d = row.segments?.date;
+        const offerId = row.segments?.offerId;
+        if (!d || !offerId) continue;
+        const dateStr = `${d.year}-${String(d.month).padStart(2, '0')}-${String(d.day).padStart(2, '0')}`;
+        const key = `${dateStr}|${offerId}`;
+        const m = row.metrics || {};
+        if (dedupMap.has(key)) {
+          const acc = dedupMap.get(key);
+          acc.clicks += parseInt(m.clicks || 0);
+          acc.impressions += parseInt(m.impressions || 0);
+          acc.conversions += parseFloat(m.conversions || 0);
+          acc.conversionValue += micros(m.conversionValueMicros);
+        } else {
+          dedupMap.set(key, {
+            dateStr, offerId,
+            clicks: parseInt(m.clicks || 0),
+            impressions: parseInt(m.impressions || 0),
+            conversions: parseFloat(m.conversions || 0),
+            conversionValue: micros(m.conversionValueMicros),
+          });
+        }
+      }
+      const dedupRows = [...dedupMap.values()].map(r => ({
+        ...r,
+        ctr: r.impressions > 0 ? r.clicks / r.impressions : 0,
+      }));
+      console.log(`[MerchantCenter] Dedup: ${dailyRows.length} raw → ${dedupRows.length} unique daily rows`);
+
+      for (let i = 0; i < dedupRows.length; i += BATCH_SIZE) {
+        const batch = dedupRows.slice(i, i + BATCH_SIZE);
         const values = [];
         const params = [];
         let idx = 1;
 
-        for (const row of batch) {
-          const d = row.segments?.date;
-          if (!d || !row.segments?.offerId) continue;
-          const dateStr = `${d.year}-${String(d.month).padStart(2, '0')}-${String(d.day).padStart(2, '0')}`;
+        for (const r of batch) {
           values.push(`($${idx},$${idx+1},$${idx+2},$${idx+3},$${idx+4},$${idx+5},$${idx+6},$${idx+7})`);
           params.push(
-            tenantId, dateStr, row.segments.offerId,
-            parseInt(row.metrics?.clicks || 0),
-            parseInt(row.metrics?.impressions || 0),
-            parseFloat(row.metrics?.ctr || 0),
-            parseFloat(row.metrics?.conversions || 0),
-            micros(row.metrics?.conversionValueMicros)
+            tenantId, r.dateStr, r.offerId,
+            r.clicks, r.impressions, r.ctr, r.conversions, r.conversionValue
           );
           idx += 8;
         }

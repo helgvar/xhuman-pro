@@ -552,14 +552,15 @@ async function persistGA4Attribution(tenantId) {
   const data = await getGA4Attribution(tenantId);
   if (!data || !data.productIndex) return { updated: 0 };
 
-  // Reset all GA4 columns to 0 before writing new data
+  // Reset GA4-specific columns to 0 before writing new data
   // This prevents stale values from previous runs with different date ranges
+  // NOTE: tp_attributed_orders and tp_attributed_revenue are calculated from Magento
+  // orders by computeHealthScores — NEVER reset them here, only GA4-specific fields
   await pool.query(`
     UPDATE product_health_scores SET
       ga4_tp_purchases = 0, ga4_tp_revenue = 0,
       ga4_assisted_sales = 0, ga4_assisted_revenue = 0,
-      ga4_total_tp_value = 0, ga4_is_assist_product = false,
-      tp_attributed_orders = 0, tp_attributed_revenue = 0
+      ga4_total_tp_value = 0, ga4_is_assist_product = false
     WHERE tenant_id = $1
   `, [tenantId]);
 

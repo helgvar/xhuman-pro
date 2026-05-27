@@ -19,7 +19,7 @@ const DEFAULT_WEIGHTS = {
   indirect: 0.10,
 };
 
-const DEFAULT_CPC = 0.3294; // EUR per Trovaprezzi click (€0.27 + IVA 22%)
+const DEFAULT_CPC = 0.27; // EUR per Trovaprezzi click (netto, IVA esclusa)
 
 // Pharmacy seasonal categories (month ranges)
 const PHARMACY_SEASONS = {
@@ -65,16 +65,18 @@ async function loadConfig(tenantId) {
  */
 async function getSellerName(tenantId) {
   const { rows } = await pool.query(
-    `SELECT config_value FROM tenant_configs
-     WHERE tenant_id = $1 AND config_key = 'trovaprezzi_seller_name'`,
+    `SELECT config_key, config_value FROM tenant_configs
+     WHERE tenant_id = $1 AND config_key IN ('scraper_merchant_name', 'trovaprezzi_seller_name')`,
     [tenantId]
   );
   if (rows.length === 0) return null;
+  const { decrypt } = require('./crypto');
+  // Prefer scraper_merchant_name (exact merchant name in scraper) over trovaprezzi_seller_name
+  const merchantRow = rows.find(r => r.config_key === 'scraper_merchant_name') || rows[0];
   try {
-    const { decrypt } = require('./crypto');
-    return decrypt(rows[0].config_value);
+    return decrypt(merchantRow.config_value);
   } catch {
-    return rows[0].config_value;
+    return merchantRow.config_value;
   }
 }
 
@@ -83,6 +85,17 @@ async function getSellerName(tenantId) {
  */
 async function assembleProductData(tenantId, sellerName) {
   const sellerPattern = sellerName ? `%${sellerName}%` : '%__NOMATCH__%';
+
+  // CRITICAL: Align order date range with click date range
+  // Orders must be compared ONLY for the period where we have click data
+  const { rows: [clickRange] } = await pool.query(
+    `SELECT MIN(fetch_date) as first_click, MAX(fetch_date) as last_click, COUNT(DISTINCT fetch_date) as days
+     FROM zombie_clicks WHERE tenant_id = $1`,
+    [tenantId]
+  );
+  const clickFirstDate = clickRange?.first_click || new Date(Date.now() - 30 * 86400000);
+  const clickDays = parseInt(clickRange?.days) || 0;
+  console.log(`[Health] Date alignment: clicks ${clickRange?.first_click || 'none'} → ${clickRange?.last_click || 'none'} (${clickDays} days), orders aligned to same range`);
 
   const { rows } = await pool.query(`
     SELECT
@@ -133,7 +146,7 @@ async function assembleProductData(tenantId, sellerName) {
 
     FROM products p
 
-    -- Zombie clicks aggregation (30 days)
+    -- Zombie clicks aggregation (aligned to click date range)
     LEFT JOIN LATERAL (
       SELECT
         SUM(clicks) as total_clicks_30d,
@@ -144,7 +157,7 @@ async function assembleProductData(tenantId, sellerName) {
       FROM zombie_clicks
       WHERE tenant_id = $1
         AND product_code = p.sku
-        AND fetch_date >= CURRENT_DATE - 30
+        AND fetch_date >= $3::date
     ) zc ON true
 
     -- Scraper data (latest 48h)
@@ -163,12 +176,13 @@ async function assembleProductData(tenantId, sellerName) {
     LEFT JOIN merchant_center_products mc
       ON mc.tenant_id = $1 AND mc.offer_id = p.sku
 
-    -- Order attribution proxy (last 30 days)
+    -- Order attribution (ALIGNED to click date range — same period as clicks)
     LEFT JOIN LATERAL (
       SELECT
         COUNT(DISTINCT oi.order_id) as tp_orders,
         SUM(oi.row_total) as tp_revenue,
-        SUM(oi.qty_ordered * p.erp_cost) as tp_cogs,
+        -- COGS realistico: erp_cost reale o fallback imputato (migration 024)
+        SUM(oi.qty_ordered * COALESCE(NULLIF(p.erp_cost, 0), p.erp_cost_imputed, 0)) as tp_cogs,
         AVG(order_item_count) as avg_items_per_order
       FROM order_items oi
       JOIN orders o ON o.id = oi.order_id AND o.tenant_id = $1
@@ -178,12 +192,12 @@ async function assembleProductData(tenantId, sellerName) {
       ) oic ON true
       WHERE oi.tenant_id = $1
         AND oi.sku = p.sku
-        AND o.order_date >= NOW() - INTERVAL '30 days'
-        AND o.order_status IN ('complete', 'processing', 'shipped')
+        AND o.order_date >= $3::date
+        AND o.order_status IN ('complete', 'processing')
     ) oa ON true
 
     WHERE p.tenant_id = $1
-  `, [tenantId, sellerPattern]);
+  `, [tenantId, sellerPattern, clickFirstDate]);
 
   return rows;
 }
@@ -523,6 +537,11 @@ async function computeHealthScores(tenantId) {
     return { total: 0, byClassification: {} };
   }
 
+  // Debug: check order attribution in assembled data
+  const withOrders = products.filter(p => (parseInt(p.tp_orders) || 0) > 0);
+  const totalTpRevenue = products.reduce((s, p) => s + (parseFloat(p.tp_revenue) || 0), 0);
+  console.log(`[Health] Order attribution: ${withOrders.length} products with orders, €${totalTpRevenue.toFixed(2)} total revenue`);
+
   // Pre-compute catalog-level stats for percentile ranking
   const marginContributions = products
     .map(p => (parseFloat(p.sales_30d_seller) || 0) * (parseFloat(p.margin) || 0))
@@ -649,6 +668,10 @@ async function computeHealthScores(tenantId) {
     await upsertHealthBatch(batch);
     upserted += batch.length;
   }
+
+  // Verify: how many results have revenue > 0?
+  const resultsWithRevenue = results.filter(r => r.tp_attributed_revenue > 0).length;
+  console.log(`[Health] Upserted ${upserted} products. Revenue in results: ${resultsWithRevenue} products with rev > 0`);
 
   // Save daily snapshot
   await saveSnapshot(tenantId, results);
@@ -812,16 +835,15 @@ async function getGlobalPnl(tenantId) {
     WHERE tenant_id = $1
   `, [tenantId]);
 
-  // Real store revenue from orders (last 30 days)
+  // Real store revenue from orders (last 30 days) — grand_total = lordo IVA + spedizioni (come report Magento)
   const { rows: [storeSummary] } = await pool.query(`
     SELECT
-      COUNT(DISTINCT o.id) as store_orders,
-      COALESCE(SUM(oi.row_total), 0) as store_revenue
-    FROM orders o
-    JOIN order_items oi ON oi.order_id = o.id AND oi.tenant_id = o.tenant_id
-    WHERE o.tenant_id = $1
-      AND o.order_status IN ('complete', 'processing', 'shipped')
-      AND o.order_date >= NOW() - INTERVAL '30 days'
+      COUNT(*) as store_orders,
+      COALESCE(SUM(grand_total), 0) as store_revenue
+    FROM orders
+    WHERE tenant_id = $1
+      AND order_status IN ('complete', 'processing')
+      AND order_date >= NOW() - INTERVAL '30 days'
   `, [tenantId]);
 
   // GA4 channel KPIs (from last GA4 import)
@@ -832,6 +854,28 @@ async function getGlobalPnl(tenantId) {
   );
   const ga4 = {};
   for (const r of ga4Rows) ga4[r.config_key] = r.config_value;
+
+  // Calcola click + costo allineati alla finestra GA4 (30gg o ga4_data_start_date)
+  // per evitare incidenza inflata da costi cumulativi storici vs revenue 30gg.
+  try {
+    const cpcVal = parseFloat(ga4.avg_tp_cpc) || 0.27;
+    const { rows: [aligned] } = await pool.query(`
+      WITH effective_start AS (
+        SELECT GREATEST(
+          CURRENT_DATE - INTERVAL '30 days',
+          COALESCE($2::date, CURRENT_DATE - INTERVAL '30 days')
+        )::date AS d
+      )
+      SELECT COALESCE(SUM(clicks), 0)::int AS clicks_30d
+      FROM zombie_clicks
+      WHERE tenant_id = $1 AND fetch_date >= (SELECT d FROM effective_start) AND fetch_date < CURRENT_DATE
+    `, [tenantId, ga4.ga4_data_start_date || null]);
+    ga4.clicks_30d_aligned = parseInt(aligned.clicks_30d) || 0;
+    ga4.click_cost_30d_aligned = +(ga4.clicks_30d_aligned * cpcVal).toFixed(2);
+  } catch (e) {
+    ga4.clicks_30d_aligned = 0;
+    ga4.click_cost_30d_aligned = 0;
+  }
 
   const ga4TpRevenue = parseFloat(ga4.ga4_tp_revenue_30d) || 0;
   const ga4TpTransactions = parseInt(ga4.ga4_tp_transactions_30d) || 0;
@@ -854,17 +898,31 @@ async function getGlobalPnl(tenantId) {
     }
   } catch { /* GA4 not available */ }
 
-  const totalClickCost = parseFloat(healthSummary.total_click_cost) || 0;
   const storeOrders = parseInt(storeSummary.store_orders) || 0;
-  // Incidenza TP = Costo Click / Revenue TP (GA4)
-  // This is the key metric: how much of TP revenue goes to click costs
-  const tpIncidence = ga4TpRevenue > 0 ? totalClickCost / ga4TpRevenue : 0;
+
+  // Use feed_daily_summary as source of truth for incidence (real data from zombie clicks period)
+  const { rows: [dailySummary] } = await pool.query(
+    `SELECT total_cost, total_revenue, cumulative_incidence, total_clicks, total_orders
+     FROM feed_daily_summary WHERE tenant_id = $1 ORDER BY summary_date DESC LIMIT 1`,
+    [tenantId]
+  );
+  const revenueSource = ga4.revenue_source || 'magento';
+  const realClickCost = parseFloat(dailySummary?.total_cost) || parseFloat(healthSummary.total_click_cost) || 0;
+  const realRevenue = parseFloat(dailySummary?.total_revenue) || (revenueSource === 'ga4' ? ga4TpRevenue : parseFloat(storeSummary.store_revenue) || 0);
+  const totalClickCost = realClickCost;
+  const tpIncidence = realRevenue > 0 ? totalClickCost / realRevenue : 0;
 
   return {
     ...healthSummary,
     store_orders: storeOrders,
-    // Incidence = click cost / TP revenue (NOT total store)
+    store_revenue: parseFloat(storeSummary.store_revenue) || 0,
+    revenue_source: revenueSource,
+    // Incidence from real data (feed_daily_summary)
     global_incidence: tpIncidence,
+    real_click_cost: realClickCost,
+    real_revenue: realRevenue,
+    real_clicks: parseInt(dailySummary?.total_clicks) || parseInt(healthSummary.total_clicks) || 0,
+    real_orders: parseInt(dailySummary?.total_orders) || storeOrders,
     // GA4 TP channel data
     ga4_tp_revenue: ga4TpRevenue,
     ga4_tp_transactions: ga4TpTransactions,
@@ -872,6 +930,11 @@ async function getGlobalPnl(tenantId) {
     ga4_tp_avg_basket: ga4TpAvgBasket,
     ga4_tp_conv_rate: ga4TpConvRate,
     ga4_last_update: ga4.ga4_last_update || null,
+    ga4_data_start_date: ga4.ga4_data_start_date || null,
+    // Costo click ultimi 30gg (allineato con la finestra GA4 del denominatore TP-attribuito).
+    // Rispetta ga4_data_start_date per tenant onboardati di recente (es. Sanvito dal 28/4).
+    click_cost_30d: parseFloat(ga4.click_cost_30d_aligned) || 0,
+    clicks_30d: parseInt(ga4.clicks_30d_aligned) || 0,
     // First-touch attribution (users acquired via TP)
     ga4_ft_revenue: parseFloat(ga4.ga4_ft_revenue_30d) || 0,
     ga4_ft_transactions: parseInt(ga4.ga4_ft_transactions_30d) || 0,
@@ -923,7 +986,7 @@ async function getWeeklyBreakdown(tenantId) {
       FROM orders o
       JOIN order_items oi ON oi.order_id = o.id AND oi.tenant_id = o.tenant_id
       WHERE o.tenant_id = $1
-        AND o.order_status IN ('complete', 'processing', 'shipped')
+        AND o.order_status IN ('complete', 'processing')
         AND o.order_date >= CURRENT_DATE - INTERVAL '4 weeks'
       GROUP BY date_trunc('week', o.order_date)
     )

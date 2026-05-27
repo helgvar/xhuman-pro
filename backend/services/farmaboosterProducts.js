@@ -24,7 +24,17 @@ async function saveProduct(tenantId, product, topsearchRuleIds = new Set()) {
   const sku = product.product_code;
   if (!sku) return false;
 
-  const price = parseFloat(product.product_price || 0);
+  // sell_price: usa product_price (calcolato da regola prezzo) come primario;
+  // fallback a product_exported_price (prezzo effettivamente esportato a TP) per
+  // i prodotti senza regola prezzo applicata. Senza fallback, ~25% del catalogo
+  // di alcuni tenant (es. Mandanici) finiva in DB con sell_price=0 ma andava
+  // comunque a TP con un prezzo valido.
+  // ATTENZIONE: l'API restituisce "0" come stringa quando il prezzo manca, e "0" e' truthy
+  // in JS. Il `||` non scatterebbe sul fallback. Per questo facciamo prima parseFloat e poi
+  // controlliamo > 0 numericamente. (Bug osservato Mandanici 29/4/2026, ~13k SKU persi.)
+  const _priceMain = parseFloat(product.product_price) || 0;
+  const _priceExported = parseFloat(product.product_exported_price) || 0;
+  const price = _priceMain > 0 ? _priceMain : _priceExported;
   const erpCost = parseFloat(product.product_erp_min_cost || 0);
   const supplierCost = parseFloat(product.product_supplier_min_cost || 0);
   // Use min_cost (best cost from any source: ERP or Supplier) for margin calculation
@@ -138,8 +148,9 @@ async function savePriceRules(tenantId, config) {
     const ruleId = r.price_rule_id;
     if (!ruleId) continue;
 
-    // Map rule type: 1=Diretto, 2=Sconto, 3=Salva Bilancio, 4=Muro
-    const ruleTypes = { '1': 'diretto', '2': 'sconto', '3': 'salva_bilancio', '4': 'muro' };
+    // Map rule type Farmabooster: 1=Ricarico, 2=Sconto, 3=Salva Bilancio, 4=Muro
+    // NB: il "Diretto/Grossista" e' un'altra dimensione (sourcing), derivata da erp_ids/supplier_ids.
+    const ruleTypes = { '1': 'ricarico', '2': 'sconto', '3': 'salva_bilancio', '4': 'muro' };
 
     await pool.query(
       `INSERT INTO price_rules (tenant_id, rule_id, rule_name, rule_type, rule_data, is_active, priority, updated_at)
@@ -280,6 +291,17 @@ async function importProducts(tenantId, jobId = null) {
         }
       }
 
+      // Step 4: Sync civetta flag from Magento (source of truth)
+      console.log('[Products] Syncing civetta flag from Magento...');
+      updateProgress({ phase: 'civetta_sync', phase_label: 'Sync civetta da Magento...', pct: 96 });
+      let civettaSynced = 0;
+      try {
+        civettaSynced = await syncCivettaFromMagento(tenantId);
+        console.log(`[Products] Civetta synced: ${civettaSynced} products set to civetta=1`);
+      } catch (civErr) {
+        console.error('[Products] Civetta sync error:', civErr.message);
+      }
+
       // Complete
       if (jobId) {
         await pool.query(
@@ -287,13 +309,13 @@ async function importProducts(tenantId, jobId = null) {
            records_processed = $1, records_imported = $2, records_updated = $3,
            metadata = $4 WHERE id = $5`,
           [productsData.length, totalImported, totalUpdated,
-           JSON.stringify({ phase: 'done', phase_label: 'Completato', pct: 100, total_products: productsData.length, rules_saved: rulesSaved }),
+           JSON.stringify({ phase: 'done', phase_label: 'Completato', pct: 100, total_products: productsData.length, rules_saved: rulesSaved, civetta_synced: civettaSynced }),
            jobId]
         );
       }
 
-      console.log(`[Products] Import complete: ${totalImported} new, ${totalUpdated} updated, ${rulesSaved} rules`);
-      return { totalProcessed: productsData.length, totalImported, totalUpdated, rulesSaved };
+      console.log(`[Products] Import complete: ${totalImported} new, ${totalUpdated} updated, ${rulesSaved} rules, ${civettaSynced} civetta synced`);
+      return { totalProcessed: productsData.length, totalImported, totalUpdated, rulesSaved, civettaSynced };
 
     } catch (err) {
       console.error(`[Products] Import error:`, err.message);
@@ -308,4 +330,102 @@ async function importProducts(tenantId, jobId = null) {
   });
 }
 
-module.exports = { importProducts };
+/**
+ * Sync civetta flag from Magento (source of truth).
+ * Farmabooster API may have stale civetta values — Magento's attribute is the real flag.
+ */
+async function syncCivettaFromMagento(tenantId) {
+  const { decrypt } = require('./crypto');
+  const { rows: creds } = await pool.query(
+    `SELECT config_key, config_value FROM tenant_configs
+     WHERE tenant_id = $1 AND config_key IN ('magento_base_url', 'magento_api_token')`,
+    [tenantId]
+  );
+  const cfg = {};
+  for (const c of creds) {
+    try { cfg[c.config_key] = decrypt(c.config_value); } catch { cfg[c.config_key] = c.config_value; }
+  }
+  if (!cfg.magento_base_url || !cfg.magento_api_token) {
+    console.log('[Products] Magento not configured, skipping civetta sync');
+    return 0;
+  }
+  if (!cfg.magento_base_url.startsWith('http')) {
+    console.log('[Products] Magento URL decryption failed (bad ENCRYPTION_KEY?), skipping civetta sync');
+    return 0;
+  }
+
+  const baseUrl = cfg.magento_base_url.replace(/\/$/, '');
+  const token = cfg.magento_api_token;
+  const headers = { Authorization: `Bearer ${token}` };
+
+  const { magentoQueue } = require('./apiQueue');
+
+  // Detect civetta attribute option values (they vary per Magento instance)
+  // Some stores use label "1", others "Elastic si", "Si", "Yes", etc.
+  let civettaOptionFor1 = null;
+  try {
+    const attrResp = await magentoQueue.enqueue(
+      () => fetch(`${baseUrl}/rest/V1/products/attributes/civetta`, { headers }),
+      `magento:civetta-attr:${tenantId}`
+    );
+    if (attrResp.ok) {
+      const attr = await attrResp.json();
+      // Normalize: lowercase + strip spaces, hyphens, underscores. Cosi' "elastic si",
+      // "elastic-si", "elastic_si" matchano tutti contro lo stesso label canonical.
+      const normalize = s => (s || '').toLowerCase().trim().replace(/[-_\s]+/g, '');
+      const positiveLabels = ['1', 'si', 'yes', 'elasticsi', 'true', 'attivo'];
+      const opt1 = (attr.options || []).find(o => positiveLabels.includes(normalize(o.label)));
+      if (opt1) {
+        civettaOptionFor1 = opt1.value;
+        console.log(`[Products] Civetta attribute: label="${opt1.label}" value=${opt1.value}`);
+      } else {
+        console.log(`[Products] Civetta attribute options: ${JSON.stringify((attr.options || []).map(o => o.label))}`);
+      }
+    }
+  } catch {}
+
+  if (!civettaOptionFor1) {
+    console.log('[Products] Could not detect civetta attribute options, skipping sync');
+    return 0;
+  }
+
+  // Fetch all SKUs with civetta=1 from Magento (paginated, via queue)
+  const civetta1Set = new Set();
+  let page = 1;
+  while (true) {
+    const url = `${baseUrl}/rest/V1/products?searchCriteria[filterGroups][0][filters][0][field]=civetta&searchCriteria[filterGroups][0][filters][0][value]=${civettaOptionFor1}&searchCriteria[pageSize]=300&searchCriteria[currentPage]=${page}&fields=items[sku]`;
+    const resp = await magentoQueue.enqueue(
+      () => fetch(url, { headers }),
+      `magento:civetta-list:${tenantId}:${page}`
+    );
+    if (!resp.ok) break;
+    const data = await resp.json();
+    const items = data.items || [];
+    if (items.length === 0) break;
+    items.forEach(i => civetta1Set.add(i.sku));
+    page++;
+    if (items.length < 300) break;
+  }
+
+  if (civetta1Set.size === 0) {
+    console.log('[Products] No civetta=1 products found in Magento');
+    return 0;
+  }
+
+  // Reset all to false, then set true for Magento civetta=1
+  await pool.query('UPDATE products SET is_civetta = false WHERE tenant_id = $1 AND is_civetta = true', [tenantId]);
+  const skuArray = Array.from(civetta1Set);
+  let updated = 0;
+  for (let i = 0; i < skuArray.length; i += 500) {
+    const batch = skuArray.slice(i, i + 500);
+    const { rowCount } = await pool.query(
+      'UPDATE products SET is_civetta = true WHERE tenant_id = $1 AND sku = ANY($2)',
+      [tenantId, batch]
+    );
+    updated += rowCount;
+  }
+
+  return updated;
+}
+
+module.exports = { importProducts, syncCivettaFromMagento };

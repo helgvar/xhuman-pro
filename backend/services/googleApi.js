@@ -19,26 +19,29 @@ class GoogleApiService {
     const cached = this.configCache.get(tenantId);
     if (cached && cached.expires > Date.now()) return cached.config;
 
+    // Per-tenant keys (ga4_property_id, merchant_center_id) still live in tenant_configs.
+    // The service account JSON is GLOBAL — same Google identity for the whole network.
     const { rows } = await pool.query(
       `SELECT config_key, config_value FROM tenant_configs
        WHERE tenant_id = $1
-       AND config_key IN ('ga4_property_id', 'merchant_center_id', 'google_service_account_json')`,
+       AND config_key IN ('ga4_property_id', 'merchant_center_id')`,
       [tenantId]
     );
 
     const config = {};
     for (const row of rows) {
-      try {
-        config[row.config_key] = decrypt(row.config_value);
-      } catch {
-        config[row.config_key] = row.config_value;
-      }
+      try { config[row.config_key] = decrypt(row.config_value); }
+      catch { config[row.config_key] = row.config_value; }
     }
+
+    const { getGlobal } = require('./globalConfig');
+    const serviceAccountJson = await getGlobal('google_service_account_json')
+      || await getGlobal('ga4_credentials_json');
 
     const result = {
       ga4PropertyId: config.ga4_property_id || null,
       merchantCenterId: config.merchant_center_id || null,
-      serviceAccountJson: config.google_service_account_json || null,
+      serviceAccountJson: serviceAccountJson || null,
     };
 
     this.configCache.set(tenantId, { config: result, expires: Date.now() + this.CONFIG_TTL });

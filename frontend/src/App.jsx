@@ -17,6 +17,11 @@ import TenantConfig from './pages/TenantConfig';
 import Trovaprezzi from './pages/Trovaprezzi';
 import Statistiche from './pages/Statistiche';
 import FeedOptimizer from './pages/FeedOptimizer';
+import Onboarding from './pages/Onboarding';
+import AgentChat from './pages/Agent';
+import ParetoRule from './pages/ParetoRule';
+import RuleOptimizer from './pages/RuleOptimizer';
+import CrossChannel from './pages/CrossChannel';
 
 export default function App() {
   const { loading, needsTenantSelection } = useAuth();
@@ -54,8 +59,17 @@ export default function App() {
                 <Route path="/trovaprezzi" element={<Trovaprezzi />} />
                 <Route path="/statistiche" element={<Statistiche />} />
                 <Route path="/optimization" element={<FeedOptimizer />} />
+                <Route path="/pareto" element={<ParetoRule />} />
+                <Route path="/rule-optimizer" element={<RuleOptimizer />} />
+                <Route path="/cross-channel" element={<CrossChannel />} />
                 <Route path="/admin/users" element={
                   <ProtectedRoute roles={['superadmin', 'admin']}><AdminUsers /></ProtectedRoute>
+                } />
+                <Route path="/agent" element={
+                  <ProtectedRoute roles={['superadmin', 'admin']}><AgentChat /></ProtectedRoute>
+                } />
+                <Route path="/onboarding" element={
+                  <ProtectedRoute roles={['superadmin', 'admin']}><Onboarding /></ProtectedRoute>
                 } />
                 <Route path="/admin/config" element={
                   <ProtectedRoute roles={['superadmin', 'admin']}><TenantConfig /></ProtectedRoute>

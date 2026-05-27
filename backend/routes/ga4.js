@@ -72,15 +72,22 @@ router.post('/credentials', requireRole('superadmin', 'admin'), async (req, res)
 
     const updates = {};
     if (ga4PropertyId) updates.ga4_property_id = ga4PropertyId;
+    // Service account JSON is GLOBAL — saved to global_config (shared by all tenants).
+    let globalSaved = null;
     if (serviceAccountJson) {
-      // Validate JSON
       const parsed = typeof serviceAccountJson === 'string' ? JSON.parse(serviceAccountJson) : serviceAccountJson;
       if (!parsed.client_email || !parsed.private_key) {
         return res.status(400).json({ error: 'Service account JSON non valido: mancano client_email o private_key' });
       }
-      updates.google_service_account_json = typeof serviceAccountJson === 'string'
-        ? serviceAccountJson
-        : JSON.stringify(serviceAccountJson);
+      const saStr = typeof serviceAccountJson === 'string' ? serviceAccountJson : JSON.stringify(serviceAccountJson);
+      await pool.query(`
+        INSERT INTO global_config (config_key, config_value, description, updated_at)
+        VALUES ('google_service_account_json', $1, 'Google service account (Drive, GA4, Merchant Center)', NOW())
+        ON CONFLICT (config_key) DO UPDATE SET config_value = $1, updated_at = NOW()
+      `, [saStr]);
+      const { invalidateGlobal } = require('../services/globalConfig');
+      invalidateGlobal('google_service_account_json');
+      globalSaved = 'google_service_account_json';
     }
 
     for (const [key, value] of Object.entries(updates)) {
@@ -93,7 +100,7 @@ router.post('/credentials', requireRole('superadmin', 'admin'), async (req, res)
     }
 
     googleApiService.clearTenant(req.tenantId);
-    res.json({ ok: true, saved: Object.keys(updates) });
+    res.json({ ok: true, saved: Object.keys(updates), globalSaved });
   } catch (err) {
     console.error('[GA4] Credentials save error:', err.message);
     res.status(500).json({ error: err.message });

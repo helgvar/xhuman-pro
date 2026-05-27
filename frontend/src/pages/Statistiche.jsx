@@ -1,6 +1,5 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect } from 'react';
 import { authFetch } from '../utils/tokenManager';
-import { useAuth } from '../contexts/AuthContext';
 
 function api(path) {
   return authFetch(`/api${path}`, {
@@ -8,266 +7,146 @@ function api(path) {
   }).then(r => r.json());
 }
 
-function apiPost(path) {
-  return authFetch(`/api${path}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-  }).then(r => r.json());
-}
-
 export default function Statistiche() {
-  const { user } = useAuth();
-  const [tab, setTab] = useState('overview');
   const [mcData, setMcData] = useState(null);
   const [tpData, setTpData] = useState(null);
   const [loading, setLoading] = useState(true);
-  const [importing, setImporting] = useState(false);
+  const [error, setError] = useState(null);
 
-  const loadData = useCallback(async () => {
-    setLoading(true);
-    try {
-      const [mc, tp] = await Promise.all([
-        api('/merchant-center/overview'),
-        api('/trovaprezzi/overview'),
-      ]);
-      setMcData(mc);
-      setTpData(tp);
-    } catch (err) {
-      console.error('Load error:', err);
-    }
-    setLoading(false);
+  useEffect(() => {
+    (async () => {
+      try {
+        const mc = await api('/merchant-center/overview').catch(() => null);
+        const tp = await api('/trovaprezzi/overview').catch(() => null);
+        setMcData(mc);
+        setTpData(tp);
+      } catch (err) {
+        setError(err.message);
+      }
+      setLoading(false);
+    })();
   }, []);
-
-  useEffect(() => { loadData(); }, [loadData]);
-
-  const triggerMCImport = async () => {
-    setImporting(true);
-    try {
-      await apiPost('/merchant-center/import');
-      setTimeout(() => { loadData(); setImporting(false); }, 10000);
-    } catch { setImporting(false); }
-  };
 
   if (loading) {
     return (
       <div className="flex items-center justify-center h-64">
-        <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-brand-500"></div>
+        <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-teal-500"></div>
       </div>
     );
   }
 
+  if (error) {
+    return <div className="p-6 text-red-600">Errore: {error}</div>;
+  }
+
   const mc = mcData?.mcStats || {};
   const tp = tpData || {};
-
-  return (
-    <div className="space-y-6">
-      {/* Header */}
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-2xl font-bold text-gray-900">Statistiche</h1>
-          <p className="text-sm text-gray-500 mt-1">
-            Google Shopping + Trovaprezzi — Dati aggregati per decisioni strategiche
-          </p>
-        </div>
-        {(user?.role === 'superadmin' || user?.role === 'admin') && (
-          <button
-            onClick={triggerMCImport}
-            disabled={importing}
-            className="px-4 py-2 bg-brand-600 text-white rounded-lg hover:bg-brand-700 disabled:opacity-50 text-sm font-medium"
-          >
-            {importing ? 'Aggiornamento...' : 'Aggiorna Dati MC'}
-          </button>
-        )}
-      </div>
-
-      {/* Tabs */}
-      <div className="border-b border-gray-200">
-        <nav className="flex -mb-px">
-          {[
-            { id: 'overview', label: 'Panoramica' },
-            { id: 'ga4-sources', label: 'Sorgenti GA4' },
-            { id: 'ga4-attribution', label: 'Attribuzione TP' },
-            { id: 'benchmark', label: 'Benchmark Prezzi' },
-            { id: 'opportunities', label: 'Opportunit\u00e0' },
-            { id: 'trends', label: 'Trend' },
-          ].map(t => (
-            <button
-              key={t.id}
-              onClick={() => setTab(t.id)}
-              className={`px-4 py-3 text-sm font-medium border-b-2 transition-colors ${
-                tab === t.id ? 'border-brand-500 text-brand-600' : 'border-transparent text-gray-500 hover:text-gray-700'
-              }`}
-            >
-              {t.label}
-            </button>
-          ))}
-        </nav>
-      </div>
-
-      {tab === 'overview' && <OverviewTab mc={mc} tp={tp} mcData={mcData} />}
-      {tab === 'ga4-sources' && <GA4SourcesTab />}
-      {tab === 'ga4-attribution' && <GA4AttributionTab />}
-      {tab === 'benchmark' && <BenchmarkTab mcData={mcData} />}
-      {tab === 'opportunities' && <OpportunitiesTab mcData={mcData} />}
-      {tab === 'trends' && <TrendsTab mcData={mcData} tp={tp} />}
-    </div>
-  );
-}
-
-// ─── Overview Tab ──────────────────────────────────────
-
-function OverviewTab({ mc, tp, mcData }) {
   const tpClick = tp.clickStats;
-  const cross = mcData?.crossAnalysis;
 
   return (
     <div className="space-y-6">
-      {/* Main KPIs */}
-      <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-4">
-        <KPI label="Prodotti MC" value={n(mc.mc_total)} color="blue" />
-        <KPI label="Approvati" value={n(mc.mc_approved)} sub={`${pct(mc.mc_approved, mc.mc_total)}%`} color="green" />
-        <KPI label="Disapprovati" value={n(mc.mc_disapproved)} color="red" />
-        <KPI label="Click GS (14gg)" value={n(mc.total_clicks_14d)} color="purple" />
-        <KPI label="Impressioni (14gg)" value={n(mc.total_impressions_14d)} color="blue" />
-        <KPI label="CTR Medio" value={`${(parseFloat(mc.avg_ctr || 0) * 100).toFixed(2)}%`} color="orange" />
+      <div>
+        <h1 className="text-2xl font-bold text-gray-900">Analytics & Statistiche</h1>
+        <p className="text-sm text-gray-500 mt-1">Google Shopping + Trovaprezzi</p>
       </div>
 
-      {/* Trovaprezzi KPIs */}
+      {/* MC KPIs */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-        <KPI label="Prodotti Trovaprezzi" value={n(tp.scraperStats?.scraper_products)} color="green" />
-        <KPI label="Merchant TP" value={n(tp.scraperStats?.scraper_merchants)} color="purple" />
-        <KPI
-          label="Click TP (ultimo giorno)"
-          value={tpClick ? n(tpClick.total_clicks) : 'N/D'}
-          sub={tpClick?.fetch_date || ''}
-          color="orange"
-        />
-        <KPI
-          label="Prodotti con Click TP"
-          value={tpClick ? n(tpClick.products_with_clicks) : 'N/D'}
-          color="blue"
-        />
+        <KPI label="Prodotti MC" value={n(mc.mc_total)} />
+        <KPI label="Approvati MC" value={n(mc.mc_approved)} />
+        <KPI label="Click GS (14gg)" value={n(mc.total_clicks_14d)} />
+        <KPI label="Impressioni (14gg)" value={n(mc.total_impressions_14d)} />
       </div>
 
-      {/* Cross-platform analysis */}
-      {cross && (
-        <div className="bg-white rounded-lg shadow p-6">
-          <h3 className="text-sm font-semibold text-gray-700 mb-4">Copertura Cross-Platform</h3>
+      {/* TP KPIs */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+        <KPI label="Prodotti Scraper" value={n(tp.scraperStats?.scraper_products)} />
+        <KPI label="Merchant TP" value={n(tp.scraperStats?.scraper_merchants)} />
+        <KPI label="Click TP (ultimo gg)" value={tpClick ? n(tpClick.total_clicks) : 'N/D'} />
+        <KPI label="Prodotti con click" value={tpClick ? n(tpClick.products_with_clicks) : 'N/D'} />
+      </div>
+
+      {/* Click Potential Distribution */}
+      {(mc.high_potential > 0 || mc.medium_potential > 0 || mc.low_potential > 0) && (
+        <div className="bg-white rounded-lg border p-4">
+          <h3 className="font-semibold mb-3">Click Potential (Merchant Center)</h3>
           <div className="grid grid-cols-3 gap-4">
-            <div className="text-center p-4 bg-blue-50 rounded-lg">
-              <div className="text-2xl font-bold text-blue-800">{n(cross.on_both)}</div>
-              <div className="text-xs text-blue-600 mt-1">Su entrambi (GS + TP)</div>
+            <div className="text-center p-3 bg-green-50 rounded">
+              <div className="text-2xl font-bold text-green-700">{n(mc.high_potential)}</div>
+              <div className="text-xs text-green-600">HIGH</div>
             </div>
-            <div className="text-center p-4 bg-green-50 rounded-lg">
-              <div className="text-2xl font-bold text-green-800">{n(cross.gs_only)}</div>
-              <div className="text-xs text-green-600 mt-1">Solo Google Shopping</div>
+            <div className="text-center p-3 bg-yellow-50 rounded">
+              <div className="text-2xl font-bold text-yellow-700">{n(mc.medium_potential)}</div>
+              <div className="text-xs text-yellow-600">MEDIUM</div>
             </div>
-            <div className="text-center p-4 bg-orange-50 rounded-lg">
-              <div className="text-2xl font-bold text-orange-800">{n(cross.tp_only)}</div>
-              <div className="text-xs text-orange-600 mt-1">Solo Trovaprezzi</div>
+            <div className="text-center p-3 bg-gray-50 rounded">
+              <div className="text-2xl font-bold text-gray-700">{n(mc.low_potential)}</div>
+              <div className="text-xs text-gray-600">LOW</div>
             </div>
           </div>
         </div>
       )}
 
-      {/* Benchmark Price Distribution */}
-      <div className="bg-white rounded-lg shadow p-6">
-        <h3 className="text-sm font-semibold text-gray-700 mb-4">Posizionamento Prezzo vs Benchmark Google</h3>
-        <div className="grid grid-cols-3 gap-4">
-          <div className="text-center p-4 bg-green-50 rounded-lg border border-green-200">
-            <div className="text-2xl font-bold text-green-700">{n(mc.below_benchmark)}</div>
-            <div className="text-xs text-green-600 mt-1">Sotto il benchmark</div>
-            <div className="text-[10px] text-green-500">Competitivi</div>
-          </div>
-          <div className="text-center p-4 bg-yellow-50 rounded-lg border border-yellow-200">
-            <div className="text-2xl font-bold text-yellow-700">{n(mc.at_benchmark)}</div>
-            <div className="text-xs text-yellow-600 mt-1">Al benchmark</div>
-            <div className="text-[10px] text-yellow-500">In linea</div>
-          </div>
-          <div className="text-center p-4 bg-red-50 rounded-lg border border-red-200">
-            <div className="text-2xl font-bold text-red-700">{n(mc.above_benchmark)}</div>
-            <div className="text-xs text-red-600 mt-1">Sopra il benchmark</div>
-            <div className="text-[10px] text-red-500">Fuori mercato</div>
-          </div>
-        </div>
-      </div>
-
-      {/* Click Potential */}
-      {mcData?.clickPotDist && mcData.clickPotDist.length > 0 && (
-        <div className="bg-white rounded-lg shadow p-6">
-          <h3 className="text-sm font-semibold text-gray-700 mb-4">Click Potential (Google)</h3>
-          <div className="flex gap-4">
-            {mcData.clickPotDist.map((cp, i) => {
-              const colors = { HIGH: 'bg-green-500', MEDIUM: 'bg-yellow-500', LOW: 'bg-red-400' };
-              const labels = { HIGH: 'Alto', MEDIUM: 'Medio', LOW: 'Basso' };
-              return (
-                <div key={i} className="flex-1 text-center">
-                  <div className="text-xs text-gray-500 mb-1">{labels[cp.click_potential] || cp.click_potential}</div>
-                  <div className={`${colors[cp.click_potential] || 'bg-gray-400'} text-white rounded-lg py-3 text-lg font-bold`}>
-                    {n(cp.count)}
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        </div>
-      )}
-
-      {/* Top Products GS */}
+      {/* Top MC Products */}
       {mcData?.topClicksMC && mcData.topClicksMC.length > 0 && (
-        <div className="bg-white rounded-lg shadow p-6">
-          <h3 className="text-sm font-semibold text-gray-700 mb-4">Top 20 Prodotti Google Shopping (Click 14gg)</h3>
+        <div className="bg-white rounded-lg border p-4">
+          <h3 className="font-semibold mb-3">Top Prodotti Google Shopping (click 14gg)</h3>
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
-              <thead>
-                <tr className="text-left text-gray-500 border-b">
-                  <th className="pb-2 pl-2">#</th>
-                  <th className="pb-2">Codice</th>
-                  <th className="pb-2">Prodotto</th>
-                  <th className="pb-2 text-right">Click</th>
-                  <th className="pb-2 text-right">Impr.</th>
-                  <th className="pb-2 text-right">CTR</th>
-                  <th className="pb-2 text-right">Prezzo</th>
-                  <th className="pb-2 text-right">Benchmark</th>
-                  <th className="pb-2 text-right">Suggerito</th>
-                  <th className="pb-2 text-right">Margine</th>
-                  <th className="pb-2 text-center">Flags</th>
+              <thead className="bg-gray-50">
+                <tr>
+                  <th className="px-3 py-2 text-left">Prodotto</th>
+                  <th className="px-3 py-2 text-right">Click</th>
+                  <th className="px-3 py-2 text-right">Impressioni</th>
+                  <th className="px-3 py-2 text-right">CTR</th>
+                  <th className="px-3 py-2 text-right">Prezzo</th>
+                  <th className="px-3 py-2 text-right">Benchmark</th>
+                  <th className="px-3 py-2">Potenziale</th>
                 </tr>
               </thead>
               <tbody>
                 {mcData.topClicksMC.map((p, i) => (
-                  <tr key={i} className="border-b border-gray-100 hover:bg-gray-50">
-                    <td className="py-2 pl-2 text-gray-400">{i + 1}</td>
-                    <td className="py-2 font-mono text-xs">{p.offer_id}</td>
-                    <td className="py-2 truncate max-w-[180px]" title={p.mc_title}>{p.mc_title}</td>
-                    <td className="py-2 text-right font-semibold text-brand-600">{n(p.clicks_14d)}</td>
-                    <td className="py-2 text-right text-gray-500">{n(p.impressions_14d)}</td>
-                    <td className="py-2 text-right">{(parseFloat(p.ctr_14d || 0) * 100).toFixed(2)}%</td>
-                    <td className="py-2 text-right">{money(p.mc_sale_price || p.sell_price)}</td>
-                    <td className="py-2 text-right">
-                      {p.benchmark_price ? (
-                        <span className={parseFloat(p.mc_sale_price) <= parseFloat(p.benchmark_price) ? 'text-green-600' : 'text-red-600'}>
-                          {money(p.benchmark_price)}
-                        </span>
-                      ) : '-'}
+                  <tr key={i} className="border-t">
+                    <td className="px-3 py-2 max-w-[300px] truncate">{p.mc_title || p.offer_id}</td>
+                    <td className="px-3 py-2 text-right font-medium">{p.clicks_14d}</td>
+                    <td className="px-3 py-2 text-right">{n(p.impressions_14d)}</td>
+                    <td className="px-3 py-2 text-right">{(parseFloat(p.ctr_14d || 0) * 100).toFixed(1)}%</td>
+                    <td className="px-3 py-2 text-right">{money(p.mc_sale_price)}</td>
+                    <td className="px-3 py-2 text-right">{money(p.benchmark_price)}</td>
+                    <td className="px-3 py-2">
+                      <span className={`px-2 py-0.5 rounded text-xs ${p.click_potential === 'HIGH' ? 'bg-green-100 text-green-700' : p.click_potential === 'MEDIUM' ? 'bg-yellow-100 text-yellow-700' : 'bg-gray-100 text-gray-600'}`}>
+                        {p.click_potential || '-'}
+                      </span>
                     </td>
-                    <td className="py-2 text-right">
-                      {p.suggested_price ? <span className="text-blue-600">{money(p.suggested_price)}</span> : '-'}
-                    </td>
-                    <td className="py-2 text-right">
-                      {p.margin_pct != null ? (
-                        <span className={parseFloat(p.margin_pct) >= 15 ? 'text-green-600' : parseFloat(p.margin_pct) >= 5 ? 'text-yellow-600' : 'text-red-600'}>
-                          {parseFloat(p.margin_pct).toFixed(1)}%
-                        </span>
-                      ) : '-'}
-                    </td>
-                    <td className="py-2 text-center">
-                      <div className="flex gap-1 justify-center">
-                        {p.is_civetta && <span className="px-1 py-0.5 bg-yellow-100 text-yellow-800 text-[9px] rounded">CIV</span>}
-                        {p.is_topsearch && <span className="px-1 py-0.5 bg-blue-100 text-blue-800 text-[9px] rounded">TOP</span>}
-                        {p.approval_status === 'approved' && <span className="px-1 py-0.5 bg-green-100 text-green-800 text-[9px] rounded">OK</span>}
-                      </div>
-                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {/* Click trend */}
+      {tp.clickTrend && tp.clickTrend.length > 0 && (
+        <div className="bg-white rounded-lg border p-4">
+          <h3 className="font-semibold mb-3">Trend Click Trovaprezzi</h3>
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead className="bg-gray-50">
+                <tr>
+                  <th className="px-3 py-2 text-left">Data</th>
+                  <th className="px-3 py-2 text-right">Prodotti</th>
+                  <th className="px-3 py-2 text-right">Click</th>
+                  <th className="px-3 py-2 text-right">Costo (€0.27)</th>
+                </tr>
+              </thead>
+              <tbody>
+                {tp.clickTrend.map((d, i) => (
+                  <tr key={i} className="border-t">
+                    <td className="px-3 py-2">{new Date(d.fetch_date).toLocaleDateString('it-IT')}</td>
+                    <td className="px-3 py-2 text-right">{d.products}</td>
+                    <td className="px-3 py-2 text-right font-medium">{n(d.total_clicks)}</td>
+                    <td className="px-3 py-2 text-right text-red-600">{money(parseInt(d.total_clicks) * 0.27)}</td>
                   </tr>
                 ))}
               </tbody>
@@ -279,364 +158,14 @@ function OverviewTab({ mc, tp, mcData }) {
   );
 }
 
-// ─── Benchmark Tab ─────────────────────────────────────
-
-function BenchmarkTab({ mcData }) {
-  if (!mcData?.overpriced || mcData.overpriced.length === 0) {
-    return <div className="text-center py-8 text-gray-400">Nessun dato benchmark disponibile</div>;
-  }
-
+function KPI({ label, value }) {
   return (
-    <div className="space-y-6">
-      <div className="bg-white rounded-lg shadow p-6">
-        <h3 className="text-sm font-semibold text-gray-700 mb-1">Prodotti Sopra il Benchmark Google</h3>
-        <p className="text-xs text-gray-400 mb-4">Prodotti il cui prezzo di vendita supera il benchmark di mercato di Google. Candidati per una riduzione prezzo.</p>
-        <div className="overflow-x-auto">
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="text-left text-gray-500 border-b">
-                <th className="pb-2">Codice</th>
-                <th className="pb-2">Prodotto</th>
-                <th className="pb-2">Brand</th>
-                <th className="pb-2 text-right">Tuo Prezzo</th>
-                <th className="pb-2 text-right">Benchmark</th>
-                <th className="pb-2 text-right">% Sopra</th>
-                <th className="pb-2 text-right">Click 14gg</th>
-                <th className="pb-2 text-right">Margine</th>
-              </tr>
-            </thead>
-            <tbody>
-              {mcData.overpriced.map((p, i) => (
-                <tr key={i} className="border-b border-gray-100 hover:bg-gray-50">
-                  <td className="py-2 font-mono text-xs">{p.offer_id}</td>
-                  <td className="py-2 truncate max-w-[200px]" title={p.mc_title}>{p.mc_title}</td>
-                  <td className="py-2 text-gray-500 text-xs">{p.mc_brand}</td>
-                  <td className="py-2 text-right font-medium">{money(p.mc_sale_price)}</td>
-                  <td className="py-2 text-right text-green-600">{money(p.benchmark_price)}</td>
-                  <td className="py-2 text-right">
-                    <span className="text-red-600 font-medium">+{p.pct_above}%</span>
-                  </td>
-                  <td className="py-2 text-right">{n(p.clicks_14d)}</td>
-                  <td className="py-2 text-right">
-                    {p.margin_pct != null ? `${parseFloat(p.margin_pct).toFixed(1)}%` : '-'}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// ─── Opportunities Tab ─────────────────────────────────
-
-function OpportunitiesTab({ mcData }) {
-  if (!mcData?.priceOpportunities || mcData.priceOpportunities.length === 0) {
-    return <div className="text-center py-8 text-gray-400">Nessuna opportunita\u0300 di prezzo disponibile</div>;
-  }
-
-  return (
-    <div className="space-y-6">
-      <div className="bg-white rounded-lg shadow p-6">
-        <h3 className="text-sm font-semibold text-gray-700 mb-1">Opportunita\u0300 di Prezzo (Google Price Insights)</h3>
-        <p className="text-xs text-gray-400 mb-4">
-          Google suggerisce un prezzo piu\u0300 basso per questi prodotti. La colonna "Impatto" mostra l'aumento previsto di click se adotti il prezzo suggerito.
-        </p>
-        <div className="overflow-x-auto">
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="text-left text-gray-500 border-b">
-                <th className="pb-2">Codice</th>
-                <th className="pb-2">Prodotto</th>
-                <th className="pb-2 text-right">Prezzo Attuale</th>
-                <th className="pb-2 text-right">Prezzo Suggerito</th>
-                <th className="pb-2 text-right">Risparmio</th>
-                <th className="pb-2 text-right">Benchmark</th>
-                <th className="pb-2 text-right">Impatto Click</th>
-                <th className="pb-2 text-right">Impatto Impr.</th>
-                <th className="pb-2 text-right">Margine</th>
-              </tr>
-            </thead>
-            <tbody>
-              {mcData.priceOpportunities.map((p, i) => {
-                const saving = parseFloat(p.mc_sale_price) - parseFloat(p.suggested_price);
-                const clicksChange = parseFloat(p.predicted_clicks_change || 0);
-                return (
-                  <tr key={i} className="border-b border-gray-100 hover:bg-gray-50">
-                    <td className="py-2 font-mono text-xs">{p.offer_id}</td>
-                    <td className="py-2 truncate max-w-[180px]" title={p.mc_title}>{p.mc_title}</td>
-                    <td className="py-2 text-right">{money(p.mc_sale_price)}</td>
-                    <td className="py-2 text-right font-medium text-blue-600">{money(p.suggested_price)}</td>
-                    <td className="py-2 text-right text-green-600">-{money(saving)}</td>
-                    <td className="py-2 text-right text-gray-500">{p.benchmark_price ? money(p.benchmark_price) : '-'}</td>
-                    <td className="py-2 text-right">
-                      <span className={`font-medium ${clicksChange > 1 ? 'text-green-600' : clicksChange > 0 ? 'text-yellow-600' : 'text-gray-400'}`}>
-                        +{(clicksChange * 100).toFixed(0)}%
-                      </span>
-                    </td>
-                    <td className="py-2 text-right">
-                      <span className="text-gray-500">
-                        +{(parseFloat(p.predicted_impressions_change || 0) * 100).toFixed(0)}%
-                      </span>
-                    </td>
-                    <td className="py-2 text-right">
-                      {p.margin_pct != null ? `${parseFloat(p.margin_pct).toFixed(1)}%` : '-'}
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// ─── Trends Tab ────────────────────────────────────────
-
-function TrendsTab({ mcData, tp }) {
-  const gsTrend = mcData?.gsTrend || [];
-  const tpTrend = tp?.clickTrend || [];
-
-  return (
-    <div className="space-y-6">
-      {/* Google Shopping Daily Trend */}
-      {gsTrend.length > 0 && (
-        <div className="bg-white rounded-lg shadow p-6">
-          <h3 className="text-sm font-semibold text-gray-700 mb-4">Trend Google Shopping (30gg)</h3>
-          <div className="grid grid-cols-2 gap-6">
-            <div>
-              <div className="text-xs text-gray-500 mb-2">Click giornalieri</div>
-              <div className="flex items-end gap-1 h-32">
-                {gsTrend.map((day, i) => {
-                  const max = Math.max(...gsTrend.map(d => parseInt(d.clicks)));
-                  const h = max > 0 ? (parseInt(day.clicks) / max) * 100 : 0;
-                  return (
-                    <div key={i} className="flex-1 flex flex-col items-center" title={`${day.report_date}: ${n(day.clicks)} click`}>
-                      <div className="w-full bg-blue-400 rounded-t hover:bg-blue-500 transition-colors min-h-[2px]" style={{ height: `${h}%` }}></div>
-                      {i % 5 === 0 && <div className="text-[8px] text-gray-400 mt-1 -rotate-45 origin-left">{String(day.report_date).slice(5)}</div>}
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-            <div>
-              <div className="text-xs text-gray-500 mb-2">Impressioni giornaliere</div>
-              <div className="flex items-end gap-1 h-32">
-                {gsTrend.map((day, i) => {
-                  const max = Math.max(...gsTrend.map(d => parseInt(d.impressions)));
-                  const h = max > 0 ? (parseInt(day.impressions) / max) * 100 : 0;
-                  return (
-                    <div key={i} className="flex-1 flex flex-col items-center" title={`${day.report_date}: ${n(day.impressions)} impr.`}>
-                      <div className="w-full bg-purple-400 rounded-t hover:bg-purple-500 transition-colors min-h-[2px]" style={{ height: `${h}%` }}></div>
-                      {i % 5 === 0 && <div className="text-[8px] text-gray-400 mt-1 -rotate-45 origin-left">{String(day.report_date).slice(5)}</div>}
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-          </div>
-          {/* CTR trend */}
-          <div className="mt-6">
-            <div className="text-xs text-gray-500 mb-2">CTR giornaliero</div>
-            <div className="flex items-end gap-1 h-24">
-              {gsTrend.map((day, i) => {
-                const max = Math.max(...gsTrend.map(d => parseFloat(d.ctr)));
-                const h = max > 0 ? (parseFloat(day.ctr) / max) * 100 : 0;
-                return (
-                  <div key={i} className="flex-1 flex flex-col items-center" title={`${day.report_date}: ${(parseFloat(day.ctr) * 100).toFixed(2)}%`}>
-                    <div className="w-full bg-green-400 rounded-t hover:bg-green-500 transition-colors min-h-[2px]" style={{ height: `${h}%` }}></div>
-                  </div>
-                );
-              })}
-            </div>
-          </div>
-          {/* Totals */}
-          <div className="mt-4 flex gap-6 text-sm text-gray-500">
-            <span>Totale click: <b className="text-gray-800">{n(gsTrend.reduce((s, d) => s + parseInt(d.clicks), 0))}</b></span>
-            <span>Totale impressioni: <b className="text-gray-800">{n(gsTrend.reduce((s, d) => s + parseInt(d.impressions), 0))}</b></span>
-            <span>CTR medio: <b className="text-gray-800">{(gsTrend.reduce((s, d) => s + parseFloat(d.ctr), 0) / gsTrend.length * 100).toFixed(3)}%</b></span>
-          </div>
-        </div>
-      )}
-
-      {/* Trovaprezzi Daily Trend */}
-      {tpTrend.length > 0 && (
-        <div className="bg-white rounded-lg shadow p-6">
-          <h3 className="text-sm font-semibold text-gray-700 mb-4">Trend Trovaprezzi Click (30gg)</h3>
-          <div className="flex items-end gap-1 h-32">
-            {tpTrend.map((day, i) => {
-              const max = Math.max(...tpTrend.map(d => parseInt(d.total_clicks)));
-              const h = max > 0 ? (parseInt(day.total_clicks) / max) * 100 : 0;
-              return (
-                <div key={i} className="flex-1 flex flex-col items-center" title={`${day.fetch_date}: ${n(day.total_clicks)} click`}>
-                  <div className="w-full bg-orange-400 rounded-t hover:bg-orange-500 transition-colors min-h-[2px]" style={{ height: `${h}%` }}></div>
-                  {i % 3 === 0 && <div className="text-[8px] text-gray-400 mt-1 -rotate-45 origin-left">{String(day.fetch_date).slice(5)}</div>}
-                </div>
-              );
-            })}
-          </div>
-          <div className="mt-4 text-sm text-gray-500">
-            Totale click: <b className="text-gray-800">{n(tpTrend.reduce((s, d) => s + parseInt(d.total_clicks), 0))}</b>
-          </div>
-        </div>
-      )}
-
-      {/* Seller position distribution */}
-      {tp?.positionDistribution && tp.positionDistribution.length > 0 && (
-        <div className="bg-white rounded-lg shadow p-6">
-          <h3 className="text-sm font-semibold text-gray-700 mb-4">Distribuzione Posizioni Trovaprezzi ({tp.sellerName})</h3>
-          <div className="flex gap-3">
-            {tp.positionDistribution.map((p, i) => {
-              const colors = ['bg-green-500', 'bg-green-400', 'bg-yellow-400', 'bg-orange-400', 'bg-red-400'];
-              const total = tp.positionDistribution.reduce((s, x) => s + parseInt(x.count), 0);
-              const pctVal = total > 0 ? ((parseInt(p.count) / total) * 100).toFixed(1) : 0;
-              return (
-                <div key={i} className="flex-1 text-center">
-                  <div className="text-xs text-gray-500 mb-1">Pos. {p.position_range}</div>
-                  <div className={`${colors[i] || 'bg-gray-400'} text-white rounded-lg py-3 text-lg font-bold`}>
-                    {n(p.count)}
-                  </div>
-                  <div className="text-xs text-gray-400 mt-1">{pctVal}%</div>
-                </div>
-              );
-            })}
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
-
-// ─── Helpers ───────────────────────────────────────────
-
-function KPI({ label, value, sub, color }) {
-  const colors = {
-    blue: 'bg-blue-50 border-blue-200 text-blue-800',
-    green: 'bg-green-50 border-green-200 text-green-800',
-    red: 'bg-red-50 border-red-200 text-red-800',
-    purple: 'bg-purple-50 border-purple-200 text-purple-800',
-    orange: 'bg-orange-50 border-orange-200 text-orange-800',
-  };
-  return (
-    <div className={`rounded-lg border p-4 ${colors[color] || colors.blue}`}>
-      <div className="text-xs font-medium opacity-70">{label}</div>
+    <div className="rounded-lg border bg-white p-4">
+      <div className="text-xs font-medium text-gray-500">{label}</div>
       <div className="text-xl font-bold mt-1">{value}</div>
-      {sub && <div className="text-xs mt-1 opacity-60">{sub}</div>}
-    </div>
-  );
-}
-
-// === GA4 TABS ===
-
-function GA4SourcesTab() {
-  const [data, setData] = useState(null);
-  const [loading, setLoading] = useState(true);
-  useEffect(() => { api('/ga4/sources').then(setData).catch(console.error).finally(() => setLoading(false)); }, []);
-  if (loading) return <div className="flex justify-center py-8"><div className="animate-spin rounded-full h-6 w-6 border-b-2 border-brand-500" /></div>;
-  if (!data?.configured) return <div className="text-center text-gray-400 py-8">GA4 non configurato. Configura in Configurazione.</div>;
-  const sources = data.sources || [];
-  const totalRev = sources.reduce((s, v) => s + v.revenue, 0);
-  const totalSess = sources.reduce((s, v) => s + v.sessions, 0);
-  return (
-    <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
-      <div className="overflow-x-auto">
-        <table className="w-full text-sm">
-          <thead className="bg-gray-50 text-gray-500 uppercase text-xs">
-            <tr>
-              <th className="px-4 py-3 text-left">Sorgente / Mezzo</th>
-              <th className="px-3 py-3 text-right">Sessioni</th>
-              <th className="px-3 py-3 text-right">% Sessioni</th>
-              <th className="px-3 py-3 text-right">Transazioni</th>
-              <th className="px-3 py-3 text-right">Revenue</th>
-              <th className="px-3 py-3 text-right">% Revenue</th>
-              <th className="px-3 py-3 text-right">Conv. Rate</th>
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-gray-100">
-            {sources.map((s, i) => {
-              const isTP = s.source.toLowerCase().includes('trovaprezzi');
-              const cr = s.sessions > 0 ? ((s.transactions / s.sessions) * 100).toFixed(2) : '0';
-              return (
-                <tr key={i} className={`hover:bg-gray-50 ${isTP ? 'bg-yellow-50 font-medium' : ''}`}>
-                  <td className="px-4 py-3 text-gray-900">{s.source} / {s.medium} {isTP && <span className="ml-1 text-xs text-yellow-600">TP</span>}</td>
-                  <td className="px-3 py-3 text-right text-gray-700">{s.sessions.toLocaleString('it-IT')}</td>
-                  <td className="px-3 py-3 text-right text-gray-500">{totalSess > 0 ? ((s.sessions / totalSess) * 100).toFixed(1) + '%' : '-'}</td>
-                  <td className="px-3 py-3 text-right text-gray-700">{s.transactions}</td>
-                  <td className="px-3 py-3 text-right text-gray-700">{new Intl.NumberFormat('it-IT', { style: 'currency', currency: 'EUR' }).format(s.revenue)}</td>
-                  <td className="px-3 py-3 text-right text-gray-500">{totalRev > 0 ? ((s.revenue / totalRev) * 100).toFixed(1) + '%' : '-'}</td>
-                  <td className="px-3 py-3 text-right text-gray-700">{cr}%</td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
-      </div>
-    </div>
-  );
-}
-
-function GA4AttributionTab() {
-  const [data, setData] = useState(null);
-  const [loading, setLoading] = useState(true);
-  useEffect(() => { api('/ga4/attribution').then(setData).catch(console.error).finally(() => setLoading(false)); }, []);
-  if (loading) return <div className="flex justify-center py-8"><div className="animate-spin rounded-full h-6 w-6 border-b-2 border-brand-500" /></div>;
-  const s = data?.summary || {};
-  const products = data?.products || [];
-  const period = data?.period || {};
-  const fmtE = v => new Intl.NumberFormat('it-IT', { style: 'currency', currency: 'EUR' }).format(v);
-  const roas = s.totalClickCost > 0 ? (s.totalTpValue || 0) / s.totalClickCost : 0;
-  return (
-    <div className="space-y-4">
-      {period.ga4Attribution && <div className="text-xs text-gray-400 text-right">{period.ga4Attribution} | {period.lastUpdate ? `Agg: ${new Date(period.lastUpdate).toLocaleString('it-IT')}` : ''}</div>}
-      <div className="grid grid-cols-2 lg:grid-cols-5 gap-3">
-        <StatCard label="Revenue Diretta TP" value={fmtE(s.totalTpRevenue || 0)} color="green" sub={`${s.totalTpPurchases || 0} vendite`} />
-        <StatCard label="Revenue Assistita" value={fmtE(s.totalAssistedRevenue || 0)} color="blue" sub={`${s.totalAssistedSales || 0} vendite`} />
-        <StatCard label="Valore Totale TP" value={fmtE(s.totalTpValue || 0)} color="green" />
-        <StatCard label="Costo Click TP" value={fmtE(s.totalClickCost || 0)} color="red" sub={`${s.totalClicks || 0} click`} />
-        <StatCard label="ROAS TP" value={roas.toFixed(2) + 'x'} color={roas >= 3 ? 'green' : roas >= 1 ? 'amber' : 'red'} />
-      </div>
-      <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
-        <div className="overflow-x-auto">
-          <table className="w-full text-sm">
-            <thead className="bg-gray-50 text-gray-500 uppercase text-xs">
-              <tr>
-                <th className="px-4 py-3 text-left">Prodotto</th>
-                <th className="px-3 py-3 text-right">Click TP</th>
-                <th className="px-3 py-3 text-right">Vendite Dir.</th>
-                <th className="px-3 py-3 text-right">Rev. Diretta</th>
-                <th className="px-3 py-3 text-right">Vendite Ass.</th>
-                <th className="px-3 py-3 text-right">Rev. Assistita</th>
-                <th className="px-3 py-3 text-right">Valore Tot.</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-gray-100">
-              {products.slice(0, 50).map(p => (
-                <tr key={p.sku} className="hover:bg-gray-50">
-                  <td className="px-4 py-3"><div className="font-medium text-gray-900 truncate max-w-[200px]">{p.product_name || p.sku}</div><div className="text-xs text-gray-400">{p.sku}</div></td>
-                  <td className="px-3 py-3 text-right text-gray-700">{parseInt(p.tp_clicks_30d) || 0}</td>
-                  <td className="px-3 py-3 text-right text-gray-700">{parseInt(p.ga4_tp_purchases) || 0}</td>
-                  <td className="px-3 py-3 text-right text-green-600">{parseFloat(p.ga4_tp_revenue) > 0 ? fmtE(p.ga4_tp_revenue) : '-'}</td>
-                  <td className="px-3 py-3 text-right text-gray-700">{parseInt(p.ga4_assisted_sales) || 0}</td>
-                  <td className="px-3 py-3 text-right text-blue-600">{parseFloat(p.ga4_assisted_revenue) > 0 ? fmtE(p.ga4_assisted_revenue) : '-'}</td>
-                  <td className="px-3 py-3 text-right font-semibold">{parseFloat(p.ga4_total_tp_value) > 0 ? fmtE(p.ga4_total_tp_value) : '-'}</td>
-                </tr>
-              ))}
-              {products.length === 0 && <tr><td colSpan={7} className="px-4 py-8 text-center text-gray-400">Nessun dato. Esegui import GA4.</td></tr>}
-            </tbody>
-          </table>
-        </div>
-      </div>
     </div>
   );
 }
 
 function n(val) { return parseInt(val || 0).toLocaleString('it-IT'); }
 function money(val) { return val ? new Intl.NumberFormat('it-IT', { style: 'currency', currency: 'EUR' }).format(parseFloat(val)) : '-'; }
-function pct(part, total) {
-  const p = parseInt(part || 0), t = parseInt(total || 0);
-  return t > 0 ? ((p / t) * 100).toFixed(1) : '0';
-}

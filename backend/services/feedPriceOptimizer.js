@@ -84,7 +84,11 @@ function calculatePriceCut(product, config, competitiveData) {
   const currentMargin = sellPrice - cost;
   if (currentMargin <= 0) return null;
 
-  const minMarginPct = parseFloat(config.feed_min_margin_pct || 8);
+  // Minimum markup by price tier: <10€→18%, 10-30€→14%, >30€→12%
+  const minMarkupPct = sellPrice < 5 ? 25 : (sellPrice < 10 ? 18 : 14);
+  // Floor price = cost * (1 + minMarkup%)
+  const floorPrice = +(cost * (1 + minMarkupPct / 100)).toFixed(2);
+  const minMarginPct = minMarkupPct;
   const minMarginEur = parseFloat(config.feed_min_margin_eur || 0.50);
 
   // 1. Find tier
@@ -129,13 +133,14 @@ function calculatePriceCut(product, config, competitiveData) {
   // Don't cut by less than 10 cents
   if (sellPrice - targetPrice < 0.10) return null;
 
-  // 5. Safety checks
-  const newPrice = +Math.max(targetPrice, cost * (1 + minMarginPct / 100)).toFixed(2);
+  // 5. Safety checks — enforce floor price (cost * (1 + minMarkup%))
+  const newPrice = +Math.max(targetPrice, floorPrice).toFixed(2);
   const newMargin = newPrice - cost;
   const newMarginPct = (newMargin / newPrice) * 100;
+  const newMarkupPct = cost > 0 ? ((newPrice - cost) / cost) * 100 : 0;
 
-  // Minimum margin checks
-  if (newMarginPct < minMarginPct) return null;
+  // Minimum markup check (cost-based, not price-based)
+  if (newMarkupPct < minMarkupPct) return null;
   if (newMargin < minMarginEur) return null;
 
   // Tier-specific margin preservation
@@ -179,10 +184,11 @@ function calculatePnlPriceCut(product, config) {
   const newMargin = newPrice - cost;
   const newMarginPct = (newMargin / newPrice) * 100;
 
-  const minMarginPct = parseFloat(config.feed_min_margin_pct || 8);
+  const minMarkupPct = newPrice < 5 ? 25 : (newPrice < 10 ? 18 : 14);
+  const newMarkupPct = cost > 0 ? ((newPrice - cost) / cost) * 100 : 0;
   const minMarginEur = parseFloat(config.feed_min_margin_eur || 0.50);
 
-  if (newMarginPct < minMarginPct || newMargin < minMarginEur) return null;
+  if (newMarkupPct < minMarkupPct || newMargin < minMarginEur) return null;
 
   return {
     feasible: true,
@@ -195,9 +201,111 @@ function calculatePnlPriceCut(product, config) {
   };
 }
 
+/**
+ * Calculate competitive price cut to match/beat best competitor price.
+ * Respects minimum markup by price tier: <10€→18%, 10-30€→14%, >30€→12%
+ *
+ * @param {Object} product - Product with sell_price, erp_cost, scraper_best_price, sales_30d_aggregated
+ * @returns {Object|null} { feasible, newPrice, cutPct, newMarkupPct, reason }
+ */
+function calculateCompetitivePriceCut(product) {
+  const sellPrice = parseFloat(product.sell_price) || 0;
+  const bestPrice = parseFloat(product.scraper_best_price || product.best_price) || 0;
+  const { cost } = resolveStockAndCost(product);
+
+  if (sellPrice <= 0 || cost <= 0 || bestPrice <= 0) return null;
+  if (sellPrice <= bestPrice * 1.02) return null; // already competitive
+
+  const minMarkupPct = sellPrice < 5 ? 25 : (sellPrice < 10 ? 18 : 14);
+  const floorPrice = +(cost * (1 + minMarkupPct / 100)).toFixed(2);
+
+  // Target: match best price or go 1% below
+  let targetPrice = +(bestPrice * 0.99).toFixed(2);
+
+  // Can we reach the target?
+  if (targetPrice >= floorPrice) {
+    const cutPct = +((sellPrice - targetPrice) / sellPrice * 100).toFixed(1);
+    const newMarkupPct = +((targetPrice - cost) / cost * 100).toFixed(1);
+    return {
+      feasible: true,
+      newPrice: targetPrice,
+      cutPct,
+      newMarkupPct,
+      reason: `Match best ${bestPrice} (-1%), markup ${newMarkupPct}% (min ${minMarkupPct}%)`,
+    };
+  }
+
+  // Can't match, but can get closer (floor is within 10% of best)?
+  if (floorPrice <= bestPrice * 1.10 && floorPrice < sellPrice) {
+    const cutPct = +((sellPrice - floorPrice) / sellPrice * 100).toFixed(1);
+    const newMarkupPct = +((floorPrice - cost) / cost * 100).toFixed(1);
+    return {
+      feasible: true,
+      newPrice: floorPrice,
+      cutPct,
+      newMarkupPct,
+      reason: `Floor price (${minMarkupPct}% markup), gap ${((floorPrice/bestPrice - 1)*100).toFixed(0)}% da best ${bestPrice}`,
+    };
+  }
+
+  return null; // gap too large
+}
+
+/**
+ * Calculate topsearch recovery price cut for products that convert
+ * but are priced above competition.
+ *
+ * More aggressive than standard competitive cut: targets best_price - 0.01
+ * or floor price, whichever is higher. Applies to star/cash_cow/opportunity
+ * products that need to maintain position after losing topsearch visibility.
+ *
+ * Uses minimum markup by price tier: <10€→18%, 10-30€→14%, >30€→12%
+ *
+ * @param {Object} product - Product with sell_price, erp_cost, scraper_best_price, classification
+ * @returns {Object|null} { feasible, newPrice, cutPct, newMarkupPct, reason }
+ */
+function calculateRecoveryPriceCut(product) {
+  const sellPrice = parseFloat(product.sell_price) || 0;
+  const bestPrice = parseFloat(product.scraper_best_price || product.best_price) || 0;
+  const { cost } = resolveStockAndCost(product);
+
+  if (sellPrice <= 0 || cost <= 0 || bestPrice <= 0) return null;
+  if (sellPrice <= bestPrice) return null; // already at or below best
+
+  const minMarkupPct = sellPrice < 5 ? 25 : (sellPrice < 10 ? 18 : 14);
+  const floorPrice = +(cost / (1 - minMarkupPct / 100)).toFixed(2);
+
+  // Target: beat best price by 1 cent, but never below floor
+  const targetPrice = +Math.max(bestPrice - 0.01, floorPrice).toFixed(2);
+
+  // Must actually cut something meaningful
+  if (targetPrice >= sellPrice || (sellPrice - targetPrice) < 0.05) return null;
+
+  const cutPct = +((sellPrice - targetPrice) / sellPrice * 100).toFixed(1);
+  const newMarkupPct = +((targetPrice - cost) / cost * 100).toFixed(1);
+
+  // Final safety: markup must meet minimum
+  if (newMarkupPct < minMarkupPct) return null;
+
+  const hitsTarget = targetPrice <= bestPrice;
+  const reason = hitsTarget
+    ? `Recovery: sotto best ${bestPrice} a €${targetPrice} (markup ${newMarkupPct}%, min ${minMarkupPct}%)`
+    : `Recovery: floor €${targetPrice} (gap ${((targetPrice/bestPrice - 1)*100).toFixed(0)}% da best ${bestPrice}, markup ${newMarkupPct}%)`;
+
+  return {
+    feasible: true,
+    newPrice: targetPrice,
+    cutPct,
+    newMarkupPct,
+    reason,
+  };
+}
+
 module.exports = {
   resolveStockAndCost,
   calculatePriceCut,
   calculatePnlPriceCut,
+  calculateCompetitivePriceCut,
+  calculateRecoveryPriceCut,
   PRICE_CUT_TIERS,
 };

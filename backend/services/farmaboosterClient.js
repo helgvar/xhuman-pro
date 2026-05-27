@@ -49,6 +49,13 @@ async function getFarmaboosterConfig(tenantId) {
     throw new Error('Farmabooster configuration missing (url, email or password)');
   }
 
+  // Normalizzazione URL: aggiungi 'https://' se manca lo schema, rimuovi trailing slash.
+  // Bug ricorrente: l'utente salva da UI senza schema → fetch fallisce con "Invalid URL".
+  let url = String(config.farmabooster_api_url).trim();
+  if (!/^https?:\/\//i.test(url)) url = 'https://' + url;
+  url = url.replace(/\/+$/, '');
+  config.farmabooster_api_url = url;
+
   return config;
 }
 
@@ -95,16 +102,19 @@ async function getToken(tenantId, config) {
 }
 
 /**
- * Make a single API call to Farmabooster with rate limiting + retry
+ * Make a single API call to Farmabooster via GLOBAL queue.
+ * All calls go through farmaboosterQueue (max 3 concurrent, circuit breaker).
+ * No retry on timeout — avoids piling up requests on a slow server.
  */
 async function apiCall(tenantId, config, endpoint, params = {}) {
-  await checkRateLimit(tenantId, 'farmabooster');
+  const { farmaboosterQueue } = require('./apiQueue');
+  const dedupKey = `fb:${tenantId}:${endpoint}:${params.page || ''}`;
 
-  const token = await getToken(tenantId, config);
+  return farmaboosterQueue.enqueue(async () => {
+    await checkRateLimit(tenantId, 'farmabooster');
+    const token = await getToken(tenantId, config);
 
-  return retryWithBackoff(async () => {
     const url = `${config.farmabooster_api_url}/${endpoint}`;
-
     const response = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -112,7 +122,6 @@ async function apiCall(tenantId, config, endpoint, params = {}) {
     });
 
     if (!response.ok) {
-      // If 401/403, clear cached token and retry
       if (response.status === 401 || response.status === 403) {
         clearCachedToken(`fb:${tenantId}`);
       }
@@ -122,14 +131,12 @@ async function apiCall(tenantId, config, endpoint, params = {}) {
     }
 
     const data = await response.json();
-    // Login returns { ok, data: { token } }, other endpoints return { page, total_records, data }
-    // Only fail if explicitly ok === false (not if ok is absent)
     if (data.ok === false) {
       throw new Error(`Farmabooster API ${endpoint}: response not ok`);
     }
 
     return data;
-  }, { maxRetries: 3, baseDelay: 2000, maxDelay: 10000 });
+  }, dedupKey);
 }
 
 /**

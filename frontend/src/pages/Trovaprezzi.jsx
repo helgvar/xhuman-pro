@@ -173,7 +173,7 @@ export default function Trovaprezzi() {
           onPageChange={(p) => loadClicks(p)}
         />
       )}
-      {tab === 'merchants' && <MerchantsTab overview={overview} />}
+      {tab === 'merchants' && <MerchantsTab overview={overview} authFetch={api} />}
       {tab === 'runs' && <RunsTab overview={overview} statusColors={statusColors} />}
     </div>
   );
@@ -455,9 +455,106 @@ function ClicksTab({ clicks, pagination, loading, search, setSearch, date, setDa
   );
 }
 
-// ─── Merchants Tab ─────────────────────────────────────
+// ─── Merchants Tab (with sub-tabs: Global + Rivals) ───
 
-function MerchantsTab({ overview }) {
+function MerchantsTab({ overview, authFetch }) {
+  const [subTab, setSubTab] = useState('rivals');
+  const [rivals, setRivals] = useState(null);
+  const [loadingRivals, setLoadingRivals] = useState(false);
+
+  useEffect(() => {
+    if (subTab === 'rivals' && !rivals) {
+      setLoadingRivals(true);
+      authFetch('/api/trovaprezzi/rivals')
+        .then(data => setRivals(data))
+        .catch(() => setRivals({ rivals: [] }))
+        .finally(() => setLoadingRivals(false));
+    }
+  }, [subTab, rivals, authFetch]);
+
+  return (
+    <div>
+      <div className="flex gap-4 mb-4">
+        <button
+          className={`px-4 py-2 rounded-lg text-sm font-medium ${subTab === 'rivals' ? 'bg-teal-600 text-white' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'}`}
+          onClick={() => setSubTab('rivals')}
+        >
+          I tuoi Rivali
+        </button>
+        <button
+          className={`px-4 py-2 rounded-lg text-sm font-medium ${subTab === 'global' ? 'bg-teal-600 text-white' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'}`}
+          onClick={() => setSubTab('global')}
+        >
+          Top Seller Globale
+        </button>
+      </div>
+
+      {subTab === 'rivals' ? (
+        <RivalsSubTab rivals={rivals} loading={loadingRivals} />
+      ) : (
+        <GlobalMerchantsSubTab overview={overview} />
+      )}
+    </div>
+  );
+}
+
+function RivalsSubTab({ rivals, loading }) {
+  if (loading) return <div className="text-gray-400 text-center py-8">Caricamento rivali...</div>;
+  if (!rivals?.rivals?.length) return <div className="text-gray-400 text-center py-8">Nessun rivale trovato (servono dati scraper con il tuo seller)</div>;
+
+  return (
+    <div className="bg-white rounded-lg shadow overflow-x-auto">
+      <table className="w-full text-sm">
+        <thead>
+          <tr className="text-left text-gray-500 border-b bg-gray-50">
+            <th className="px-3 py-3">#</th>
+            <th className="px-3 py-3">Rivale</th>
+            <th className="px-3 py-3 text-right">Battaglie</th>
+            <th className="px-3 py-3 text-right">Vinci tu</th>
+            <th className="px-3 py-3 text-right">Vince lui</th>
+            <th className="px-3 py-3 text-right">Win Rate</th>
+            <th className="px-3 py-3 text-right">Tuo prezzo</th>
+            <th className="px-3 py-3 text-right">Suo prezzo</th>
+            <th className="px-3 py-3 text-right">Gap %</th>
+            <th className="px-3 py-3 text-right">Tua pos.</th>
+            <th className="px-3 py-3 text-right">Sua pos.</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rivals.rivals.map((r, i) => {
+            const winRate = parseFloat(r.win_rate) || 0;
+            const gap = parseFloat(r.price_gap_pct) || 0;
+            return (
+              <tr key={i} className="border-b border-gray-100 hover:bg-gray-50">
+                <td className="px-3 py-2 text-gray-400">{i + 1}</td>
+                <td className="px-3 py-2 font-medium">{r.rival}</td>
+                <td className="px-3 py-2 text-right font-semibold">{parseInt(r.battles).toLocaleString()}</td>
+                <td className="px-3 py-2 text-right text-green-600 font-medium">{r.i_win}</td>
+                <td className="px-3 py-2 text-right text-red-600 font-medium">{r.they_win}</td>
+                <td className="px-3 py-2 text-right">
+                  <span className={`font-semibold ${winRate >= 50 ? 'text-green-600' : winRate >= 30 ? 'text-yellow-600' : 'text-red-600'}`}>
+                    {winRate.toFixed(0)}%
+                  </span>
+                </td>
+                <td className="px-3 py-2 text-right">{parseFloat(r.my_avg_price).toFixed(2)} &euro;</td>
+                <td className="px-3 py-2 text-right">{parseFloat(r.rival_avg_price).toFixed(2)} &euro;</td>
+                <td className="px-3 py-2 text-right">
+                  <span className={gap > 0 ? 'text-red-600' : gap < -3 ? 'text-green-600' : 'text-gray-600'}>
+                    {gap > 0 ? '+' : ''}{gap.toFixed(1)}%
+                  </span>
+                </td>
+                <td className="px-3 py-2 text-right">{parseFloat(r.my_avg_position).toFixed(1)}</td>
+                <td className="px-3 py-2 text-right">{parseFloat(r.rival_avg_position).toFixed(1)}</td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function GlobalMerchantsSubTab({ overview }) {
   if (!overview?.topMerchants) return <div className="text-gray-400 text-center py-8">Nessun dato</div>;
 
   return (
@@ -476,11 +573,11 @@ function MerchantsTab({ overview }) {
           {overview.topMerchants.map((m, i) => {
             const isSelf = overview.sellerName && m.merchant.toLowerCase().includes(overview.sellerName.toLowerCase());
             return (
-              <tr key={i} className={`border-b border-gray-100 ${isSelf ? 'bg-brand-50 font-medium' : 'hover:bg-gray-50'}`}>
+              <tr key={i} className={`border-b border-gray-100 ${isSelf ? 'bg-teal-50 font-medium' : 'hover:bg-gray-50'}`}>
                 <td className="px-3 py-2 text-gray-400">{i + 1}</td>
                 <td className="px-3 py-2">
                   {m.merchant}
-                  {isSelf && <span className="ml-2 px-1.5 py-0.5 bg-brand-100 text-brand-700 text-[10px] rounded font-bold">TU</span>}
+                  {isSelf && <span className="ml-2 px-1.5 py-0.5 bg-teal-100 text-teal-700 text-[10px] rounded font-bold">TU</span>}
                 </td>
                 <td className="px-3 py-2 text-right font-medium">{parseInt(m.product_count).toLocaleString()}</td>
                 <td className="px-3 py-2 text-right">

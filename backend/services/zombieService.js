@@ -205,8 +205,15 @@ class ZombieService {
       }
 
       if (noDataFound && !downloadEl) {
-        console.log(`[Zombie][T:${tenantId.slice(0, 8)}] No data on page (seller may be suspended/budget exhausted)`);
-        return null;
+        console.log(`[Zombie][T:${tenantId.slice(0, 8)}] No data on page (budget esaurito o campagna sospesa)`);
+        return 'NO_BUDGET';
+      }
+
+      // Empty page = budget exhausted (no analytics page rendered)
+      const bodyText = await page.evaluate(() => document.body?.innerText?.trim() || '');
+      if (bodyText.length === 0 && !downloadEl) {
+        console.log(`[Zombie][T:${tenantId.slice(0, 8)}] Empty page — budget esaurito`);
+        return 'NO_BUDGET';
       }
 
       // 4. Click download
@@ -237,7 +244,24 @@ class ZombieService {
       }
 
       if (!csvFile) {
-        console.log(`[Zombie][T:${tenantId.slice(0, 8)}] No file downloaded after ${maxWait / 1000}s`);
+        // Diagnostic: save screenshot to understand what the page shows
+        try {
+          const screenshotPath = path.join(os.tmpdir(), `zombie-debug-${tenantId.slice(0, 8)}-${Date.now()}.png`);
+          await page.screenshot({ path: screenshotPath, fullPage: true });
+          console.log(`[Zombie][T:${tenantId.slice(0, 8)}] No file downloaded after ${maxWait / 1000}s — screenshot: ${screenshotPath}`);
+          console.log(`[Zombie][T:${tenantId.slice(0, 8)}] Page URL: ${page.url()}`);
+          // Log visible buttons/links for debugging selectors
+          const visibleLinks = await page.evaluate(() => {
+            return Array.from(document.querySelectorAll('a, button')).slice(0, 20).map(el => ({
+              tag: el.tagName, text: (el.textContent || '').trim().slice(0, 50),
+              href: el.getAttribute('href')?.slice(0, 80) || '',
+              id: el.id, className: (el.className || '').toString().slice(0, 50),
+            }));
+          });
+          console.log(`[Zombie][T:${tenantId.slice(0, 8)}] Visible elements:`, JSON.stringify(visibleLinks.filter(l => l.text), null, 0));
+        } catch (dbgErr) {
+          console.log(`[Zombie][T:${tenantId.slice(0, 8)}] No file downloaded after ${maxWait / 1000}s (screenshot failed: ${dbgErr.message})`);
+        }
         return null;
       }
 
@@ -374,16 +398,23 @@ class ZombieService {
 
   // ─── Main run for a tenant ───────────────────────────────
 
-  async runForTenant(tenantId) {
+  async runForTenant(tenantId, dateOverride) {
     const config = await this.getConfig(tenantId);
     if (!config.trovaprezzi_username || !config.trovaprezzi_password) {
       throw new Error('Trovaprezzi credentials not configured');
     }
 
-    const yesterday = new Date();
-    yesterday.setDate(yesterday.getDate() - 1);
-    const dateStr = yesterday.toISOString().slice(0, 10).replace(/-/g, '');
-    const fetchDate = yesterday.toISOString().slice(0, 10);
+    let fetchDate, dateStr;
+    if (dateOverride) {
+      // Accept YYYY-MM-DD format
+      fetchDate = dateOverride;
+      dateStr = dateOverride.replace(/-/g, '');
+    } else {
+      const yesterday = new Date();
+      yesterday.setDate(yesterday.getDate() - 1);
+      dateStr = yesterday.toISOString().slice(0, 10).replace(/-/g, '');
+      fetchDate = yesterday.toISOString().slice(0, 10);
+    }
 
     const { rows: [run] } = await pool.query(
       `INSERT INTO zombie_runs (tenant_id, run_date, status, started_at)

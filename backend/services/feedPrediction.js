@@ -30,7 +30,7 @@ async function generatePredictions(tenantId) {
     `SELECT config_value FROM health_config WHERE tenant_id = $1 AND config_key = 'avg_tp_cpc'`,
     [tenantId]
   );
-  const cpc = parseFloat(cpcRow.rows[0]?.config_value) || 0.3294;
+  const cpc = parseFloat(cpcRow.rows[0]?.config_value) || 0.27;
 
   let created = 0;
   for (const a of actionableProducts) {

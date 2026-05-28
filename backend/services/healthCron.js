@@ -32,7 +32,10 @@ const log = require('./logger');
 let cronTimer = null;
 let _cronRunning = false; // Prevent overlapping cron runs
 const INTERVAL_MS = 1 * 60 * 60 * 1000; // 1 hour
-const _lastMCRunByTenant = new Map(); // Track daily Merchant Center sync per tenant
+// Lo stato "ultimo sync MC" viene letto direttamente da merchant_center_runs:
+// la Map in-memory si resettava ad ogni restart container facendo perdere il
+// tracking, e nella finestra ridotta 04-06 i tenant a fine lista non venivano
+// mai processati (es. Procaccini/MPF/SubitoFarma con 0 runs storici).
 let _lastAIDailyRun = null; // Track daily AI Explainer run (09:00 window)
 
 // Step wrapper: esegue un await con timeout. Se scade, logga fatal e ritorna { timedOut:true }.
@@ -193,15 +196,22 @@ async function _runForAllTenantsInner() {
         return await persistGA4Attribution(tenant.id);
       }, 120 * 1000);
 
-      // Step 2b: MC sync (finestra 04-06, timeout 600s)
-      const now = new Date();
-      if (now.getHours() >= 4 && now.getHours() < 6) {
-        const lastAgo = _lastMCRunByTenant.get(tenant.id)
-          ? Date.now() - _lastMCRunByTenant.get(tenant.id) : Infinity;
-        if (lastAgo > 22 * 3600 * 1000) {
-          const mcRes = await withStepTimeout('mc_sync', tenant.id, tLabel,
+      // Step 2b: MC sync (finestra 04-12 UTC, max 1 volta ogni 22h per tenant).
+      // 8 ore di finestra perche' processare 8 tenant in sequenza richiede
+      // 50-60 min totali; le vecchie 2 ore (04-06) facevano restare fuori 4
+      // tenant senza nessun sync MC mai.
+      if (new Date().getUTCHours() >= 4 && new Date().getUTCHours() < 12) {
+        const { rows: lastRunRows } = await pool.query(
+          `SELECT EXTRACT(EPOCH FROM (NOW() - started_at)) AS sec_ago
+           FROM merchant_center_runs
+           WHERE tenant_id = $1 AND status = 'completed'
+           ORDER BY started_at DESC LIMIT 1`,
+          [tenant.id]
+        );
+        const secAgo = lastRunRows[0]?.sec_ago ?? Number.POSITIVE_INFINITY;
+        if (secAgo > 22 * 3600) {
+          await withStepTimeout('mc_sync', tenant.id, tLabel,
             () => importMerchantCenter(tenant.id), 600 * 1000);
-          if (mcRes.ok) _lastMCRunByTenant.set(tenant.id, Date.now());
         }
       }
 

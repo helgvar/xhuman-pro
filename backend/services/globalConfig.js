@@ -9,6 +9,7 @@ const GLOBAL_KEYS = new Set([
   'telegram_chat_id',
   'anthropic_api_key',
   'claude_api_key',
+  'pepite_rules',
 ]);
 
 const _cache = new Map();

@@ -617,13 +617,37 @@ async function findPriceCutCandidates(tenantId, config, snapshot) {
 
 // ─── FASE 5: RIBILANCIAMENTO (PEPITE) ─────────────────
 
-async function findPepite(tenantId, config, snapshot, removedCost) {
-  if (!snapshot || snapshot.overTarget) return []; // Non aggiungere se siamo sopra target
+// Default rules: usati se global_config.pepite_rules non e' valorizzato.
+// Override via UPSERT su global_config (config_key='pepite_rules') con JSON.
+const PEPITE_DEFAULT_RULES = {
+  golden: { position_max: 5, margin_min: 8, sales_min: 3, limit: 50 },
+  silver: { enabled: true, position_min: 6, position_max: 10, margin_min: 12, sales_min: 5, limit: 50 },
+  budget_split_pct: 50,
+  min_budget_eur: 5,
+};
 
-  const availableBudget = removedCost * 0.5; // Usa il 50% del risparmio
-  if (availableBudget < 5) return [];
+async function loadPepiteRules() {
+  try {
+    const { getGlobal } = require('./globalConfig');
+    const raw = await getGlobal('pepite_rules');
+    if (!raw) return PEPITE_DEFAULT_RULES;
+    const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    // Merge poco profondo per default-safe: se la config arriva incompleta dal
+    // DB, tieni i default sui campi mancanti invece di crashare.
+    return {
+      ...PEPITE_DEFAULT_RULES,
+      ...parsed,
+      golden: { ...PEPITE_DEFAULT_RULES.golden, ...(parsed.golden || {}) },
+      silver: { ...PEPITE_DEFAULT_RULES.silver, ...(parsed.silver || {}) },
+    };
+  } catch (e) {
+    console.warn(`[FeedDaily] pepite_rules invalid, usando default: ${e.message}`);
+    return PEPITE_DEFAULT_RULES;
+  }
+}
 
-  const { rows: pepite } = await pool.query(`
+async function queryPepiteTier(tenantId, posMin, posMax, marginMin, salesMin, limit) {
+  const { rows } = await pool.query(`
     SELECT p.sku, p.product_name,
       ROUND(p.sell_price::numeric, 2) as sell_price,
       ROUND(p.margin_pct::numeric, 1) as margin_pct,
@@ -640,25 +664,56 @@ async function findPepite(tenantId, config, snapshot, removedCost) {
     WHERE p.tenant_id = $1
       AND (p.is_civetta = false OR p.is_civetta IS NULL)
       AND p.saleable = true
-      AND COALESCE(p.margin_pct, 0) >= 8
+      AND COALESCE(p.margin_pct, 0) >= $2
       AND (COALESCE(p.erp_stock,0) + COALESCE(p.supplier_stock,0)) > 0
-      AND COALESCE(p.sales_30d_aggregated, 0) >= 3
+      AND COALESCE(p.sales_30d_aggregated, 0) >= $3
       AND fk.id IS NULL
       AND fq.id IS NULL
-      AND phs.scraper_position BETWEEN 1 AND 5
+      AND phs.scraper_position BETWEEN $4 AND $5
     ORDER BY p.sales_30d_aggregated DESC, phs.health_score DESC
-    LIMIT 50
-  `, [tenantId]);
+    LIMIT $6
+  `, [tenantId, marginMin, salesMin, posMin, posMax, limit]);
+  return rows;
+}
 
-  return pepite.map(p => ({
+async function findPepite(tenantId, config, snapshot, removedCost) {
+  if (!snapshot || snapshot.overTarget) return [];
+
+  const rules = await loadPepiteRules();
+  const availableBudget = removedCost * (rules.budget_split_pct / 100);
+  if (availableBudget < rules.min_budget_eur) return [];
+
+  const goldenRows = await queryPepiteTier(
+    tenantId, 1, rules.golden.position_max,
+    rules.golden.margin_min, rules.golden.sales_min, rules.golden.limit
+  );
+
+  let silverRows = [];
+  if (rules.silver.enabled) {
+    silverRows = await queryPepiteTier(
+      tenantId, rules.silver.position_min, rules.silver.position_max,
+      rules.silver.margin_min, rules.silver.sales_min, rules.silver.limit
+    );
+    // Dedup: se per qualche motivo un SKU compare in entrambi (es. range che si
+    // sovrappone in config custom), tieni solo Golden.
+    const goldenSkus = new Set(goldenRows.map(r => r.sku));
+    silverRows = silverRows.filter(r => !goldenSkus.has(r.sku));
+  }
+
+  const toAction = (p, tier) => ({
     sku: p.sku, name: p.product_name, action: 'ADD',
-    reason: `Pepita: venduto globale ${p.sales_30d_aggregated}, pos ${p.scraper_position}/${p.scraper_competitor_count}, margine ${p.margin_pct}%`,
-    category: 'pepita',
+    reason: `Pepita ${tier.toUpperCase()}: venduto globale ${p.sales_30d_aggregated}, pos ${p.scraper_position}/${p.scraper_competitor_count}, margine ${p.margin_pct}%`,
+    category: `pepita_${tier}`,
     sellPrice: parseFloat(p.sell_price),
     marginPct: parseFloat(p.margin_pct),
     demand: parseFloat(p.sales_30d_aggregated),
     position: p.scraper_position,
-  }));
+  });
+
+  return [
+    ...goldenRows.map(p => toAction(p, 'golden')),
+    ...silverRows.map(p => toAction(p, 'silver')),
+  ];
 }
 
 // ─── FASE 6: SAVE DAILY SUMMARY ───────────────────────

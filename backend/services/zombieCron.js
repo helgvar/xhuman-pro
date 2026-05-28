@@ -13,7 +13,9 @@ const zombieService = require('./zombieService');
 
 let cronTimer = null;
 
-const RUN_HOUR = 6;  // 06:00 local time
+const RUN_HOUR = 3;  // 03:00 UTC = 05:00 Italia. Spostato da 06:00 perche gli utenti
+// guardano la dashboard tra 07:00-08:00 italiane e prima del cron yesterday appariva
+// con dato parziale (healthCron Step 0 fa fetch a meta' mattina precedente).
 const RUN_MIN  = 0;
 
 function startZombieCron() {

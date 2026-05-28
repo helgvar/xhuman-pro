@@ -1,8 +1,11 @@
 const express = require('express');
+const { authMiddleware } = require('../middleware/auth');
+const { tenantMiddleware } = require('../middleware/tenant');
 const { requireRole } = require('../middleware/acl');
 const cc = require('../services/crossChannelAnalysis');
 
 const router = express.Router();
+router.use(authMiddleware, tenantMiddleware);
 
 // GET /api/cross-channel/summary?days=30 - KPI aggregati + top anomalie
 router.get('/summary', requireRole('superadmin', 'admin', 'viewer'), async (req, res) => {

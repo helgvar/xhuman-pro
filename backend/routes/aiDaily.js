@@ -1,9 +1,12 @@
 const express = require('express');
 const { pool } = require('../db/pool');
+const { authMiddleware } = require('../middleware/auth');
+const { tenantMiddleware } = require('../middleware/tenant');
 const { requireRole } = require('../middleware/acl');
 const explainer = require('../services/aiDailyExplainer');
 
 const router = express.Router();
+router.use(authMiddleware, tenantMiddleware);
 
 // GET /api/ai-daily/note?date=2026-05-27 - ultima nota del tenant (default oggi)
 router.get('/note', requireRole('superadmin', 'admin', 'viewer'), async (req, res) => {

@@ -735,12 +735,15 @@ async function applyActions(tenantId, actions, config) {
     }
 
     if (values.length > 0) {
+      // ON CONFLICT DO NOTHING perche' uno stesso SKU puo' apparire in piu' categorie
+      // (es. remove + monitor in eccezioni). Mantieni il primo (ordine: REMOVE > KEEP > PRICE_CUT > MONITOR > ADD).
       await pool.query(`
         INSERT INTO feed_actions
           (tenant_id, sku, action, action_reason, action_source,
            clicks_consumed, cost_consumed, tp_position, direct_revenue,
            has_conversions, current_price, recommended_price, price_cut_pct)
         VALUES ${values.join(',')}
+        ON CONFLICT (tenant_id, sku) DO NOTHING
       `, params);
     }
   }

@@ -248,7 +248,7 @@ async function evaluateOne(test) {
   const orderRatio = expectedOrders > 0 ? m.orders / expectedOrders : 0;
 
   await pool.query(
-    `UPDATE ab_tests SET test_clicks=$1, test_orders=$2, test_revenue=$3,
+    `UPDATE ab_tests SET test_clicks=$1::int, test_orders=$2::int, test_revenue=$3::numeric,
        test_cpa = CASE WHEN $2::int > 0 THEN $1::numeric/$2::numeric ELSE NULL END
      WHERE id=$4`,
     [m.clicks, m.orders, m.revenue, test.id]);

@@ -389,22 +389,53 @@ async function syncCivettaFromMagento(tenantId) {
     return 0;
   }
 
-  // Fetch all SKUs with civetta=1 from Magento (paginated, via queue)
+  // Fetch all SKUs with civetta=1 from Magento — paginazione parallelizzata.
+  // PageSize 1000 (vs 300) -> 70% meno pagine. Batch 3 paralleli con pause 500ms
+  // per non saturare Magento (alcuni hanno 1-2 worker).
+  const PAGE_SIZE = 1000;
+  const PARALLEL_BATCH = 3;
+  const BATCH_PAUSE_MS = 500;
   const civetta1Set = new Set();
-  let page = 1;
-  while (true) {
-    const url = `${baseUrl}/rest/V1/products?searchCriteria[filterGroups][0][filters][0][field]=civetta&searchCriteria[filterGroups][0][filters][0][value]=${civettaOptionFor1}&searchCriteria[pageSize]=300&searchCriteria[currentPage]=${page}&fields=items[sku]`;
-    const resp = await magentoQueue.enqueue(
-      () => fetch(url, { headers }),
-      `magento:civetta-list:${tenantId}:${page}`
-    );
-    if (!resp.ok) break;
-    const data = await resp.json();
-    const items = data.items || [];
-    if (items.length === 0) break;
-    items.forEach(i => civetta1Set.add(i.sku));
-    page++;
-    if (items.length < 300) break;
+  const baseUrlFilter = `${baseUrl}/rest/V1/products?searchCriteria[filterGroups][0][filters][0][field]=civetta&searchCriteria[filterGroups][0][filters][0][value]=${civettaOptionFor1}&searchCriteria[pageSize]=${PAGE_SIZE}&fields=items[sku],total_count`;
+
+  // 1. Prima chiamata per total_count + items page 1
+  const firstResp = await magentoQueue.enqueue(
+    () => fetch(`${baseUrlFilter}&searchCriteria[currentPage]=1`, { headers }),
+    `magento:civetta-list:${tenantId}:1`
+  );
+  if (!firstResp.ok) {
+    console.log(`[Products] Civetta first page failed: ${firstResp.status}`);
+    return 0;
+  }
+  const firstData = await firstResp.json();
+  const totalCount = firstData.total_count || 0;
+  (firstData.items || []).forEach(i => civetta1Set.add(i.sku));
+  const totalPages = Math.ceil(totalCount / PAGE_SIZE);
+  console.log(`[Products] Civetta sync: ${totalCount} SKU su ${totalPages} pagine (pageSize=${PAGE_SIZE}, ${PARALLEL_BATCH} parallel)`);
+
+  // 2. Pagine 2..N in parallelo a batch di PARALLEL_BATCH
+  for (let p = 2; p <= totalPages; p += PARALLEL_BATCH) {
+    const batchEnd = Math.min(p + PARALLEL_BATCH - 1, totalPages);
+    const promises = [];
+    for (let pg = p; pg <= batchEnd; pg++) {
+      promises.push(
+        magentoQueue.enqueue(
+          () => fetch(`${baseUrlFilter}&searchCriteria[currentPage]=${pg}`, { headers }),
+          `magento:civetta-list:${tenantId}:${pg}`
+        )
+      );
+    }
+    const results = await Promise.allSettled(promises);
+    for (const r of results) {
+      if (r.status !== 'fulfilled' || !r.value.ok) continue;
+      try {
+        const d = await r.value.json();
+        (d.items || []).forEach(i => civetta1Set.add(i.sku));
+      } catch { /* skip page on parse error */ }
+    }
+    if (batchEnd < totalPages) {
+      await new Promise(r => setTimeout(r, BATCH_PAUSE_MS));
+    }
   }
 
   if (civetta1Set.size === 0) {

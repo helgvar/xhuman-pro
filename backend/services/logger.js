@@ -160,6 +160,15 @@ async function maybeTelegramAlert(record) {
 
 function emit(level, source, tenantId, traceId, message, payload, stack) {
   const ts = new Date();
+  // Estrae tenantId/source dal payload se non passati esplicitamente via context.
+  // Cosi log.info('msg', { source: 'healthCron', tenantId: 'xyz' }) popola correttamente
+  // le colonne DB indicizzate, non solo il payload JSON.
+  if (!tenantId && payload && typeof payload === 'object' && payload.tenantId) {
+    tenantId = payload.tenantId;
+  }
+  if (!source && payload && typeof payload === 'object' && payload.source) {
+    source = payload.source;
+  }
   const record = {
     ts,
     level,

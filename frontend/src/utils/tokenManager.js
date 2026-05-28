@@ -83,7 +83,9 @@ export async function authFetch(url, options = {}) {
   let res = await fetch(finalUrl, { ...options, headers });
 
   if (res.status === 401) {
-    const body = await res.json().catch(() => ({}));
+    // Clona prima di leggere il body: altrimenti il caller non puo' piu' fare .json()
+    // sulla response originale ("body stream already read").
+    const body = await res.clone().json().catch(() => ({}));
     if (body.code === 'TOKEN_EXPIRED') {
       const refreshed = await tryRefresh();
       if (refreshed) {

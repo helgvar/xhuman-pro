@@ -122,6 +122,10 @@ async function start() {
     const { startAlertMonitor } = require('./services/alertMonitor');
     startAlertMonitor();
 
+    // Start magento-sync cron (every 2h at :30, only operational tenants)
+    const { startMagentoSyncCron } = require('./services/magentoSyncCron');
+    startMagentoSyncCron();
+
     app.listen(PORT, '0.0.0.0', () => {
       console.log(`[xHUMANPRO] Backend running on http://0.0.0.0:${PORT}`);
     });

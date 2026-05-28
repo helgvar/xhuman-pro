@@ -1,14 +1,18 @@
 /**
  * Magento Sync — Push diretto su Magento REST API
  *
+ * Modello operativo per tenant:
+ *  - `observation`: Farmabooster controlla via attributo Magento `civetta` (Elastic).
+ *    xHumanPro NON deve toccare Magento. execute() ritorna early.
+ *  - `operational`: xHumanPro controlla via attributo `civettaai` (select int).
+ *    Option IDs per "0"/"1" sono auto-increment per installazione Magento, quindi
+ *    vengono letti runtime e cachati per tenant (24h).
+ *
  * Due fasi:
- * 1. Civetta updates (api_civettaai attribute)
- * 2. Price cuts (special_price + taglio_prezzo flag)
+ *  1. Civetta updates → PUT attribute_code='civettaai', value=<option_id>
+ *  2. Price cuts → PUT attribute_code='special_price', value=<float>
  *
  * Safety validations obbligatorie prima di ogni push.
- * Rate limited: batch read 5 concurrent, write 2 concurrent.
- *
- * Pattern identico a dashboard_fb/magentoSync.js
  */
 
 const { pool } = require('../db/pool');
@@ -21,6 +25,51 @@ const READ_CONCURRENCY = 5;
 const WRITE_CONCURRENCY = 2;
 const READ_DELAY = 300;
 const WRITE_DELAY = 500;
+
+const OPTION_ID_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+const civettaaiOptionsCache = new Map();
+
+/**
+ * Legge il mode operativo del tenant da tenant_configs.
+ * Default: 'observation' (safe — non scriviamo niente).
+ */
+async function getCivettaMode(tenantId) {
+  const { rows } = await pool.query(
+    `SELECT config_value FROM tenant_configs
+     WHERE tenant_id = $1 AND config_key = 'xhumanpro_magento_mode'`,
+    [tenantId]
+  );
+  if (rows.length === 0) return 'observation';
+  return rows[0].config_value === 'operational' ? 'operational' : 'observation';
+}
+
+/**
+ * Resolve civettaai select option_ids on the target Magento, cached per tenant.
+ * Option IDs are auto-increment per installation (es. Papa on=49739/off=49624,
+ * Procaccini on=26458/off=26353), quindi vanno letti runtime e mai hardcoded.
+ */
+async function getCivettaaiOptionIds(tenantId, { baseUrl, token }) {
+  const cached = civettaaiOptionsCache.get(tenantId);
+  if (cached && Date.now() - cached.ts < OPTION_ID_CACHE_TTL_MS) {
+    return { on: cached.on, off: cached.off };
+  }
+  const resp = await fetch(`${baseUrl}/rest/V1/products/attributes/civettaai/options`, {
+    headers: { 'Authorization': `Bearer ${token}` },
+    signal: AbortSignal.timeout(15000),
+  });
+  if (!resp.ok) throw new Error(`Cannot read civettaai options: ${resp.status}`);
+  const opts = await resp.json();
+  let on = null, off = null;
+  for (const o of opts) {
+    if (String(o.label).trim() === '1') on = o.value;
+    else if (String(o.label).trim() === '0') off = o.value;
+  }
+  if (!on || !off) {
+    throw new Error(`civettaai options incomplete: ${JSON.stringify(opts)}`);
+  }
+  civettaaiOptionsCache.set(tenantId, { on, off, ts: Date.now() });
+  return { on, off };
+}
 
 /**
  * Get Magento credentials for a tenant
@@ -84,7 +133,7 @@ async function batchFetchProducts(magentoConfig, skus) {
         price: parseFloat(item.price) || 0,
         specialPrice: parseFloat(attrs.special_price) || null,
         cost: parseFloat(attrs.cost) || 0,
-        civettaai: attrs.api_civettaai || null,
+        civettaai: attrs.civettaai != null ? String(attrs.civettaai) : null,
         civetta: attrs.civetta || null,
       });
     }
@@ -132,9 +181,12 @@ function validatePriceSafety(sku, newPrice, magentoProduct) {
 }
 
 /**
- * Preview — mostra cosa farebbe senza applicare
+ * Preview — mostra cosa farebbe (osservazione/simulazione).
+ * Funziona per qualunque tenant a prescindere dal mode: serve a "ragionare e
+ * suggerire" anche per i tenant in osservazione.
  */
 async function preview(tenantId) {
+  const mode = await getCivettaMode(tenantId);
   const magentoConfig = await getMagentoConfig(tenantId);
 
   // Get feed actions
@@ -183,6 +235,7 @@ async function preview(tenantId) {
 
   return {
     preview: true,
+    mode,
     civetta: {
       remove: civettaUpdates.filter(a => a.action === 'REMOVE').map(a => ({ sku: a.sku, reason: a.action_reason })),
       add: civettaUpdates.filter(a => a.action === 'ADD').map(a => ({ sku: a.sku, reason: a.action_reason })),
@@ -202,128 +255,186 @@ async function preview(tenantId) {
 
 /**
  * Execute — push to Magento (requires confirm: true)
- * Phase 1: Civetta updates (api_civettaai attribute)
- * Phase 2: Price cuts (special_price + taglio_prezzo)
+ * Phase 1: Civetta updates → attribute `civettaai` (operational only)
+ * Phase 2: Price cuts → attribute `special_price`
+ *
+ * In modalità `observation` ritorna early senza scrivere niente: per quei tenant
+ * il feed civetta è ancora controllato da Farmabooster via attributo `civetta`.
  */
 async function execute(tenantId, { dryRun = false, confirm = false } = {}) {
   if (!confirm && !dryRun) {
     throw new Error('Richiesto confirm:true per eseguire. Usa preview() prima.');
   }
 
+  const mode = await getCivettaMode(tenantId);
+  if (mode !== 'operational' && !dryRun) {
+    return {
+      executed: false,
+      mode,
+      message: 'Tenant in osservazione: xHumanPro non scrive su Magento. Farmabooster controlla via attributo civetta. Settare xhumanpro_magento_mode=operational quando si vuole passare il controllo a xHumanPro (civettaai).',
+    };
+  }
+
   const magentoConfig = await getMagentoConfig(tenantId);
   const { baseUrl, token } = magentoConfig;
   const headers = { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' };
 
-  // Get preview first
+  const optionIds = await getCivettaaiOptionIds(tenantId, magentoConfig);
+
   const previewResult = await preview(tenantId);
 
   if (dryRun) {
-    return { ...previewResult, dryRun: true };
+    return { ...previewResult, mode, optionIds, dryRun: true };
   }
 
   const results = {
+    mode,
     phase1_civetta: { success: 0, failed: 0, errors: [] },
     phase2_prices: { success: 0, failed: 0, blocked: previewResult.priceCuts.blocked.length, errors: [] },
   };
 
-  // === PHASE 1: Civetta updates ===
-  console.log(`[MagentoSync] Phase 1: ${previewResult.summary.civettaRemove} REMOVE, ${previewResult.summary.civettaAdd} ADD`);
+  const appliedCivettaSKUs = [];
+  const appliedPriceSKUs = [];
 
-  const civettaOps = [
-    ...previewResult.civetta.remove.map(r => ({ sku: r.sku, civettaValue: '0' })),
-    ...previewResult.civetta.add.map(a => ({ sku: a.sku, civettaValue: '1' })),
-  ];
+    // === PHASE 1: Civetta updates → civettaai = optionId ===
+    console.log(`[MagentoSync] Phase 1 [${mode}]: ${previewResult.summary.civettaRemove} REMOVE, ${previewResult.summary.civettaAdd} ADD (option_ids on=${optionIds.on} off=${optionIds.off})`);
 
-  const civettaFns = civettaOps.map(op => async () => {
-    try {
-      const resp = await magentoQueue.enqueue(async () => {
-        return fetch(`${baseUrl}/rest/V1/products/${encodeURIComponent(op.sku)}`, {
-          method: 'PUT',
-          headers,
-          body: JSON.stringify({
-            product: {
-              sku: op.sku,
-              custom_attributes: [
-                { attribute_code: 'api_civettaai', value: op.civettaValue === '1' ? '1' : '0' },
-              ],
-            },
-          }),
-          signal: AbortSignal.timeout(30000),
-        });
-      }, `magento:civetta:${op.sku}`);
-      if (!resp.ok) {
-        const err = await resp.text();
-        throw new Error(`PUT ${resp.status}: ${err.substring(0, 100)}`);
+    const civettaOps = [
+      ...previewResult.civetta.remove.map(r => ({ sku: r.sku, target: optionIds.off, isAdd: false })),
+      ...previewResult.civetta.add.map(a => ({ sku: a.sku, target: optionIds.on, isAdd: true })),
+    ];
+
+    // --- Delta fetch: leggi civettaai corrente per tutti i candidati e fai PUT
+    // solo dove diverge dal target. Su Papa abbiamo visto che ~97% sono già
+    // coerenti (civettaai già a 0 perché Farmabooster aveva fatto il suo run o
+    // mai stati civetta), quindi questo riduce 10k PUT a ~100-300.
+    console.log(`[MagentoSync] Delta fetch: reading civettaai for ${civettaOps.length} candidates...`);
+    const tDelta0 = Date.now();
+    const currentState = await batchFetchProducts(magentoConfig, civettaOps.map(o => o.sku));
+    console.log(`[MagentoSync] Delta fetch done in ${((Date.now()-tDelta0)/1000).toFixed(1)}s (${currentState.size}/${civettaOps.length} found)`);
+
+    const civettaToWrite = [];
+    let alreadyCoherent = 0;
+    let unknownOnMagento = 0;
+    for (const op of civettaOps) {
+      const cur = currentState.get(op.sku);
+      if (!cur) {
+        unknownOnMagento++;
+        results.phase1_civetta.failed++;
+        if (results.phase1_civetta.errors.length < 10) {
+          results.phase1_civetta.errors.push({ sku: op.sku, error: 'not found on Magento' });
+        }
+        continue;
       }
-      results.phase1_civetta.success++;
-    } catch (e) {
-      results.phase1_civetta.failed++;
-      if (results.phase1_civetta.errors.length < 10) {
-        results.phase1_civetta.errors.push({ sku: op.sku, error: e.message });
-      }
-    }
-  });
-
-  await throttledBatchFetch(civettaFns, WRITE_CONCURRENCY, WRITE_DELAY);
-
-  // === PHASE 2: Price cuts (only safe ones) ===
-  console.log(`[MagentoSync] Phase 2: ${previewResult.priceCuts.safe.length} safe cuts, ${previewResult.priceCuts.blocked.length} blocked`);
-
-  const priceFns = previewResult.priceCuts.safe.map(pc => async () => {
-    try {
-      const resp = await magentoQueue.enqueue(async () => {
-        return fetch(`${baseUrl}/rest/V1/products/${encodeURIComponent(pc.sku)}`, {
-          method: 'PUT',
-          headers,
-          body: JSON.stringify({
-            product: {
-              sku: pc.sku,
-              custom_attributes: [
-                { attribute_code: 'special_price', value: String(pc.newPrice) },
-                { attribute_code: 'taglio_prezzo', value: '1' },
-              ],
-            },
-          }),
-          signal: AbortSignal.timeout(30000),
-        });
-      }, `magento:price:${pc.sku}`);
-      if (!resp.ok) {
-        const err = await resp.text();
-        throw new Error(`PUT ${resp.status}: ${err.substring(0, 100)}`);
-      }
-      results.phase2_prices.success++;
-    } catch (e) {
-      results.phase2_prices.failed++;
-      if (results.phase2_prices.errors.length < 10) {
-        results.phase2_prices.errors.push({ sku: pc.sku, error: e.message });
+      // Skip SOLO se civettaai è gia' esattamente al target option_id.
+      // civettaai = null NON e' equivalente a "off": significa che xHumanPro non
+      // ha espresso opinione e Magento applica fallback su `civetta` (Farmabooster).
+      // Per avere PRIORITA' su Farmabooster (cosi' una pepita viene inclusa anche
+      // se FB l'ha esclusa, e un burner escluso anche se FB l'ha incluso) bisogna
+      // sempre settare l'option_id esplicito.
+      const curValue = cur.civettaai;
+      if (curValue === String(op.target)) {
+        alreadyCoherent++;
+        results.phase1_civetta.success++;
+        appliedCivettaSKUs.push(op.sku);
+      } else {
+        civettaToWrite.push(op);
       }
     }
-  });
+    console.log(`[MagentoSync] Delta result: already-coherent=${alreadyCoherent}, need-PUT=${civettaToWrite.length}, unknown=${unknownOnMagento}`);
 
-  await throttledBatchFetch(priceFns, WRITE_CONCURRENCY, WRITE_DELAY);
+  try {
+    const civettaFns = civettaToWrite.map(op => async () => {
+      try {
+        const resp = await magentoQueue.enqueue(async () => {
+          return fetch(`${baseUrl}/rest/V1/products/${encodeURIComponent(op.sku)}`, {
+            method: 'PUT',
+            headers,
+            body: JSON.stringify({
+              product: {
+                sku: op.sku,
+                custom_attributes: [
+                  { attribute_code: 'civettaai', value: String(op.target) },
+                ],
+              },
+            }),
+            signal: AbortSignal.timeout(30000),
+          });
+        }, `magento:civetta:${op.sku}`);
+        if (!resp.ok) {
+          const err = await resp.text();
+          throw new Error(`PUT ${resp.status}: ${err.substring(0, 100)}`);
+        }
+        results.phase1_civetta.success++;
+        appliedCivettaSKUs.push(op.sku);
+      } catch (e) {
+        results.phase1_civetta.failed++;
+        if (results.phase1_civetta.errors.length < 10) {
+          results.phase1_civetta.errors.push({ sku: op.sku, error: e.message });
+        }
+      }
+    });
 
-  // Log dispatch
-  await pool.query(
-    `INSERT INTO feed_dispatch_log (tenant_id, endpoint, products_served, request_ip)
-     VALUES ($1, 'magento-sync', $2, 'internal')`,
-    [tenantId, results.phase1_civetta.success + results.phase2_prices.success]
-  );
+    await throttledBatchFetch(civettaFns, WRITE_CONCURRENCY, WRITE_DELAY);
 
-  // Mark actions as applied
-  const appliedSKUs = [
-    ...previewResult.civetta.remove.map(r => r.sku),
-    ...previewResult.civetta.add.map(a => a.sku),
-    ...previewResult.priceCuts.safe.map(p => p.sku),
-  ];
-  if (appliedSKUs.length > 0) {
-    await pool.query(
-      `UPDATE feed_actions SET status = 'applied', applied_at = NOW()
-       WHERE tenant_id = $1 AND sku = ANY($2) AND status IN ('pending', 'dispatched')`,
-      [tenantId, appliedSKUs]
-    );
+    // === PHASE 2: Price cuts (only safe ones) ===
+    console.log(`[MagentoSync] Phase 2: ${previewResult.priceCuts.safe.length} safe cuts, ${previewResult.priceCuts.blocked.length} blocked`);
+
+    const priceFns = previewResult.priceCuts.safe.map(pc => async () => {
+      try {
+        const resp = await magentoQueue.enqueue(async () => {
+          return fetch(`${baseUrl}/rest/V1/products/${encodeURIComponent(pc.sku)}`, {
+            method: 'PUT',
+            headers,
+            body: JSON.stringify({
+              product: {
+                sku: pc.sku,
+                custom_attributes: [
+                  { attribute_code: 'special_price', value: String(pc.newPrice) },
+                ],
+              },
+            }),
+            signal: AbortSignal.timeout(30000),
+          });
+        }, `magento:price:${pc.sku}`);
+        if (!resp.ok) {
+          const err = await resp.text();
+          throw new Error(`PUT ${resp.status}: ${err.substring(0, 100)}`);
+        }
+        results.phase2_prices.success++;
+        appliedPriceSKUs.push(pc.sku);
+      } catch (e) {
+        results.phase2_prices.failed++;
+        if (results.phase2_prices.errors.length < 10) {
+          results.phase2_prices.errors.push({ sku: pc.sku, error: e.message });
+        }
+      }
+    });
+
+    await throttledBatchFetch(priceFns, WRITE_CONCURRENCY, WRITE_DELAY);
+  } finally {
+    // Persistiamo SEMPRE quello che è andato a buon fine, anche se il run è stato
+    // troncato (uncaught exception, container restart, ecc). Il PID 250 del 28/5
+    // è morto prima di questo finale e ha lasciato 10k feed_actions in 'dispatched'.
+    const appliedSKUs = [...appliedCivettaSKUs, ...appliedPriceSKUs];
+    if (appliedSKUs.length > 0) {
+      try {
+        await pool.query(
+          `INSERT INTO feed_dispatch_log (tenant_id, endpoint, products_served, request_ip)
+           VALUES ($1, 'magento-sync', $2, NULL)`,
+          [tenantId, appliedSKUs.length]
+        );
+        await pool.query(
+          `UPDATE feed_actions SET status = 'applied', applied_at = NOW()
+           WHERE tenant_id = $1 AND sku = ANY($2) AND status IN ('pending', 'dispatched')`,
+          [tenantId, appliedSKUs]
+        );
+      } catch (persistErr) {
+        console.error(`[MagentoSync] Failed to persist applied state:`, persistErr.message);
+      }
+    }
+    console.log(`[MagentoSync] Done: civetta ${results.phase1_civetta.success}/${results.phase1_civetta.success + results.phase1_civetta.failed}, prices ${results.phase2_prices.success}/${results.phase2_prices.success + results.phase2_prices.failed}`);
   }
-
-  console.log(`[MagentoSync] Done: civetta ${results.phase1_civetta.success}/${civettaOps.length}, prices ${results.phase2_prices.success}/${previewResult.priceCuts.safe.length}`);
 
   return {
     executed: true,
@@ -332,4 +443,4 @@ async function execute(tenantId, { dryRun = false, confirm = false } = {}) {
   };
 }
 
-module.exports = { preview, execute, validatePriceSafety, batchFetchProducts };
+module.exports = { preview, execute, validatePriceSafety, batchFetchProducts, getCivettaMode, getCivettaaiOptionIds };

@@ -106,8 +106,8 @@ export default function Shopping() {
     <div className="space-y-4">
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-bold text-gray-900">Google Shopping Optimizer</h1>
-          <p className="text-sm text-gray-500 mt-0.5">Merchant Center: ottimizzazione campagne, burner detection, recupero opportunità</p>
+          <h1 className="text-2xl font-bold text-gray-900">Feed Health (Merchant Center)</h1>
+          <p className="text-sm text-gray-500 mt-0.5">Stato del feed Google Shopping: approvazioni, prodotti sotto-esposti, dead listings. Per ottimizzazione campagne e budget serve la sezione Google Ads (in attivazione).</p>
         </div>
         <button onClick={refreshAll} disabled={loading} className="px-3 py-1 bg-brand-600 text-white text-sm rounded hover:bg-brand-700 disabled:opacity-50">
           {loading ? '…' : 'Aggiorna'}

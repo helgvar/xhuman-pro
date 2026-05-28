@@ -79,6 +79,7 @@ const ruleOptimizerRoutes = require('./routes/ruleOptimizer');
 const abTestsRoutes = require('./routes/abTests');
 const crossChannelRoutes = require('./routes/crossChannel');
 const shoppingRoutes = require('./routes/shopping');
+const googleAdsRoutes = require('./routes/googleAds');
 app.use('/api/tenants', tenantsRoutes);
 app.use('/api/users', usersRoutes);
 app.use('/api/orders', ordersRoutes);
@@ -97,6 +98,7 @@ app.use('/api/rule-optimizer', ruleOptimizerRoutes);
 app.use('/api/ab-tests', abTestsRoutes);
 app.use('/api/cross-channel', crossChannelRoutes);
 app.use('/api/shopping', shoppingRoutes);
+app.use('/api/google-ads', googleAdsRoutes);
 
 // Start server
 async function start() {

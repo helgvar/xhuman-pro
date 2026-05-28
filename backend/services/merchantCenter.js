@@ -163,6 +163,11 @@ async function importMerchantCenter(tenantId, jobId = null) {
     const statuses = await fetchStatuses(content, merchantId);
     console.log(`[MerchantCenter] ${statuses.length} product statuses`);
 
+    // Country di interesse per l'approval status. Hardcodato 'IT' perchè i tenant
+    // attuali sono tutti farmacie italiane; se servisse aggiungere multi-country
+    // si puo' leggere da tenant_configs.merchant_country_code.
+    const COUNTRY = 'IT';
+
     for (const s of statuses) {
       // productId format: "channel:contentLang:targetCountry:offerId"
       // es: "online:it:IT:904336498" oppure "online:it:-:904336498" (se targetCountry non settato)
@@ -170,9 +175,32 @@ async function importMerchantCenter(tenantId, jobId = null) {
       const offerId = s.productId ? s.productId.split(':').pop() : '';
       if (!offerId || !productIndex[offerId]) continue;
 
+      // Logica approval status: l'API ritorna `status` GLOBALE per destination
+      // (es. "disapproved"), MA distingue per country via `approvedCountries` e
+      // `disapprovedCountries`. Per un seller IT, un prodotto e' "approvato" se
+      // almeno una destination lo include in approvedCountries[IT]. Senza questa
+      // mappatura il sync classificava ~80% del catalogo come disapproved anche
+      // se Merchant Center UI lo mostrava come approvato in IT.
       const destStatuses = s.destinationStatuses || [];
-      const shoppingStatus = destStatuses.find(d => d.destination === 'Shopping');
-      productIndex[offerId].approvalStatus = shoppingStatus?.status || '';
+      let anyApprovedIT = false;
+      let anyDisapprovedIT = false;
+      let anyPendingIT = false;
+      for (const d of destStatuses) {
+        if ((d.approvedCountries || []).includes(COUNTRY)) anyApprovedIT = true;
+        if ((d.disapprovedCountries || []).includes(COUNTRY)) anyDisapprovedIT = true;
+        if ((d.pendingCountries || []).includes(COUNTRY)) anyPendingIT = true;
+      }
+      let approvalStatus;
+      if (anyApprovedIT) approvalStatus = 'approved';
+      else if (anyDisapprovedIT) approvalStatus = 'disapproved';
+      else if (anyPendingIT) approvalStatus = 'pending';
+      else {
+        // Nessuna informazione country-specific: fallback al vecchio comportamento
+        // basato sul `status` globale del destination Shopping.
+        const shoppingStatus = destStatuses.find(d => d.destination === 'Shopping');
+        approvalStatus = shoppingStatus?.status || '';
+      }
+      productIndex[offerId].approvalStatus = approvalStatus;
       productIndex[offerId].issuesCount = (s.itemLevelIssues || []).length;
       productIndex[offerId].lastUpdate = s.lastUpdateDate || null;
       productIndex[offerId].expirationDate = s.googleExpirationDate || null;

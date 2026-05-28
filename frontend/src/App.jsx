@@ -23,6 +23,7 @@ import ParetoRule from './pages/ParetoRule';
 import RuleOptimizer from './pages/RuleOptimizer';
 import CrossChannel from './pages/CrossChannel';
 import Shopping from './pages/Shopping';
+import GoogleAdsSetup from './pages/GoogleAdsSetup';
 
 export default function App() {
   const { loading, needsTenantSelection } = useAuth();
@@ -64,6 +65,8 @@ export default function App() {
                 <Route path="/rule-optimizer" element={<RuleOptimizer />} />
                 <Route path="/cross-channel" element={<CrossChannel />} />
                 <Route path="/shopping" element={<Shopping />} />
+                <Route path="/feed-health" element={<Shopping />} />
+                <Route path="/admin/google-ads" element={<GoogleAdsSetup />} />
                 <Route path="/admin/users" element={
                   <ProtectedRoute roles={['superadmin', 'admin']}><AdminUsers /></ProtectedRoute>
                 } />

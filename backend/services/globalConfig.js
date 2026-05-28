@@ -10,6 +10,11 @@ const GLOBAL_KEYS = new Set([
   'anthropic_api_key',
   'claude_api_key',
   'pepite_rules',
+  'google_ads_developer_token',
+  'google_ads_oauth_client_id',
+  'google_ads_oauth_client_secret',
+  'google_ads_oauth_refresh_token',
+  'google_ads_login_customer_id',
 ]);
 
 const _cache = new Map();

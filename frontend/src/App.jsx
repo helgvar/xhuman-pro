@@ -22,6 +22,7 @@ import AgentChat from './pages/Agent';
 import ParetoRule from './pages/ParetoRule';
 import RuleOptimizer from './pages/RuleOptimizer';
 import CrossChannel from './pages/CrossChannel';
+import Shopping from './pages/Shopping';
 
 export default function App() {
   const { loading, needsTenantSelection } = useAuth();
@@ -62,6 +63,7 @@ export default function App() {
                 <Route path="/pareto" element={<ParetoRule />} />
                 <Route path="/rule-optimizer" element={<RuleOptimizer />} />
                 <Route path="/cross-channel" element={<CrossChannel />} />
+                <Route path="/shopping" element={<Shopping />} />
                 <Route path="/admin/users" element={
                   <ProtectedRoute roles={['superadmin', 'admin']}><AdminUsers /></ProtectedRoute>
                 } />

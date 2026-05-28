@@ -78,6 +78,7 @@ const paretoRoutes = require('./routes/pareto');
 const ruleOptimizerRoutes = require('./routes/ruleOptimizer');
 const abTestsRoutes = require('./routes/abTests');
 const crossChannelRoutes = require('./routes/crossChannel');
+const shoppingRoutes = require('./routes/shopping');
 app.use('/api/tenants', tenantsRoutes);
 app.use('/api/users', usersRoutes);
 app.use('/api/orders', ordersRoutes);
@@ -95,6 +96,7 @@ app.use('/api/pareto', paretoRoutes);
 app.use('/api/rule-optimizer', ruleOptimizerRoutes);
 app.use('/api/ab-tests', abTestsRoutes);
 app.use('/api/cross-channel', crossChannelRoutes);
+app.use('/api/shopping', shoppingRoutes);
 
 // Start server
 async function start() {

@@ -11,7 +11,7 @@ const navItems = [
   { to: '/optimization', label: 'Ottimizzazione', icon: 'M13 7h8m0 0v8m0-8l-8 8-4-4-6 6' },
   { to: '/pareto', label: 'Regola di Pareto', icon: 'M3 3v18h18M7 17l4-8 4 4 6-10' },
   { to: '/rule-optimizer', label: 'Rule Optimizer', icon: 'M10.325 4.317c.426-1.756 2.924-1.756 3.35 0M15 12a3 3 0 11-6 0 3 3 0 016 0z' },
-  { to: '/cross-channel', label: 'Cross-Channel', icon: 'M4 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zM14 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2v-2zM14 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z' },
+  { to: '/shopping', label: 'Google Shopping', icon: 'M3 3h2l.4 2M7 13h10l4-8H5.4M7 13L5.4 5M7 13l-2.293 2.293c-.63.63-.184 1.707.707 1.707H17m0 0a2 2 0 100 4 2 2 0 000-4zm-8 2a2 2 0 11-4 0 2 2 0 014 0z' },
   { to: '/agent', label: 'Agent AI', icon: 'M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z' },
 ];
 

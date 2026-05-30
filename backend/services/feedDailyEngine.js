@@ -60,6 +60,12 @@ async function loadConfig(tenantId) {
     q1Days: parseInt(c.feed_q1_days || 7),
     q2Days: parseInt(c.feed_q2_days || 15),
     q3Days: parseInt(c.feed_q3_days || 30),
+    // Safety-net: se un SKU vende N+ volte nello store negli ultimi 30g,
+    // NON viene rimosso anche se figura come burner sul feed TP. Default 0
+    // (disabilitato, manteniamo il comportamento storico). Settabile per
+    // tenant via health_config.store_sales_safety_net per essere meno
+    // aggressivi su tenant dove il calo TP coincide con calo ordini store.
+    storeSalesSafetyNet: parseInt(c.store_sales_safety_net || 0),
   };
 }
 
@@ -407,6 +413,20 @@ async function triageProducts(tenantId, config, snapshot, ruleSet = null) {
         quarantineDays: 30,
       });
       stats.killers++;
+      continue;
+    }
+
+    // SAFETY NET — SKU che vendono nello store >= soglia → protetti dal REMOVE.
+    // Si applica solo se config.storeSalesSafetyNet > 0 (per tenant specifico).
+    // Skippa killer/quarantined (gestiti sopra) e SKU senza vendite reali.
+    const storeSales30d = parseFloat(p.sales_30d_seller) || 0;
+    if (config.storeSalesSafetyNet > 0 && storeSales30d >= config.storeSalesSafetyNet) {
+      actions.monitor.push({
+        sku: p.sku, name: p.product_name, action: 'MONITOR',
+        reason: `Safety net: ${storeSales30d} vendite store/30g (>= soglia ${config.storeSalesSafetyNet}). Non rimosso anche se burner TP.`,
+        category: 'store_safety_net', cost: totalCost, clicks: totalClicks, orders: totalOrders,
+      });
+      stats.safety_net = (stats.safety_net || 0) + 1;
       continue;
     }
 

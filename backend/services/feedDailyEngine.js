@@ -45,8 +45,11 @@ function calculatePriceCut(sellPrice, erpCost, bestPrice) {
 // ─── CONFIG ────────────────────────────────────────────
 
 async function loadConfig(tenantId) {
+  // Ignora i valori scaduti (expires_at <= NOW): permette configurazioni
+  // a tempo (es. push commerciale ponte 2/6) con rollback automatico.
   const { rows } = await pool.query(
-    `SELECT config_key, config_value FROM health_config WHERE tenant_id = $1`,
+    `SELECT config_key, config_value FROM health_config
+     WHERE tenant_id = $1 AND (expires_at IS NULL OR expires_at > NOW())`,
     [tenantId]
   );
   const c = {};
@@ -646,23 +649,62 @@ const PEPITE_DEFAULT_RULES = {
   min_budget_eur: 5,
 };
 
-async function loadPepiteRules() {
+async function loadPepiteRules(tenantId) {
+  let rules;
   try {
     const { getGlobal } = require('./globalConfig');
     const raw = await getGlobal('pepite_rules');
-    if (!raw) return PEPITE_DEFAULT_RULES;
-    const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
-    // Merge poco profondo per default-safe: se la config arriva incompleta dal
-    // DB, tieni i default sui campi mancanti invece di crashare.
-    return {
-      ...PEPITE_DEFAULT_RULES,
-      ...parsed,
-      golden: { ...PEPITE_DEFAULT_RULES.golden, ...(parsed.golden || {}) },
-      silver: { ...PEPITE_DEFAULT_RULES.silver, ...(parsed.silver || {}) },
-    };
+    if (!raw) {
+      rules = PEPITE_DEFAULT_RULES;
+    } else {
+      const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      rules = {
+        ...PEPITE_DEFAULT_RULES,
+        ...parsed,
+        golden: { ...PEPITE_DEFAULT_RULES.golden, ...(parsed.golden || {}) },
+        silver: { ...PEPITE_DEFAULT_RULES.silver, ...(parsed.silver || {}) },
+      };
+    }
   } catch (e) {
     console.warn(`[FeedDaily] pepite_rules invalid, usando default: ${e.message}`);
-    return PEPITE_DEFAULT_RULES;
+    rules = PEPITE_DEFAULT_RULES;
+  }
+
+  if (!tenantId) return rules;
+
+  // Override per tenant via health_config (rispetta expires_at): permette di
+  // spingere parametri pepite solo per tenant del treatment, con rollback
+  // automatico al timestamp.
+  try {
+    const { rows } = await pool.query(
+      `SELECT config_key, config_value FROM health_config
+       WHERE tenant_id=$1 AND (expires_at IS NULL OR expires_at > NOW())
+         AND config_key IN ('pepite_golden_position_max','pepite_golden_margin_min',
+                            'pepite_golden_sales_min','pepite_silver_position_min',
+                            'pepite_silver_position_max','pepite_silver_margin_min',
+                            'pepite_silver_sales_min','pepite_silver_enabled')`,
+      [tenantId]
+    );
+    if (rows.length === 0) return rules;
+    const cloned = JSON.parse(JSON.stringify(rules));
+    for (const r of rows) {
+      const v = r.config_value;
+      switch (r.config_key) {
+        case 'pepite_golden_position_max': cloned.golden.position_max = parseInt(v); break;
+        case 'pepite_golden_margin_min':   cloned.golden.margin_min   = parseInt(v); break;
+        case 'pepite_golden_sales_min':    cloned.golden.sales_min    = parseInt(v); break;
+        case 'pepite_silver_position_min': cloned.silver.position_min = parseInt(v); break;
+        case 'pepite_silver_position_max': cloned.silver.position_max = parseInt(v); break;
+        case 'pepite_silver_margin_min':   cloned.silver.margin_min   = parseInt(v); break;
+        case 'pepite_silver_sales_min':    cloned.silver.sales_min    = parseInt(v); break;
+        case 'pepite_silver_enabled':      cloned.silver.enabled      = (v === 'true' || v === '1'); break;
+      }
+    }
+    console.log(`[FeedDaily] pepite override per tenant ${tenantId.slice(0,8)}: ${rows.length} chiavi attive`);
+    return cloned;
+  } catch (e) {
+    console.warn(`[FeedDaily] pepite tenant-override failed: ${e.message}`);
+    return rules;
   }
 }
 
@@ -699,7 +741,7 @@ async function queryPepiteTier(tenantId, posMin, posMax, marginMin, salesMin, li
 async function findPepite(tenantId, config, snapshot, removedCost) {
   if (!snapshot || snapshot.overTarget) return [];
 
-  const rules = await loadPepiteRules();
+  const rules = await loadPepiteRules(tenantId);
   const availableBudget = removedCost * (rules.budget_split_pct / 100);
   if (availableBudget < rules.min_budget_eur) return [];
 

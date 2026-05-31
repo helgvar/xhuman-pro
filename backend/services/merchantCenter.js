@@ -53,55 +53,80 @@ async function getMerchantClient(tenantId) {
 /**
  * Fetch all products from Merchant Center catalog
  */
-async function fetchProducts(content, merchantId) {
-  const products = [];
+/**
+ * Helper: pagination loop con delay tra pagine + exponential backoff su quota.
+ * fetchPage(pageToken) deve ritornare { items, nextPageToken }.
+ * Su "Quota per minute exceeded" / 429: retry con backoff 2s,4s,8s,16s,32s.
+ */
+async function paginateWithThrottle(fetchPage, { pageDelayMs = 250, maxRetries = 5, label = '?' } = {}) {
+  const all = [];
   let pageToken = undefined;
+  let pageCount = 0;
 
   do {
+    if (pageCount > 0 && pageDelayMs > 0) {
+      await new Promise(r => setTimeout(r, pageDelayMs));
+    }
+    let attempt = 0;
+    let page;
+    while (true) {
+      try {
+        page = await fetchPage(pageToken);
+        break;
+      } catch (err) {
+        const msg = String(err?.message || err);
+        const isQuota = err?.code === 429 || /quota|rate|too many|exceeded/i.test(msg);
+        if (isQuota && attempt < maxRetries) {
+          const backoff = 2000 * Math.pow(2, attempt);
+          console.warn(`[MerchantCenter] ${label} quota hit (attempt ${attempt+1}/${maxRetries}), retry in ${backoff}ms`);
+          await new Promise(r => setTimeout(r, backoff));
+          attempt++;
+          continue;
+        }
+        throw err;
+      }
+    }
+    all.push(...(page.items || []));
+    pageToken = page.nextPageToken;
+    pageCount++;
+  } while (pageToken);
+
+  return all;
+}
+
+async function fetchProducts(content, merchantId) {
+  return paginateWithThrottle(async pageToken => {
     const opts = { merchantId, maxResults: 250 };
     if (pageToken) opts.pageToken = pageToken;
     const res = await content.products.list(opts);
-    products.push(...(res.data.resources || []));
-    pageToken = res.data.nextPageToken;
-  } while (pageToken);
-
-  return products;
+    return { items: res.data.resources || [], nextPageToken: res.data.nextPageToken };
+  }, { label: 'products' });
 }
 
 /**
  * Fetch product statuses (approval, issues)
  */
 async function fetchStatuses(content, merchantId) {
-  const statuses = [];
-  let pageToken = undefined;
-
-  do {
+  return paginateWithThrottle(async pageToken => {
     const opts = { merchantId, maxResults: 250 };
     if (pageToken) opts.pageToken = pageToken;
     const res = await content.productstatuses.list(opts);
-    statuses.push(...(res.data.resources || []));
-    pageToken = res.data.nextPageToken;
-  } while (pageToken);
-
-  return statuses;
+    return { items: res.data.resources || [], nextPageToken: res.data.nextPageToken };
+  }, { label: 'statuses' });
 }
 
 /**
  * Fetch report data using Reports API (paginated)
  */
 async function fetchReport(content, merchantId, query) {
-  const results = [];
-  let pageToken = undefined;
-
-  do {
+  // Reports API ha quote più strette del catalog (50 chiamate/minute storiche);
+  // alziamo il delay tra pagine a 500ms per evitare ban + retry esteso.
+  return paginateWithThrottle(async pageToken => {
     const body = { query };
     if (pageToken) body.pageToken = pageToken;
     const res = await content.reports.search({ merchantId, requestBody: body });
-    results.push(...(res.data.results || []));
-    pageToken = res.data.nextPageToken;
-  } while (pageToken);
-
-  return results;
+    return { items: res.data.results || [], nextPageToken: res.data.nextPageToken };
+  }, { label: 'reports', pageDelayMs: 500, maxRetries: 6 });
 }
 
 /**

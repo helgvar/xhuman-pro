@@ -178,22 +178,32 @@ async function _runForAllTenantsInner() {
     log.info(`Tenant pipeline START`, { source: 'healthCron', tenantId: tenant.id, tenantName: tLabel });
     let healthResult = null;
     try {
-      // Step 0b: Sync civetta from Magento (timeout 360s = 6 min)
+      // Step 0b: Sync civetta from Magento (timeout 540s = 9 min)
       // Tenant grossi possono avere 60k+ SKU civetta = 120+ pagine paginate;
-      // Magento alcuni giorni risponde lento (1.5-2.5s/pagina)
+      // Magento alcuni giorni risponde lento. MPF e San Vito timeoutavano a
+      // 360s ricorrentemente: alzato a 540s.
       await withStepTimeout('civetta_sync', tenant.id, tLabel,
-        () => syncCivettaFromMagento(tenant.id), 360 * 1000);
+        () => syncCivettaFromMagento(tenant.id), 540 * 1000);
 
-      // Step 1: Health scores (timeout 300s = 5 min) — tenant grandi (100k prodotti) fino a ~3 min
+      // Step 1: Health scores (timeout 600s = 10 min). San Vito (800k SKU)
+      // timeoutava sistematicamente a 300s: 22 fatal/24h. Alzato a 600s.
       const hRes = await withStepTimeout('health_scores', tenant.id, tLabel,
-        () => computeHealthScores(tenant.id), 300 * 1000);
+        () => computeHealthScores(tenant.id), 600 * 1000);
       if (hRes.ok) healthResult = hRes.result;
 
-      // Step 2: GA4 attribution (timeout 120s)
+      // Step 2: GA4 attribution (timeout 120s).
+      // GA4 produce errori "Step FAIL" silenziosi: API rate limit, dataset
+      // vuoto, credenziali revocate, property_id sbagliato. NON e' bloccante
+      // (GA4 e' lookup secondario per attribution), quindi catturiamo gli
+      // errori per non sporcare i log con fatal.
       await withStepTimeout('ga4_attribution', tenant.id, tLabel, async () => {
-        const hasGA4 = await googleApiService.hasGA4Credentials(tenant.id);
-        if (!hasGA4) return { skipped: true };
-        return await persistGA4Attribution(tenant.id);
+        try {
+          const hasGA4 = await googleApiService.hasGA4Credentials(tenant.id);
+          if (!hasGA4) return { skipped: true, reason: 'no_credentials' };
+          return await persistGA4Attribution(tenant.id);
+        } catch (e) {
+          return { skipped: true, reason: 'soft_fail', error: e.message?.slice(0, 200) };
+        }
       }, 120 * 1000);
 
       // Step 2b: MC sync (finestra 04-12 UTC, max 1 volta ogni 22h per tenant).

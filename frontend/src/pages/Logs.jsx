@@ -198,7 +198,24 @@ export default function Logs() {
           </thead>
           <tbody>
             {rows.length === 0 && (
-              <tr><td colSpan={5} className="px-3 py-6 text-center text-gray-400">Nessun log trovato</td></tr>
+              <tr>
+                <td colSpan={5} className="px-3 py-10 text-center">
+                  <div className="text-gray-500 text-sm font-medium">Nessun log con il filtro corrente</div>
+                  <div className="text-gray-400 text-xs mt-1">
+                    {filters.level === 'fatal,error,warn'
+                      ? <>Stato sano per il filtro <code>fatal+error+warn</code> ultime 24h. Per vedere anche i log info, cambia il filtro <strong>Level</strong> in alto.</>
+                      : <>Prova ad allargare i filtri (rimuovi Source/Ricerca, scegli Level "tutti", aumenta Limit).</>}
+                  </div>
+                  {filters.level === 'fatal,error,warn' && (
+                    <button
+                      onClick={() => setFilters(f => ({ ...f, level: 'info' }))}
+                      className="mt-3 px-3 py-1 text-xs bg-brand-600 text-white rounded hover:bg-brand-700"
+                    >
+                      Mostra log info ultime 24h
+                    </button>
+                  )}
+                </td>
+              </tr>
             )}
             {rows.map(r => {
               const { t, agoLabel } = fmtTs(r.ts);

@@ -38,7 +38,7 @@ let _flushing = false;
 let _telegramConfig = null;
 let _telegramConfigCheckedAt = 0;
 const _telegramDedup = new Map();   // key -> ts
-const TELEGRAM_DEDUP_MS = 30 * 60 * 1000;  // 30 min same fatal class
+const TELEGRAM_DEDUP_MS = 4 * 60 * 60 * 1000;  // 4h same fatal class (era 30min)
 
 function uptimeSec() {
   return Math.floor((Date.now() - PROCESS_START) / 1000);
@@ -118,6 +118,10 @@ const TELEGRAM_EXCLUDE_PATTERNS = [
   // i fix applicati a Promise.race non hanno chiuso l'unhandled, ma e' inocuo
   // (process.on cattura, backend non crasha). Telegram qui sarebbe puro rumore.
   /UNHANDLED REJECTION: Timeout after \d+ms \(avg:/,
+  // Step TIMEOUT healthCron: ricorrenti per tenant grossi (San Vito 800k SKU).
+  // I fix di timeout+skip-intelligent riducono la frequenza ma non vogliamo
+  // spam Telegram quando un tenant supera il budget tempo. Restano in DB.
+  /Step TIMEOUT: (health_scores|mc_sync|civetta_sync) on /,
 ];
 
 async function maybeTelegramAlert(record) {
@@ -126,10 +130,30 @@ async function maybeTelegramAlert(record) {
   for (const re of TELEGRAM_EXCLUDE_PATTERNS) {
     if (re.test(record.message)) return;
   }
-  // Dedup: stesso fatal pattern entro 30min -> niente Telegram
+  // Dedup persistente: cerchiamo in log_events l'ultimo fatal con stesso
+  // source + message normalizzato. Se ce n'e' uno entro TELEGRAM_DEDUP_MS,
+  // skip. Sopravvive ai restart container (vs Map in-memory che si svuotava).
   const key = _dedupKey(record);
-  const last = _telegramDedup.get(key) || 0;
-  if (Date.now() - last < TELEGRAM_DEDUP_MS) return;
+  try {
+    const cutoffMs = TELEGRAM_DEDUP_MS;
+    const normMsg = (record.message || '').replace(/\d+/g, '%').slice(0, 120);
+    const { rows } = await pool.query(
+      `SELECT 1 FROM log_events
+       WHERE level='fatal' AND source=$1 AND message ILIKE $2
+         AND ts > NOW() - ($3 || ' milliseconds')::interval
+         AND ts < NOW() - INTERVAL '5 seconds'
+       LIMIT 1`,
+      [record.source || '', normMsg, String(cutoffMs)]
+    );
+    if (rows.length > 0) {
+      _telegramDedup.set(key, Date.now()); // refresh in-memory anche
+      return;
+    }
+  } catch {
+    // Su errore DB, fallback al dedup in-memory
+    const last = _telegramDedup.get(key) || 0;
+    if (Date.now() - last < TELEGRAM_DEDUP_MS) return;
+  }
   _telegramDedup.set(key, Date.now());
   // Cache config 5 min
   if (Date.now() - _telegramConfigCheckedAt > 5 * 60 * 1000) {

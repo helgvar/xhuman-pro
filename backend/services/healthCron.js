@@ -178,17 +178,43 @@ async function _runForAllTenantsInner() {
     log.info(`Tenant pipeline START`, { source: 'healthCron', tenantId: tenant.id, tenantName: tLabel });
     let healthResult = null;
     try {
-      // Step 0b: Sync civetta from Magento (timeout 540s = 9 min)
-      // Tenant grossi possono avere 60k+ SKU civetta = 120+ pagine paginate;
-      // Magento alcuni giorni risponde lento. MPF e San Vito timeoutavano a
-      // 360s ricorrentemente: alzato a 540s.
-      await withStepTimeout('civetta_sync', tenant.id, tLabel,
-        () => syncCivettaFromMagento(tenant.id), 540 * 1000);
+      // Step 0b: Sync civetta from Magento (timeout 1200s = 20 min)
+      // Tenant grossi (San Vito 800k SKU) richiedono ~15-20 min.
+      // Skip se eseguito con successo nelle ultime 4h.
+      {
+        const { rows } = await pool.query(
+          `SELECT MAX(updated_at) AS last_ok
+           FROM products WHERE tenant_id=$1`, [tenant.id]
+        );
+        const lastOkSec = rows[0]?.last_ok ? (Date.now() - new Date(rows[0].last_ok).getTime()) / 1000 : Infinity;
+        if (lastOkSec > 4 * 3600) {
+          await withStepTimeout('civetta_sync', tenant.id, tLabel,
+            () => syncCivettaFromMagento(tenant.id), 1200 * 1000);
+        } else {
+          console.log(`[HealthCron] [${tLabel}] civetta_sync skip: ultimo update ${Math.round(lastOkSec/60)}min fa`);
+        }
+      }
 
-      // Step 1: Health scores (timeout 600s = 10 min). San Vito (800k SKU)
-      // timeoutava sistematicamente a 300s: 22 fatal/24h. Alzato a 600s.
-      const hRes = await withStepTimeout('health_scores', tenant.id, tLabel,
-        () => computeHealthScores(tenant.id), 600 * 1000);
+      // Step 1: Health scores (timeout 1800s = 30 min). San Vito (800k SKU)
+      // richiede 12-15 min. Skip se ultima esecuzione con successo entro
+      // SKIP_THRESHOLD: lookup MAX(updated_at) in product_health_scores per
+      // capire se serve girare ora o se i dati sono già freschi.
+      {
+        const { rows } = await pool.query(
+          `SELECT MAX(updated_at) AS last_ok
+           FROM product_health_scores WHERE tenant_id=$1`, [tenant.id]
+        );
+        const lastOkSec = rows[0]?.last_ok ? (Date.now() - new Date(rows[0].last_ok).getTime()) / 1000 : Infinity;
+        const SKIP_THRESHOLD_SEC = 4 * 3600; // 4 ore
+        if (lastOkSec > SKIP_THRESHOLD_SEC) {
+          const hRes = await withStepTimeout('health_scores', tenant.id, tLabel,
+            () => computeHealthScores(tenant.id), 1800 * 1000);
+          if (hRes.ok) healthResult = hRes.result;
+        } else {
+          console.log(`[HealthCron] [${tLabel}] health_scores skip: ultimo run ${Math.round(lastOkSec/60)}min fa (soglia ${SKIP_THRESHOLD_SEC/3600}h)`);
+        }
+      }
+      const hRes = { ok: true }; // garbage var preserved for back-compat below
       if (hRes.ok) healthResult = hRes.result;
 
       // Step 2: GA4 attribution (timeout 120s).
@@ -220,8 +246,10 @@ async function _runForAllTenantsInner() {
         );
         const secAgo = lastRunRows[0]?.sec_ago ?? Number.POSITIVE_INFINITY;
         if (secAgo > 22 * 3600) {
+          // timeout 1800s = 30 min. San Vito/Ospedale (50k+ SKU MC) timeoutavano
+          // a 600s anche con throttling + retry: ora ampio margine.
           await withStepTimeout('mc_sync', tenant.id, tLabel,
-            () => importMerchantCenter(tenant.id), 600 * 1000);
+            () => importMerchantCenter(tenant.id), 1800 * 1000);
         }
       }
 

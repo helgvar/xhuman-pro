@@ -69,6 +69,12 @@ async function loadConfig(tenantId) {
     // tenant via health_config.store_sales_safety_net per essere meno
     // aggressivi su tenant dove il calo TP coincide con calo ordini store.
     storeSalesSafetyNet: parseInt(c.store_sales_safety_net || 0),
+    // Briglie più larghe: se SKU quarantenato/killer ha sales_30d_seller >=
+    // soglia, NON viene rimosso ma marcato MONITOR. Default 0 = disabilitato.
+    // Filosofia: meglio spendere un po' più su SKU che venderanno comunque
+    // che tagliare il feed e perdere il fatturato store associato.
+    quarantineReleaseMinStoreSales: parseInt(c.quarantine_release_min_store_sales || 0),
+    killerSkipMinStoreSales: parseInt(c.killer_skip_min_store_sales || 0),
   };
 }
 
@@ -397,8 +403,21 @@ async function triageProducts(tenantId, config, snapshot, ruleSet = null) {
     const hasGA4Orders = (parseInt(p.ga4_tp_purchases) || 0) > 0;
     const hasAssistedSales = (parseInt(p.ga4_assisted_sales) || 0) > 0;
 
-    // Already quarantined → still emit as REMOVE (Farmabooster needs to know)
+    const storeSales30dRaw = parseFloat(p.sales_30d_seller) || 0;
+
+    // Already quarantined → di norma REMOVE. Briglie larghe: se vende nello
+    // store sopra soglia, sposta in MONITOR invece di REMOVE (il sistema NON
+    // tocca la quarantena DB, solo la decisione di feed).
     if (p.is_quarantined) {
+      if (config.quarantineReleaseMinStoreSales > 0 && storeSales30dRaw >= config.quarantineReleaseMinStoreSales) {
+        actions.monitor.push({
+          sku: p.sku, name: p.product_name, action: 'MONITOR',
+          reason: `Briglie larghe: quarantenato Q${p.quarantine_level} MA vende ${storeSales30dRaw}/30g in store (>= ${config.quarantineReleaseMinStoreSales}). Lascio in feed.`,
+          category: 'quarantine_release', cost: totalCost, clicks: totalClicks,
+        });
+        stats.quarantine_release = (stats.quarantine_release || 0) + 1;
+        continue;
+      }
       actions.remove.push({
         sku: p.sku, name: p.product_name, action: 'REMOVE',
         reason: `In quarantena Q${p.quarantine_level}`,
@@ -407,8 +426,18 @@ async function triageProducts(tenantId, config, snapshot, ruleSet = null) {
       continue;
     }
 
-    // A) KILLER — via subito
+    // A) KILLER — di norma via subito. Briglie larghe: se vende nello store
+    // sopra soglia, MONITOR invece di REMOVE.
     if (p.is_killer) {
+      if (config.killerSkipMinStoreSales > 0 && storeSales30dRaw >= config.killerSkipMinStoreSales) {
+        actions.monitor.push({
+          sku: p.sku, name: p.product_name, action: 'MONITOR',
+          reason: `Briglie larghe: killer (${p.competitors} seller, 0 globali) MA vende ${storeSales30dRaw}/30g in store. Lascio in feed.`,
+          category: 'killer_release', cost: totalCost, clicks: totalClicks,
+        });
+        stats.killer_release = (stats.killer_release || 0) + 1;
+        continue;
+      }
       actions.remove.push({
         sku: p.sku, name: p.product_name, action: 'REMOVE',
         reason: `KILLER: ${p.competitors} seller, 0 vendite globali, ${totalClicks} click, €${totalCost.toFixed(2)} sprecati`,
@@ -988,15 +1017,28 @@ async function runDailyFeedEngine(tenantId) {
   console.log(`[FeedDaily] Triage: ${stats.killers} killer, ${stats.bruciatori} bruciatori, ${stats.convertitori} convertitori, ${stats.potenziali} potenziali`);
 
   // FASE 4a: Include ALL active quarantined products as REMOVE
+  // (briglie larghe: se vendono nello store >= soglia, MONITOR invece di REMOVE)
   const { rows: quarantined } = await pool.query(`
-    SELECT fq.sku, fq.quarantine_level, fq.reason, p.product_name
+    SELECT fq.sku, fq.quarantine_level, fq.reason, p.product_name,
+           COALESCE(p.sales_30d_seller, 0) AS sales_30d_seller
     FROM feed_quarantine fq
     JOIN products p ON p.sku = fq.sku AND p.tenant_id = fq.tenant_id
     WHERE fq.tenant_id = $1 AND fq.reactivated = false
   `, [tenantId]);
   const triageSKUs = new Set(actions.remove.map(a => a.sku));
+  let releasedQuar = 0;
   for (const q of quarantined) {
     if (triageSKUs.has(q.sku)) continue; // Already in remove from triage
+    const storeSales = parseFloat(q.sales_30d_seller) || 0;
+    if (config.quarantineReleaseMinStoreSales > 0 && storeSales >= config.quarantineReleaseMinStoreSales) {
+      actions.monitor.push({
+        sku: q.sku, name: q.product_name, action: 'MONITOR',
+        reason: `Briglie larghe: quarantenato Q${q.quarantine_level} MA vende ${storeSales}/30g in store (>= ${config.quarantineReleaseMinStoreSales}). Lascio in feed.`,
+        category: 'quarantine_release', cost: 0, clicks: 0,
+      });
+      releasedQuar++;
+      continue;
+    }
     actions.remove.push({
       sku: q.sku, name: q.product_name, action: 'REMOVE',
       reason: `In quarantena Q${q.quarantine_level}: ${q.reason}`,
@@ -1005,21 +1047,36 @@ async function runDailyFeedEngine(tenantId) {
   }
   // Also include active killers not yet quarantined
   const { rows: activeKillers } = await pool.query(`
-    SELECT fk.sku, p.product_name, fk.reason
+    SELECT fk.sku, p.product_name, fk.reason,
+           COALESCE(p.sales_30d_seller, 0) AS sales_30d_seller
     FROM feed_killers fk
     JOIN products p ON p.sku = fk.sku AND p.tenant_id = fk.tenant_id
     WHERE fk.tenant_id = $1 AND fk.is_active = true
   `, [tenantId]);
   const allRemoveSKUs = new Set(actions.remove.map(a => a.sku));
+  let releasedKiller = 0;
   for (const k of activeKillers) {
     if (allRemoveSKUs.has(k.sku)) continue;
+    const storeSales = parseFloat(k.sales_30d_seller) || 0;
+    if (config.killerSkipMinStoreSales > 0 && storeSales >= config.killerSkipMinStoreSales) {
+      actions.monitor.push({
+        sku: k.sku, name: k.product_name, action: 'MONITOR',
+        reason: `Briglie larghe: killer MA vende ${storeSales}/30g in store. Lascio in feed.`,
+        category: 'killer_release', cost: 0, clicks: 0,
+      });
+      releasedKiller++;
+      continue;
+    }
     actions.remove.push({
       sku: k.sku, name: k.product_name, action: 'REMOVE',
       reason: k.reason, category: 'killer', cost: 0, clicks: 0,
       quarantineDays: 30,
     });
   }
-  console.log(`[FeedDaily] Total REMOVE: ${actions.remove.length} (triage: ${stats.killers + stats.bruciatori}, quarantined: ${quarantined.length}, killers: ${activeKillers.length})`);
+  console.log(`[FeedDaily] Total REMOVE: ${actions.remove.length} (triage: ${stats.killers + stats.bruciatori}, quarantined: ${quarantined.length - releasedQuar}, killers: ${activeKillers.length - releasedKiller})`);
+  if (releasedQuar > 0 || releasedKiller > 0) {
+    console.log(`[FeedDaily] Briglie larghe: rilasciati ${releasedQuar} quarantenati + ${releasedKiller} killer in MONITOR`);
+  }
 
   // FASE 4b: Price cut per civetta=1 zero click con domanda
   const zeroPriceCuts = await findPriceCutCandidates(tenantId, config, snapshot);

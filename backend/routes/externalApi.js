@@ -182,11 +182,17 @@ async function recalculateStableCache(tenantId) {
     }
   }
 
-  // Build price cuts list
+  // Build price cuts list.
+  // Includiamo ANCHE i record action='ADD' che hanno un recommended_price
+  // (es. promotion_salva_bilancio). Sono SKU che mettiamo in feed civetta
+  // CON un nuovo prezzo: senza emetterli qui, Farmabooster non aggiorna il
+  // prezzo e l'SKU entrerebbe in feed con il vecchio (non competitivo).
   const { rows: priceCutRows } = await pool.query(`
     SELECT fa.sku as code, fa.recommended_price as newprice
     FROM feed_actions fa
-    WHERE fa.tenant_id = $1 AND fa.action = 'PRICE_CUT' AND fa.recommended_price IS NOT NULL
+    WHERE fa.tenant_id = $1
+      AND fa.recommended_price IS NOT NULL
+      AND (fa.action = 'PRICE_CUT' OR fa.action = 'ADD')
   `, [tenantId]);
 
   const priceCuts = priceCutRows.map(r => ({ code: r.code, newprice: String(Math.round(parseFloat(r.newprice) * 100) / 100) }));

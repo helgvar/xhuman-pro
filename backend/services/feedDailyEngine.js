@@ -87,9 +87,10 @@ async function loadConfig(tenantId) {
     salvaBilancioMinEur: parseFloat(c.salva_bilancio_min_margin_eur || 3),
     // PRICE_CUT competitivo: SKU in feed civetta con sell_price > best_price
     // competitor → tagliamo a best - 0.01 per finire top, se margine fascia OR
-    // Salva Bilancio rispettato. Default abilitato con limite per non emettere
-    // migliaia di azioni in un colpo (rate limit Magento).
-    competitivePriceCutLimit: parseInt(c.competitive_price_cut_limit || 500),
+    // Salva Bilancio rispettato. Limit alto (3000) perchè con catalogo da 100k
+    // SKU il giacimento reale è 2-4k SKU per tenant: limit basso = perdere
+    // soldi sul tavolo. magentoSyncCron ha gia' suo throttling lato Magento.
+    competitivePriceCutLimit: parseInt(c.competitive_price_cut_limit || 3000),
   };
 }
 
@@ -957,9 +958,12 @@ async function findCompetitivePriceCuts(tenantId, config, snapshot, excludeSkus 
       AND fk.id IS NULL AND fq.id IS NULL
       AND COALESCE(p.erp_cost, p.erp_cost_imputed, 0) > 0
     ORDER BY
-      -- Priorità: SKU con domanda store + pos peggiore (più potenziale upside)
-      COALESCE(p.sales_30d_seller, 0) DESC,
-      phs.scraper_position DESC NULLS LAST
+      -- Priorità: SKU con MARGINE EUR POST-CUT più alto (massimo guadagno per
+      -- pezzo dopo l'allineamento) + bonus per pos cattiva (upside maggiore).
+      -- Prima ORDER BY sales_30d_seller pre-filtrava SKU low-margin in cima
+      -- che venivano scartati da Salva Bilancio.
+      (phs.scraper_best_price - 0.01 - COALESCE(p.erp_cost, p.erp_cost_imputed, 0)) DESC,
+      COALESCE(p.sales_30d_seller, 0) DESC
     LIMIT $2
   `, [tenantId, config.competitivePriceCutLimit]);
 

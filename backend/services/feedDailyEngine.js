@@ -765,6 +765,8 @@ async function loadPepiteRules(tenantId) {
 }
 
 async function queryPepiteTier(tenantId, posMin, posMax, marginMin, salesMin, limit) {
+  // Esclude regole Sconto (mai toccare prezzi su SKU "sconto") +
+  // priorità stagionale (in-season/entrante prima).
   const { rows } = await pool.query(`
     SELECT p.sku, p.product_name,
       ROUND(p.sell_price::numeric, 2) as sell_price,
@@ -773,12 +775,13 @@ async function queryPepiteTier(tenantId, posMin, posMax, marginMin, salesMin, li
       p.erp_stock, p.supplier_stock,
       phs.scraper_position, phs.scraper_competitor_count,
       ROUND(phs.scraper_best_price::numeric, 2) as best_price,
-      phs.mc_click_potential, phs.health_score,
+      phs.mc_click_potential, phs.health_score, phs.seasonal_score,
       p.price_rule_id
     FROM products p
     JOIN product_health_scores phs ON phs.sku = p.sku AND phs.tenant_id = p.tenant_id
     LEFT JOIN feed_killers fk ON fk.sku = p.sku AND fk.tenant_id = p.tenant_id AND fk.is_active = true
     LEFT JOIN feed_quarantine fq ON fq.sku = p.sku AND fq.tenant_id = p.tenant_id AND fq.reactivated = false
+    LEFT JOIN price_rules pr ON pr.rule_id = p.price_rule_id AND pr.tenant_id = p.tenant_id
     WHERE p.tenant_id = $1
       AND (p.is_civetta = false OR p.is_civetta IS NULL)
       AND p.saleable = true
@@ -788,7 +791,11 @@ async function queryPepiteTier(tenantId, posMin, posMax, marginMin, salesMin, li
       AND fk.id IS NULL
       AND fq.id IS NULL
       AND phs.scraper_position BETWEEN $4 AND $5
-    ORDER BY p.sales_30d_aggregated DESC, phs.health_score DESC
+      AND (pr.rule_type IS NULL OR pr.rule_type != 'sconto')
+    ORDER BY
+      COALESCE(phs.seasonal_score, 70) DESC,
+      p.sales_30d_aggregated DESC,
+      phs.health_score DESC
     LIMIT $6
   `, [tenantId, marginMin, salesMin, posMin, posMax, limit]);
   return rows;
@@ -878,11 +885,8 @@ async function findStoreSellerPromotions(tenantId, config, snapshot, excludeSkus
   if (!snapshot || snapshot.overTarget) return [];
 
   const minSales = config.promoteStoreSellerMinSales;
-  // Due categorie:
-  //   A) Promotion "pura": sells store >= soglia, accetta SKU sopra E sotto best_price.
-  //      Se sopra best → suggeriamo new_price = best - 0.01 (con Salva Bilancio).
-  //   B) Promotion competitiva: anche con vendite store basse (>=1), se sopra
-  //      best_price e Salva Bilancio OK, vale la pena testare (margine assoluto sano).
+  // Esclude regole Sconto: prezzi imposti, non tocchiamo mai.
+  // Priorità stagionalità: SKU in-season o entrante prima (seasonal_score DESC).
   const { rows } = await pool.query(`
     SELECT p.sku, p.product_name,
       ROUND(p.sell_price::numeric, 2) AS sell_price,
@@ -892,21 +896,25 @@ async function findStoreSellerPromotions(tenantId, config, snapshot, excludeSkus
       phs.mc_click_potential,
       phs.scraper_position,
       phs.scraper_competitor_count,
+      phs.seasonal_score,
       ROUND(phs.scraper_best_price::numeric, 2) AS best_price
     FROM products p
     LEFT JOIN product_health_scores phs ON phs.tenant_id=p.tenant_id AND phs.sku=p.sku
     LEFT JOIN feed_killers fk ON fk.tenant_id=p.tenant_id AND fk.sku=p.sku AND fk.is_active=true
     LEFT JOIN feed_quarantine fq ON fq.tenant_id=p.tenant_id AND fq.sku=p.sku AND fq.reactivated=false
+    LEFT JOIN price_rules pr ON pr.rule_id = p.price_rule_id AND pr.tenant_id = $1
     WHERE p.tenant_id = $1
       AND COALESCE(p.is_civetta, false) = false
       AND p.saleable = true
       AND (COALESCE(p.erp_stock,0) + COALESCE(p.supplier_stock,0)) > 0
       AND fk.id IS NULL AND fq.id IS NULL
+      AND (pr.rule_type IS NULL OR pr.rule_type != 'sconto')
       AND (
         COALESCE(p.sales_30d_seller, 0) >= $2
         OR (phs.scraper_best_price > 0 AND p.sell_price > phs.scraper_best_price + 0.01)
       )
     ORDER BY
+      COALESCE(phs.seasonal_score, 70) DESC,
       COALESCE(p.sales_30d_seller, 0) DESC,
       CASE phs.mc_click_potential WHEN 'HIGH' THEN 1 WHEN 'MEDIUM' THEN 2 ELSE 3 END
     LIMIT 600
@@ -962,18 +970,22 @@ async function findStoreSellerPromotions(tenantId, config, snapshot, excludeSkus
 // verifica Salva Bilancio + margine fascia come fallback.
 async function findCompetitivePriceCuts(tenantId, config, snapshot, excludeSkus = new Set()) {
   if (!snapshot || snapshot.overTarget) return [];
+  // Esclude regole Sconto (prezzo imposto, non si tocca).
+  // Priorità ordering: 1) stagionalità (in-season/entrante prima), 2) margine
+  // assoluto post-cut DESC (massimo guadagno per pezzo), 3) vendite store.
   const { rows } = await pool.query(`
     SELECT p.sku, p.product_name,
       ROUND(p.sell_price::numeric, 2) AS sell_price,
       ROUND(COALESCE(p.erp_cost, p.erp_cost_imputed, 0)::numeric, 4) AS erp_cost,
       ROUND(p.margin_pct::numeric, 1) AS margin_pct,
       p.sales_30d_seller,
-      phs.scraper_position, phs.scraper_competitor_count,
+      phs.scraper_position, phs.scraper_competitor_count, phs.seasonal_score,
       ROUND(phs.scraper_best_price::numeric, 2) AS best_price
     FROM products p
     JOIN product_health_scores phs ON phs.tenant_id=p.tenant_id AND phs.sku=p.sku
     LEFT JOIN feed_killers fk ON fk.tenant_id=p.tenant_id AND fk.sku=p.sku AND fk.is_active=true
     LEFT JOIN feed_quarantine fq ON fq.tenant_id=p.tenant_id AND fq.sku=p.sku AND fq.reactivated=false
+    LEFT JOIN price_rules pr ON pr.rule_id = p.price_rule_id AND pr.tenant_id = $1
     WHERE p.tenant_id=$1
       AND COALESCE(p.is_civetta, false)=true
       AND p.saleable=true
@@ -982,11 +994,9 @@ async function findCompetitivePriceCuts(tenantId, config, snapshot, excludeSkus 
       AND p.sell_price > phs.scraper_best_price + 0.01
       AND fk.id IS NULL AND fq.id IS NULL
       AND COALESCE(p.erp_cost, p.erp_cost_imputed, 0) > 0
+      AND (pr.rule_type IS NULL OR pr.rule_type != 'sconto')
     ORDER BY
-      -- Priorità: SKU con MARGINE EUR POST-CUT più alto (massimo guadagno per
-      -- pezzo dopo l'allineamento) + bonus per pos cattiva (upside maggiore).
-      -- Prima ORDER BY sales_30d_seller pre-filtrava SKU low-margin in cima
-      -- che venivano scartati da Salva Bilancio.
+      COALESCE(phs.seasonal_score, 70) DESC,
       (phs.scraper_best_price - 0.01 - COALESCE(p.erp_cost, p.erp_cost_imputed, 0)) DESC,
       COALESCE(p.sales_30d_seller, 0) DESC
     LIMIT $2

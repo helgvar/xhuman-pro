@@ -80,6 +80,16 @@ async function loadConfig(tenantId) {
     // qualità: pos TP 1-7 (zona click) + margine rispetto fascia prezzo
     // (<10€→18%, 10-30€→14%, >30€→12%). Default 3 = abilitato.
     promoteStoreSellerMinSales: parseInt(c.promote_store_seller_min_sales || 3),
+    // Salva Bilancio: criterio fallback per accettare cut anche se margin_pct
+    // sotto fascia, purchè margine ASSOLUTO EUR sia significativo. SKU costosi
+    // possono vendere bene con 5-6€ di margine anche se in % sono al 8-9%.
+    // Default €3 = abilitato (cfr. feedback_salva_bilancio_pepite_vere).
+    salvaBilancioMinEur: parseFloat(c.salva_bilancio_min_margin_eur || 3),
+    // PRICE_CUT competitivo: SKU in feed civetta con sell_price > best_price
+    // competitor → tagliamo a best - 0.01 per finire top, se margine fascia OR
+    // Salva Bilancio rispettato. Default abilitato con limite per non emettere
+    // migliaia di azioni in un colpo (rate limit Magento).
+    competitivePriceCutLimit: parseInt(c.competitive_price_cut_limit || 500),
   };
 }
 
@@ -827,17 +837,36 @@ async function findPepite(tenantId, config, snapshot, removedCost) {
 //   sell_price < 10€   → margin_pct ≥ 18
 //   10€ ≤ p < 30€      → margin_pct ≥ 14
 //   sell_price ≥ 30€   → margin_pct ≥ 12
+// Helper: regola Salva Bilancio. Restituisce { ok, marginEur, marginPct, tier }
+function isCutAcceptable(newPrice, erpCost, salvaBilancioMinEur) {
+  if (newPrice <= erpCost) return { ok: false };
+  const marginEur = newPrice - erpCost;
+  const marginPct = (marginEur / newPrice) * 100;
+  const tier = newPrice < 10 ? 18 : newPrice < 30 ? 14 : 12;
+  const okPct = marginPct >= tier;
+  const okEur = marginEur >= salvaBilancioMinEur;
+  return { ok: okPct || okEur, marginEur, marginPct, tier, okBy: okPct ? 'pct' : 'eur' };
+}
+
 async function findStoreSellerPromotions(tenantId, config, snapshot, excludeSkus = new Set()) {
-  if (!snapshot || snapshot.overTarget) return []; // rispetta cap incidenza
+  if (!snapshot || snapshot.overTarget) return [];
 
   const minSales = config.promoteStoreSellerMinSales;
+  // Due categorie:
+  //   A) Promotion "pura": sells store >= soglia, accetta SKU sopra E sotto best_price.
+  //      Se sopra best → suggeriamo new_price = best - 0.01 (con Salva Bilancio).
+  //   B) Promotion competitiva: anche con vendite store basse (>=1), se sopra
+  //      best_price e Salva Bilancio OK, vale la pena testare (margine assoluto sano).
   const { rows } = await pool.query(`
     SELECT p.sku, p.product_name,
       ROUND(p.sell_price::numeric, 2) AS sell_price,
+      ROUND(COALESCE(p.erp_cost, p.erp_cost_imputed, 0)::numeric, 4) AS erp_cost,
       ROUND(p.margin_pct::numeric, 1) AS margin_pct,
       p.sales_30d_seller,
       phs.mc_click_potential,
-      phs.scraper_position
+      phs.scraper_position,
+      phs.scraper_competitor_count,
+      ROUND(phs.scraper_best_price::numeric, 2) AS best_price
     FROM products p
     LEFT JOIN product_health_scores phs ON phs.tenant_id=p.tenant_id AND phs.sku=p.sku
     LEFT JOIN feed_killers fk ON fk.tenant_id=p.tenant_id AND fk.sku=p.sku AND fk.is_active=true
@@ -846,31 +875,117 @@ async function findStoreSellerPromotions(tenantId, config, snapshot, excludeSkus
       AND COALESCE(p.is_civetta, false) = false
       AND p.saleable = true
       AND (COALESCE(p.erp_stock,0) + COALESCE(p.supplier_stock,0)) > 0
-      AND COALESCE(p.sales_30d_seller, 0) >= $2
       AND fk.id IS NULL AND fq.id IS NULL
       AND (
-        (p.sell_price <  10 AND COALESCE(p.margin_pct,0) >= 18) OR
-        (p.sell_price >= 10 AND p.sell_price < 30 AND COALESCE(p.margin_pct,0) >= 14) OR
-        (p.sell_price >= 30 AND COALESCE(p.margin_pct,0) >= 12)
+        COALESCE(p.sales_30d_seller, 0) >= $2
+        OR (phs.scraper_best_price > 0 AND p.sell_price > phs.scraper_best_price + 0.01)
       )
     ORDER BY
-      -- HIGH/MEDIUM click_potential MC in cima (Google segnale)
-      CASE phs.mc_click_potential WHEN 'HIGH' THEN 1 WHEN 'MEDIUM' THEN 2 ELSE 3 END,
-      p.sales_30d_seller DESC
-    LIMIT 200
+      COALESCE(p.sales_30d_seller, 0) DESC,
+      CASE phs.mc_click_potential WHEN 'HIGH' THEN 1 WHEN 'MEDIUM' THEN 2 ELSE 3 END
+    LIMIT 600
   `, [tenantId, minSales]);
 
-  return rows
-    .filter(r => !excludeSkus.has(r.sku))
-    .map(r => ({
+  const out = [];
+  for (const r of rows) {
+    if (excludeSkus.has(r.sku)) continue;
+    const sellPrice = parseFloat(r.sell_price);
+    const erpCost = parseFloat(r.erp_cost) || 0;
+    const bestPrice = parseFloat(r.best_price) || 0;
+    const sales = parseFloat(r.sales_30d_seller) || 0;
+
+    // Caso 1: sopra best_price → suggeriamo cut. Verifica Salva Bilancio.
+    if (bestPrice > 0 && sellPrice > bestPrice + 0.01) {
+      const newPrice = +(bestPrice - 0.01).toFixed(2);
+      const acc = isCutAcceptable(newPrice, erpCost, config.salvaBilancioMinEur);
+      if (acc.ok) {
+        out.push({
+          sku: r.sku, name: r.product_name, action: 'ADD',
+          reason: `Pepita Salva Bilancio: vende ${sales}/30g in store, attuale €${sellPrice} > best €${bestPrice}. Cut a €${newPrice} → margine €${acc.marginEur.toFixed(2)} (${acc.marginPct.toFixed(1)}%, ${acc.okBy === 'eur' ? 'OK Salva Bilancio' : 'OK fascia ' + acc.tier + '%'})`,
+          category: 'promotion_salva_bilancio',
+          sellPrice, currentPrice: sellPrice,
+          recommendedPrice: newPrice,
+          priceCutPct: +(((sellPrice - newPrice) / sellPrice) * 100).toFixed(1),
+          newMarginPct: +acc.marginPct.toFixed(1),
+          newMarginEur: +acc.marginEur.toFixed(2),
+          marginPct: parseFloat(r.margin_pct),
+          demand: sales,
+          position: r.scraper_position,
+        });
+        continue;
+      }
+    }
+
+    // Caso 2: sotto/uguale best_price o no best → ADD puro se sells store + fascia margine OK
+    if (sales < minSales) continue;
+    const mp = parseFloat(r.margin_pct) || 0;
+    const tierFascia = sellPrice < 10 ? 18 : sellPrice < 30 ? 14 : 12;
+    if (mp < tierFascia) continue;
+    out.push({
       sku: r.sku, name: r.product_name, action: 'ADD',
-      reason: `Promozione store: vende ${r.sales_30d_seller}/30g in store, margine ${r.margin_pct}% (fascia ${r.sell_price < 10 ? '<10€' : r.sell_price < 30 ? '10-30€' : '≥30€'})${r.mc_click_potential ? ', MC potential ' + r.mc_click_potential : ''}`,
+      reason: `Promozione store: vende ${sales}/30g in store, margine ${mp}% (fascia ${sellPrice < 10 ? '<10€' : sellPrice < 30 ? '10-30€' : '≥30€'})${r.mc_click_potential ? ', MC ' + r.mc_click_potential : ''}`,
       category: 'promotion_store_seller',
-      sellPrice: parseFloat(r.sell_price),
-      marginPct: parseFloat(r.margin_pct),
-      demand: parseFloat(r.sales_30d_seller),
+      sellPrice, marginPct: mp, demand: sales, position: r.scraper_position,
+    });
+  }
+  return out;
+}
+
+// FASE 5c: PRICE_CUT competitivo per SKU IN feed civetta dove siamo sopra il
+// best_price (paghiamo i click ma perdiamo i confronti). Cut a best - 0.01,
+// verifica Salva Bilancio + margine fascia come fallback.
+async function findCompetitivePriceCuts(tenantId, config, snapshot, excludeSkus = new Set()) {
+  if (!snapshot || snapshot.overTarget) return [];
+  const { rows } = await pool.query(`
+    SELECT p.sku, p.product_name,
+      ROUND(p.sell_price::numeric, 2) AS sell_price,
+      ROUND(COALESCE(p.erp_cost, p.erp_cost_imputed, 0)::numeric, 4) AS erp_cost,
+      ROUND(p.margin_pct::numeric, 1) AS margin_pct,
+      p.sales_30d_seller,
+      phs.scraper_position, phs.scraper_competitor_count,
+      ROUND(phs.scraper_best_price::numeric, 2) AS best_price
+    FROM products p
+    JOIN product_health_scores phs ON phs.tenant_id=p.tenant_id AND phs.sku=p.sku
+    LEFT JOIN feed_killers fk ON fk.tenant_id=p.tenant_id AND fk.sku=p.sku AND fk.is_active=true
+    LEFT JOIN feed_quarantine fq ON fq.tenant_id=p.tenant_id AND fq.sku=p.sku AND fq.reactivated=false
+    WHERE p.tenant_id=$1
+      AND COALESCE(p.is_civetta, false)=true
+      AND p.saleable=true
+      AND (COALESCE(p.erp_stock,0)+COALESCE(p.supplier_stock,0))>0
+      AND phs.scraper_best_price > 0
+      AND p.sell_price > phs.scraper_best_price + 0.01
+      AND fk.id IS NULL AND fq.id IS NULL
+      AND COALESCE(p.erp_cost, p.erp_cost_imputed, 0) > 0
+    ORDER BY
+      -- Priorità: SKU con domanda store + pos peggiore (più potenziale upside)
+      COALESCE(p.sales_30d_seller, 0) DESC,
+      phs.scraper_position DESC NULLS LAST
+    LIMIT $2
+  `, [tenantId, config.competitivePriceCutLimit]);
+
+  const out = [];
+  for (const r of rows) {
+    if (excludeSkus.has(r.sku)) continue;
+    const sellPrice = parseFloat(r.sell_price);
+    const erpCost = parseFloat(r.erp_cost) || 0;
+    const bestPrice = parseFloat(r.best_price) || 0;
+    const newPrice = +(bestPrice - 0.01).toFixed(2);
+    const acc = isCutAcceptable(newPrice, erpCost, config.salvaBilancioMinEur);
+    if (!acc.ok) continue;
+    out.push({
+      sku: r.sku, name: r.product_name, action: 'PRICE_CUT',
+      reason: `Competitivo: pos ${r.scraper_position}, attuale €${sellPrice} > best €${bestPrice}. Cut a €${newPrice} → margine €${acc.marginEur.toFixed(2)} (${acc.marginPct.toFixed(1)}%, ${acc.okBy === 'eur' ? 'OK Salva Bilancio' : 'OK fascia'})`,
+      category: 'competitive_price_cut',
+      cost: 0, clicks: 0,
+      currentPrice: sellPrice,
+      recommendedPrice: newPrice,
+      priceCutPct: +(((sellPrice - newPrice) / sellPrice) * 100).toFixed(1),
+      newMarginPct: +acc.marginPct.toFixed(1),
+      newMarginEur: +acc.marginEur.toFixed(2),
       position: r.scraper_position,
-    }));
+    });
+  }
+  return out;
 }
 
 // ─── FASE 6: SAVE DAILY SUMMARY ───────────────────────
@@ -1155,17 +1270,31 @@ async function runDailyFeedEngine(tenantId) {
   actions.add = pepite;
   console.log(`[FeedDaily] Pepite: ${pepite.length} candidate`);
 
-  // FASE 5b: Promozione attiva di SKU non in feed civetta MA che vendono in
-  // store. Intrinseco all'ottimizzazione: identifichiamo SKU con domanda
-  // confermata che oggi non riceviamo via TP, filtriamo per qualità (posizione
-  // 1-7 + margine per fascia prezzo), emettiamo ADD. Skip duplicati con pepite.
+  // FASE 5b: Promozione attiva di SKU non in feed civetta. Doppio criterio:
+  //  - vendono in store >= soglia AND margine fascia OK → ADD puro
+  //  - sopra best_price competitor + Salva Bilancio (margin_eur OR margin_pct
+  //    fascia) → ADD con PRICE_CUT contestuale (pepita vera).
   if (config.promoteStoreSellerMinSales > 0) {
     const promoted = await findStoreSellerPromotions(
       tenantId, config, snapshot,
       new Set(actions.add.map(a => a.sku))
     );
     actions.add.push(...promoted);
-    console.log(`[FeedDaily] Promozione store sellers: +${promoted.length} ADD (soglia vendite ≥${config.promoteStoreSellerMinSales}/30g + margine per fascia)`);
+    const nSalva = promoted.filter(p => p.category === 'promotion_salva_bilancio').length;
+    console.log(`[FeedDaily] Promozione store sellers: +${promoted.length} ADD (${nSalva} con cut Salva Bilancio, ${promoted.length - nSalva} ADD puri)`);
+  }
+
+  // FASE 5c: PRICE_CUT competitivo per SKU in feed con prezzo > best_price.
+  // Verifica Salva Bilancio + fascia margine. Limita a competitivePriceCutLimit
+  // per non sommergere Magento di PUT.
+  if (config.competitivePriceCutLimit > 0) {
+    const exclude = new Set([
+      ...actions.priceCut.map(p => p.sku),
+      ...actions.add.map(a => a.sku),
+    ]);
+    const cuts = await findCompetitivePriceCuts(tenantId, config, snapshot, exclude);
+    actions.priceCut.push(...cuts);
+    console.log(`[FeedDaily] PRICE_CUT competitivi (Salva Bilancio): +${cuts.length}`);
   }
 
   // Apply

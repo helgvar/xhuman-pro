@@ -3,7 +3,8 @@ const { importProducts } = require('./farmaboosterProducts');
 const { isJobRunning } = require('./requestQueue');
 const { withTenantLock, farmaboosterQueue } = require('./apiQueue');
 
-const SYNC_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6 hours (catalogo non cambia spesso, riduce carico su FB)
+const SYNC_INTERVAL_MS = 60 * 60 * 1000;      // 1 hour (era 6h; prezzi e stock_source cambiano intra-giorno,
+                                              // cfr. feedback_pricing_freshness_critical)
 const STAGGER_DELAY_MS = 60 * 1000;           // 60s delay between tenants (protegge FB server)
 
 let syncRunning = false;

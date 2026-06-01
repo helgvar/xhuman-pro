@@ -30,7 +30,8 @@ const THRESHOLDS_HOURS = {
   orders: 8,                  // OrderSync 60min cycle
   zombieClicks: 36,           // ZombieCron daily 03:00 UTC
   healthScores: 6,            // HealthCron 60min ma loop tenant lungo
-  productSync: 24,            // ProductSync 6h cycle
+  productSync: 3,             // ProductSync ora ogni 1h (era 24h con cron 6h), abbassato a 3h alert
+                              // per i tenant operational dove dati prezzo/costo devono essere freschi
   driveScraper: 25,           // gira ogni 4-6h dal productSync, 25h = safe
   mcSync: 30,                 // gira 1x/24h finestra 04-12 UTC
   magentoSync: 4,             // gira ogni 2h, 4h copre 2 cicli persi

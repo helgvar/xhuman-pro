@@ -26,23 +26,33 @@ const MAX_FILES_PER_TYPE = 2; // Only latest N files per type (results/walls)
  * Get Google Drive client using service account credentials from DB
  */
 async function getDriveClient(tenantId) {
-  const { rows } = await pool.query(
-    `SELECT config_key, config_value FROM tenant_configs
-     WHERE tenant_id = $1 AND config_key IN ('google_service_account_json', 'ga4_credentials_json', 'scraper_drive_folder_id')`,
-    [tenantId]
-  );
-
-  const config = {};
-  for (const row of rows) {
-    try { config[row.config_key] = decrypt(row.config_value); }
-    catch { config[row.config_key] = row.config_value; }
-  }
-
-  const saJson = config.google_service_account_json || config.ga4_credentials_json;
-  const folderId = config.scraper_drive_folder_id;
+  // Drive è UGUALE PER TUTTI i tenant (memoria utente). Cerchiamo prima in
+  // global_config (sorgente unica), poi fallback tenant_configs se per qualche
+  // ragione c'è override per tenant. Senza questo fallback, tenant che non
+  // hanno scraper_drive_folder_id in tenant_configs (es. Ospedale, SubitoFarma)
+  // fallivano con "not configured" anche se la config esiste a livello globale.
+  const { getGlobal } = require('./globalConfig');
+  let saJson = await getGlobal('google_service_account_json');
+  let folderId = await getGlobal('scraper_drive_folder_id');
 
   if (!saJson || !folderId) {
-    throw new Error('Google Drive not configured (missing service account or folder ID)');
+    // Fallback per-tenant (legacy)
+    const { rows } = await pool.query(
+      `SELECT config_key, config_value FROM tenant_configs
+       WHERE tenant_id = $1 AND config_key IN ('google_service_account_json', 'ga4_credentials_json', 'scraper_drive_folder_id')`,
+      [tenantId]
+    );
+    const config = {};
+    for (const row of rows) {
+      try { config[row.config_key] = decrypt(row.config_value); }
+      catch { config[row.config_key] = row.config_value; }
+    }
+    saJson = saJson || config.google_service_account_json || config.ga4_credentials_json;
+    folderId = folderId || config.scraper_drive_folder_id;
+  }
+
+  if (!saJson || !folderId) {
+    throw new Error('Google Drive not configured (missing service account or folder ID) — verifica global_config.google_service_account_json + global_config.scraper_drive_folder_id');
   }
 
   const credentials = JSON.parse(saJson);

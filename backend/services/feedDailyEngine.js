@@ -75,6 +75,11 @@ async function loadConfig(tenantId) {
     // che tagliare il feed e perdere il fatturato store associato.
     quarantineReleaseMinStoreSales: parseInt(c.quarantine_release_min_store_sales || 0),
     killerSkipMinStoreSales: parseInt(c.killer_skip_min_store_sales || 0),
+    // Promozione attiva: SKU non in feed civetta MA che vendono nello store
+    // sopra soglia → emettiamo ADD (intrinseco all'ottimizzazione). Filtri di
+    // qualità: pos TP 1-7 (zona click) + margine rispetto fascia prezzo
+    // (<10€→18%, 10-30€→14%, >30€→12%). Default 3 = abilitato.
+    promoteStoreSellerMinSales: parseInt(c.promote_store_seller_min_sales || 3),
   };
 }
 
@@ -807,6 +812,67 @@ async function findPepite(tenantId, config, snapshot, removedCost) {
   ];
 }
 
+// ─── FASE 5b: PROMOZIONE ATTIVA STORE SELLERS ─────────
+// Trova SKU che vendono nel nostro store sopra soglia, MA non sono nel feed
+// civetta (gestiti da Farmabooster come "non sponsorizzati"). Filtri di
+// qualità: margine rispetto fascia prezzo (giusta marginalità). Saltiamo
+// killer e quarantenati (decisioni esplicite passate).
+//
+// NB: NON filtriamo per scraper_position perché lo scraper TP visita solo
+// gli SKU già civetta. Quindi i candidati promotion hanno position NULL
+// quasi sempre. La posizione effettiva viene rilevata al ciclo successivo
+// dopo che li abbiamo aggiunti al feed.
+//
+// Margine per fascia (cfr. feedback_price_cut_margins):
+//   sell_price < 10€   → margin_pct ≥ 18
+//   10€ ≤ p < 30€      → margin_pct ≥ 14
+//   sell_price ≥ 30€   → margin_pct ≥ 12
+async function findStoreSellerPromotions(tenantId, config, snapshot, excludeSkus = new Set()) {
+  if (!snapshot || snapshot.overTarget) return []; // rispetta cap incidenza
+
+  const minSales = config.promoteStoreSellerMinSales;
+  const { rows } = await pool.query(`
+    SELECT p.sku, p.product_name,
+      ROUND(p.sell_price::numeric, 2) AS sell_price,
+      ROUND(p.margin_pct::numeric, 1) AS margin_pct,
+      p.sales_30d_seller,
+      phs.mc_click_potential,
+      phs.scraper_position
+    FROM products p
+    LEFT JOIN product_health_scores phs ON phs.tenant_id=p.tenant_id AND phs.sku=p.sku
+    LEFT JOIN feed_killers fk ON fk.tenant_id=p.tenant_id AND fk.sku=p.sku AND fk.is_active=true
+    LEFT JOIN feed_quarantine fq ON fq.tenant_id=p.tenant_id AND fq.sku=p.sku AND fq.reactivated=false
+    WHERE p.tenant_id = $1
+      AND COALESCE(p.is_civetta, false) = false
+      AND p.saleable = true
+      AND (COALESCE(p.erp_stock,0) + COALESCE(p.supplier_stock,0)) > 0
+      AND COALESCE(p.sales_30d_seller, 0) >= $2
+      AND fk.id IS NULL AND fq.id IS NULL
+      AND (
+        (p.sell_price <  10 AND COALESCE(p.margin_pct,0) >= 18) OR
+        (p.sell_price >= 10 AND p.sell_price < 30 AND COALESCE(p.margin_pct,0) >= 14) OR
+        (p.sell_price >= 30 AND COALESCE(p.margin_pct,0) >= 12)
+      )
+    ORDER BY
+      -- HIGH/MEDIUM click_potential MC in cima (Google segnale)
+      CASE phs.mc_click_potential WHEN 'HIGH' THEN 1 WHEN 'MEDIUM' THEN 2 ELSE 3 END,
+      p.sales_30d_seller DESC
+    LIMIT 200
+  `, [tenantId, minSales]);
+
+  return rows
+    .filter(r => !excludeSkus.has(r.sku))
+    .map(r => ({
+      sku: r.sku, name: r.product_name, action: 'ADD',
+      reason: `Promozione store: vende ${r.sales_30d_seller}/30g in store, margine ${r.margin_pct}% (fascia ${r.sell_price < 10 ? '<10€' : r.sell_price < 30 ? '10-30€' : '≥30€'})${r.mc_click_potential ? ', MC potential ' + r.mc_click_potential : ''}`,
+      category: 'promotion_store_seller',
+      sellPrice: parseFloat(r.sell_price),
+      marginPct: parseFloat(r.margin_pct),
+      demand: parseFloat(r.sales_30d_seller),
+      position: r.scraper_position,
+    }));
+}
+
 // ─── FASE 6: SAVE DAILY SUMMARY ───────────────────────
 
 async function saveDailySummary(tenantId, snapshot, actions, killerCount) {
@@ -1088,6 +1154,19 @@ async function runDailyFeedEngine(tenantId) {
   const pepite = await findPepite(tenantId, config, snapshot, removedCost);
   actions.add = pepite;
   console.log(`[FeedDaily] Pepite: ${pepite.length} candidate`);
+
+  // FASE 5b: Promozione attiva di SKU non in feed civetta MA che vendono in
+  // store. Intrinseco all'ottimizzazione: identifichiamo SKU con domanda
+  // confermata che oggi non riceviamo via TP, filtriamo per qualità (posizione
+  // 1-7 + margine per fascia prezzo), emettiamo ADD. Skip duplicati con pepite.
+  if (config.promoteStoreSellerMinSales > 0) {
+    const promoted = await findStoreSellerPromotions(
+      tenantId, config, snapshot,
+      new Set(actions.add.map(a => a.sku))
+    );
+    actions.add.push(...promoted);
+    console.log(`[FeedDaily] Promozione store sellers: +${promoted.length} ADD (soglia vendite ≥${config.promoteStoreSellerMinSales}/30g + margine per fascia)`);
+  }
 
   // Apply
   const applied = await applyActions(tenantId, actions, config);

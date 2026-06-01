@@ -15,8 +15,15 @@ const rootLogger = require('./logger');
 const logger = rootLogger.with({ source: 'magentoSyncCron' });
 
 let cronTimer = null;
-const RUN_INTERVAL_HOURS = 2;
+// Allineamento al ciclo TP: TP rilegge il feed ogni 4h dalle 00:00 italia
+// (= 22:00 UTC del giorno prima in estate). MagentoSync deve completare
+// almeno 1h prima del refresh TP. Schedule UTC: 20:30, 00:30, 04:30, 08:30,
+// 12:30, 16:30 → completa entro 21:00, 01:00, 05:00, ecc → 1h margine prima
+// che TP rilegga alle 22:00, 02:00, 06:00 UTC (= 00:00, 04:00, 08:00 italia).
+// Cfr. project_tp_feed_refresh_cycle.
+const RUN_INTERVAL_HOURS = 4;
 const RUN_MINUTE = 30;
+const RUN_HOURS_UTC = [0, 4, 8, 12, 16, 20];
 
 async function listOperationalTenants() {
   const { rows } = await pool.query(`
@@ -63,18 +70,22 @@ async function runForAllOperational() {
 }
 
 function msUntilNextRun() {
+  // Allineamento esplicito UTC (container TZ = UTC): trova il prossimo slot
+  // tra RUN_HOURS_UTC al minuto RUN_MINUTE.
   const now = new Date();
-  const next = new Date(now);
-  next.setMinutes(RUN_MINUTE, 0, 0);
-  // Allinea ad ora pari (00, 02, 04, ...)
-  let h = next.getHours();
-  if (h % RUN_INTERVAL_HOURS !== 0) {
-    h = h + (RUN_INTERVAL_HOURS - (h % RUN_INTERVAL_HOURS));
-    next.setHours(h);
+  const nowMin = now.getUTCHours() * 60 + now.getUTCMinutes();
+  const slotMins = RUN_HOURS_UTC.map(h => h * 60 + RUN_MINUTE);
+  // Trova slot strettamente futuro oggi, altrimenti primo slot di domani.
+  let nextSlot = slotMins.find(m => m > nowMin);
+  let dayOffset = 0;
+  if (nextSlot == null) {
+    nextSlot = slotMins[0];
+    dayOffset = 1;
   }
-  if (next <= now) {
-    next.setHours(next.getHours() + RUN_INTERVAL_HOURS);
-  }
+  const next = new Date(Date.UTC(
+    now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + dayOffset,
+    Math.floor(nextSlot / 60), nextSlot % 60, 0, 0
+  ));
   return next - now;
 }
 
@@ -94,7 +105,7 @@ function scheduleNext() {
 
 function startMagentoSyncCron() {
   scheduleNext();
-  console.log(`[MagentoSyncCron] Initialized (every ${RUN_INTERVAL_HOURS}h at :${String(RUN_MINUTE).padStart(2, '0')}, sequential per tenant)`);
+  console.log(`[MagentoSyncCron] Initialized (slot UTC ${RUN_HOURS_UTC.map(h => String(h).padStart(2,'0')+':'+String(RUN_MINUTE).padStart(2,'0')).join(', ')}, allineato al ciclo TP refresh)`);
 }
 
 function stopMagentoSyncCron() {

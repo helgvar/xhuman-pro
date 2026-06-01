@@ -26,14 +26,25 @@ function calculatePriceCut(sellPrice, erpCost, bestPrice) {
   if (!sellPrice || !erpCost || sellPrice <= erpCost) return null;
   if (!bestPrice || bestPrice <= 0 || sellPrice <= bestPrice) return null;
 
+  // MANTRA: HARD FLOOR MOL 15% (cfr. feedback_mantra_operativo).
+  // Floor = costo / (1 - 0.15) → margine_pct esattamente 15% sul target.
+  const MOL_FLOOR = 0.15;
+  const priceFloorByMol = erpCost / (1 - MOL_FLOOR);
+  // Vecchio floor per ricarico minimo (compatibilità storica)
   const minMarkup = sellPrice < 10 ? 0.18 : sellPrice < 30 ? 0.14 : 0.12;
-  const floor = erpCost * (1 + minMarkup);
+  const priceFloorByMarkup = erpCost * (1 + minMarkup);
+  // Floor = il più alto fra i due (più conservativo)
+  const floor = Math.max(priceFloorByMol, priceFloorByMarkup);
+
   // Target: match best price - 1%, but not below floor
   const target = Math.max(bestPrice * 0.99, floor);
   if (target >= sellPrice) return null; // Can't cut enough
   if (sellPrice - target < 0.10) return null; // Cut too small
 
   const newMarginPct = ((target - erpCost) / target) * 100;
+  // HARD STOP: se per qualche ragione di arrotondamento siamo sotto 15%, reject
+  if (newMarginPct < 15) return null;
+
   const cutPct = ((sellPrice - target) / sellPrice) * 100;
   return {
     targetPrice: Math.round(target * 100) / 100,
@@ -838,15 +849,29 @@ async function findPepite(tenantId, config, snapshot, removedCost) {
 //   sell_price < 10€   → margin_pct ≥ 18
 //   10€ ≤ p < 30€      → margin_pct ≥ 14
 //   sell_price ≥ 30€   → margin_pct ≥ 12
-// Helper: regola Salva Bilancio. Restituisce { ok, marginEur, marginPct, tier }
+// Helper: regola di accettazione cut. MANTRA: Fatturato UP, MOL ~20%, Costo TP DOWN.
+// HARD FLOOR MOL 15% (mai accettato sotto, cfr. feedback_mol_3_fasce). Sopra
+// 15% accettiamo tutti — l'ORDER BY del chiamante priorizza SKU con margin_eur
+// post-cut piu' alto, quindi i piu' redditizi entrano per primi nel LIMIT.
+// Salva Bilancio EUR e' un AND (no fallback %): per fascia >= 30€ richiediamo
+// ANCHE che il margine assoluto sia >= soglia (default €3): non promuoviamo
+// SKU costosi con €1 di margine assoluto perche' anche con MOL 15% sarebbe
+// strategicamente debole.
 function isCutAcceptable(newPrice, erpCost, salvaBilancioMinEur) {
   if (newPrice <= erpCost) return { ok: false };
   const marginEur = newPrice - erpCost;
   const marginPct = (marginEur / newPrice) * 100;
-  const tier = newPrice < 10 ? 18 : newPrice < 30 ? 14 : 12;
-  const okPct = marginPct >= tier;
-  const okEur = marginEur >= salvaBilancioMinEur;
-  return { ok: okPct || okEur, marginEur, marginPct, tier, okBy: okPct ? 'pct' : 'eur' };
+
+  // HARD FLOOR MOL 15% — mantra, mai sotto
+  if (marginPct < 15) return { ok: false, marginEur, marginPct, reason: 'sotto MOL hard floor 15%' };
+
+  // Fascia >= 30€: HARD FLOOR 15% + Salva Bilancio (margine assoluto minimo)
+  if (newPrice >= 30 && marginEur < salvaBilancioMinEur) {
+    return { ok: false, marginEur, marginPct, reason: `margin_eur ${marginEur.toFixed(2)} < SB ${salvaBilancioMinEur} (fascia ≥30€)` };
+  }
+
+  // OK: sopra floor 15% (e per fascia ≥30€ anche Salva Bilancio EUR ok)
+  return { ok: true, marginEur, marginPct, tier: 15, okBy: marginPct >= 20 ? 'target_20+' : 'floor_15' };
 }
 
 async function findStoreSellerPromotions(tenantId, config, snapshot, excludeSkus = new Set()) {

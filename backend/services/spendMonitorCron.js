@@ -1,20 +1,16 @@
 /**
  * Spend Monitor Cron — guardiano economico del feed TP.
  *
- * Ogni 3 ore controlla per ciascun tenant operational:
- *  - spesa TP cumulativa del giorno (zombie_clicks × avg_cpc)
- *  - incidenza giornaliera = spesa / revenue store del giorno
- *  - delta spesa vs media stessa fascia oraria settimana precedente
- *  - delta ordini vs media stesso giorno settimana
+ * Ogni 3 ore per tenant operational:
+ *  - Incidenza IERI = spesa_TP_ieri / revenue_store_ieri.
+ *    Calcolata SOLO se zombie_clicks copre ieri (gira ~03 UTC del giorno
+ *    dopo) E orderSync è fresco (< 6h). Se uno dei due dati è stale, skip
+ *    con motivo loggato — niente alert "a capocchia".
+ *  - Spesa anomala = clicks ieri vs media 7g precedenti. Stessa gate freschezza.
+ *  - Calo ordini = ordini today vs media stesso DOW alla stessa ora. Solo
+ *    orderSync fresh richiesto.
  *
- * Se una soglia di anomalia è superata, invia alert Telegram con dedup 4h
- * per (tenant, alert_type). Log strutturati in log_events (source='spendMonitor').
- *
- * Soglie (configurabili in global_config.spend_monitor_thresholds JSON):
- *  - incidence_alert_pct:   8.0   (cap 6.5% + buffer)
- *  - spend_anomaly_pct:    150    (spesa today > +50% media 7g)
- *  - orders_drop_pct:       40    (ordini today < -40% media DOW)
- *  - min_clicks_for_check:  20    (sotto questa soglia ignoriamo, dato rumoroso)
+ * Soglie configurabili in global_config.spend_monitor_thresholds (JSON).
  */
 
 const { pool } = require('../db/pool');
@@ -66,121 +62,180 @@ async function sendTelegram(text) {
 }
 
 async function getTenantMetrics(tenantId) {
-  // Tutti i numeri in Europe/Rome day boundaries
+  // Incidenza si calcola su YESTERDAY (giorno chiuso), perchè:
+  //  - Click TP arrivano via ZombieCron alle ~03 UTC del giorno dopo
+  //  - Ordini today sono parziali fino a fine giornata + 1-2h di sync
+  // Calcolare incidenza su giorno corrente porta a falsi allarmi: spesa parziale
+  // (=0 fino alle 5 del giorno dopo) contro revenue parziale (cresce ora per ora).
+  //
+  // Per "ordini drop" usiamo invece confronto today-vs-DOW perchè gli ordini
+  // crescono in continuo e un calo drammatico è rilevabile anche durante la
+  // giornata (es. ore 18: confronto vs media DOW alla stessa ora).
   const { rows: [r] } = await pool.query(`
     WITH dates AS (
       SELECT
         (NOW() AT TIME ZONE 'Europe/Rome')::date AS today,
-        ((NOW() AT TIME ZONE 'Europe/Rome')::date - INTERVAL '7 days')::date AS last7_start,
         ((NOW() AT TIME ZONE 'Europe/Rome')::date - INTERVAL '1 day')::date AS yest,
+        ((NOW() AT TIME ZONE 'Europe/Rome')::date - INTERVAL '8 days')::date AS last8_start,
         EXTRACT(DOW FROM (NOW() AT TIME ZONE 'Europe/Rome'))::int AS today_dow
     ),
     avg_cpc AS (
-      SELECT COALESCE(NULLIF(config_value, '')::numeric, 0.27) AS cpc
+      SELECT COALESCE(MAX(NULLIF(config_value,'')::numeric), 0.27) AS cpc
       FROM health_config WHERE tenant_id=$1 AND config_key='avg_tp_cpc'
-      UNION ALL SELECT 0.27 LIMIT 1
     ),
-    spend_today AS (
-      SELECT COALESCE(SUM(clicks), 0)::int AS clicks
-      FROM zombie_clicks WHERE tenant_id=$1 AND fetch_date=(SELECT today FROM dates)
+    -- Freshness gates
+    last_zombie AS (
+      SELECT MAX(fetch_date) AS max_fetch_date,
+             MAX(created_at) AS last_loaded_at
+      FROM zombie_clicks WHERE tenant_id=$1
     ),
-    spend_yest AS (
+    last_order AS (
+      SELECT MAX(imported_at) AS last_import FROM orders WHERE tenant_id=$1
+    ),
+    -- YESTERDAY metrics (per incidenza affidabile)
+    clicks_yest AS (
       SELECT COALESCE(SUM(clicks), 0)::int AS clicks
       FROM zombie_clicks WHERE tenant_id=$1 AND fetch_date=(SELECT yest FROM dates)
     ),
-    spend_7day_avg AS (
+    orders_yest AS (
+      SELECT COUNT(*) AS n, COALESCE(SUM(grand_total_products), 0) AS rev
+      FROM orders WHERE tenant_id=$1
+        AND (order_date AT TIME ZONE 'Europe/Rome')::date = (SELECT yest FROM dates)
+        AND order_status NOT IN ('canceled','closed')
+    ),
+    clicks_7day_avg AS (
       SELECT AVG(daily_clicks) AS clicks
       FROM (
         SELECT SUM(clicks) AS daily_clicks
         FROM zombie_clicks
-        WHERE tenant_id=$1 AND fetch_date BETWEEN (SELECT last7_start FROM dates) AND (SELECT yest FROM dates)
+        WHERE tenant_id=$1
+          AND fetch_date BETWEEN (SELECT last8_start FROM dates) AND ((SELECT yest FROM dates) - INTERVAL '1 day')
         GROUP BY fetch_date
       ) s
     ),
+    -- TODAY metrics (per ordini-drop a metà giornata)
     orders_today AS (
-      SELECT COUNT(*) AS n, COALESCE(SUM(grand_total_products), 0) AS rev
+      SELECT COUNT(*) AS n
       FROM orders WHERE tenant_id=$1
         AND (order_date AT TIME ZONE 'Europe/Rome')::date = (SELECT today FROM dates)
         AND order_status NOT IN ('canceled','closed')
     ),
     orders_dow_avg AS (
+      -- Per confronto realistico durante la giornata: media ordini fino allo
+      -- stesso orario nei 4 DOW precedenti (es. lunedì 14:00 = media ordini
+      -- fino alle 14:00 dei 4 lunedì precedenti).
       SELECT AVG(daily_n) AS avg_orders
       FROM (
         SELECT COUNT(*) AS daily_n
         FROM orders WHERE tenant_id=$1
-          AND order_date AT TIME ZONE 'Europe/Rome' >= NOW() - INTERVAL '28 days'
+          AND order_date >= NOW() - INTERVAL '28 days'
           AND (order_date AT TIME ZONE 'Europe/Rome')::date < (SELECT today FROM dates)
           AND EXTRACT(DOW FROM (order_date AT TIME ZONE 'Europe/Rome')) = (SELECT today_dow FROM dates)
+          -- finestra "fino all'ora attuale del DOW di riferimento"
+          AND EXTRACT(EPOCH FROM (order_date AT TIME ZONE 'Europe/Rome'))::bigint % 86400
+              < EXTRACT(EPOCH FROM (NOW() AT TIME ZONE 'Europe/Rome'))::bigint % 86400
           AND order_status NOT IN ('canceled','closed')
         GROUP BY (order_date AT TIME ZONE 'Europe/Rome')::date
       ) s
     )
     SELECT
       (SELECT cpc FROM avg_cpc) AS avg_cpc,
-      (SELECT clicks FROM spend_today) AS clicks_today,
-      (SELECT clicks FROM spend_yest) AS clicks_yest,
-      (SELECT clicks FROM spend_7day_avg) AS clicks_7day_avg,
+      (SELECT max_fetch_date FROM last_zombie) AS last_zombie_date,
+      (SELECT last_loaded_at FROM last_zombie) AS last_zombie_loaded,
+      (SELECT last_import FROM last_order) AS last_order_import,
+      (SELECT yest FROM dates) AS yest,
+      (SELECT clicks FROM clicks_yest) AS clicks_yest,
+      (SELECT n FROM orders_yest) AS orders_yest,
+      (SELECT rev FROM orders_yest) AS rev_yest,
+      (SELECT clicks FROM clicks_7day_avg) AS clicks_7day_avg,
       (SELECT n FROM orders_today) AS orders_today,
-      (SELECT rev FROM orders_today) AS rev_today,
-      (SELECT avg_orders FROM orders_dow_avg) AS orders_dow_avg
+      (SELECT avg_orders FROM orders_dow_avg) AS orders_dow_avg_so_far
   `, [tenantId]);
 
   const cpc = Number(r.avg_cpc) || 0.27;
-  const clicksToday = Number(r.clicks_today) || 0;
+  const yest = r.yest;
+  const clicksYest = Number(r.clicks_yest) || 0;
+  const revYest = Number(r.rev_yest) || 0;
+  const ordersYest = Number(r.orders_yest) || 0;
   const clicks7avg = Number(r.clicks_7day_avg) || 0;
   const ordersToday = Number(r.orders_today) || 0;
-  const ordersDowAvg = Number(r.orders_dow_avg) || 0;
-  const revToday = Number(r.rev_today) || 0;
+  const ordersDowAvg = Number(r.orders_dow_avg_so_far) || 0;
+  const spendYest = clicksYest * cpc;
+
+  // Freshness flags
+  const zombieDate = r.last_zombie_date ? new Date(r.last_zombie_date) : null;
+  const zombieCoversYest = zombieDate && zombieDate.toISOString().slice(0,10) >= new Date(yest).toISOString().slice(0,10);
+  const orderImportAgeH = r.last_order_import ? (Date.now() - new Date(r.last_order_import).getTime()) / 3600000 : Infinity;
 
   return {
     cpc,
-    clicks_today: clicksToday,
-    clicks_7day_avg: clicks7avg,
-    spend_today: clicksToday * cpc,
+    yest,
+    clicks_yest: clicksYest,
+    revenue_yest: revYest,
+    orders_yest: ordersYest,
+    spend_yest: spendYest,
     spend_7day_avg: clicks7avg * cpc,
-    spend_delta_pct: clicks7avg > 0 ? Math.round(((clicksToday - clicks7avg) / clicks7avg) * 100) : null,
+    spend_delta_pct: clicks7avg > 0 ? Math.round(((clicksYest - clicks7avg) / clicks7avg) * 100) : null,
+    incidence_yest_pct: revYest > 0 ? +((spendYest / revYest) * 100).toFixed(1) : null,
     orders_today: ordersToday,
-    orders_dow_avg: ordersDowAvg,
+    orders_dow_avg_so_far: ordersDowAvg,
     orders_delta_pct: ordersDowAvg > 0 ? Math.round(((ordersToday - ordersDowAvg) / ordersDowAvg) * 100) : null,
-    revenue_today: revToday,
-    incidence_pct: revToday > 0 ? +(((clicksToday * cpc) / revToday) * 100).toFixed(1) : null,
+    // Freshness
+    zombie_covers_yest: zombieCoversYest,
+    order_import_age_h: orderImportAgeH,
   };
 }
 
 async function checkAlerts(tenantName, m, th) {
   const alerts = [];
+  const reasonsSkipped = [];
 
-  // Skip se traffico TP troppo basso (dato rumoroso)
-  if (m.clicks_today < th.min_clicks_for_check) return alerts;
+  // === ALERT A+B (incidenza, spesa anomala) richiedono ENTRAMBI freschi: ===
+  //  - clicks_yest (zombie ha coperto fino a ieri) — gira alle ~03 UTC
+  //  - rev_yest    (ordini di ieri tutti importati) — orderSync ogni 1h
+  // Se uno dei due non è pronto, SKIP (no alert capocchia).
+  const incidenceDataFresh =
+    m.zombie_covers_yest === true &&
+    m.order_import_age_h <= 6 &&
+    m.clicks_yest >= th.min_clicks_for_check &&
+    m.revenue_yest > 0;
 
-  // ALERT A: incidenza giornaliera sopra soglia
-  if (m.incidence_pct != null && m.incidence_pct >= th.incidence_alert_pct) {
-    alerts.push({
-      type: 'incidence_high',
-      severity: 'high',
-      msg: `Incidenza giornaliera <b>${m.incidence_pct}%</b> (soglia ${th.incidence_alert_pct}%). Spesa €${m.spend_today.toFixed(0)} su €${m.revenue_today.toFixed(0)} revenue.`,
-    });
+  if (incidenceDataFresh) {
+    if (m.incidence_yest_pct != null && m.incidence_yest_pct >= th.incidence_alert_pct) {
+      alerts.push({
+        type: 'incidence_high',
+        severity: 'high',
+        msg: `Incidenza ieri <b>${m.incidence_yest_pct}%</b> (soglia ${th.incidence_alert_pct}%). Spesa €${m.spend_yest.toFixed(0)} su €${m.revenue_yest.toFixed(0)} revenue (${m.orders_yest} ordini).`,
+      });
+    }
+    if (m.spend_delta_pct != null && m.spend_delta_pct >= th.spend_anomaly_pct - 100 && m.spend_7day_avg > 5) {
+      alerts.push({
+        type: 'spend_anomaly',
+        severity: 'medium',
+        msg: `Spesa anomala ieri: €${m.spend_yest.toFixed(0)} vs €${m.spend_7day_avg.toFixed(0)} media 7g (+${m.spend_delta_pct}%).`,
+      });
+    }
+  } else {
+    if (!m.zombie_covers_yest) reasonsSkipped.push('zombie_clicks non copre ieri');
+    if (m.order_import_age_h > 6) reasonsSkipped.push(`orderSync vecchio ${m.order_import_age_h.toFixed(1)}h`);
+    if (m.clicks_yest < th.min_clicks_for_check) reasonsSkipped.push(`click ieri <${th.min_clicks_for_check}`);
+    if (m.revenue_yest === 0) reasonsSkipped.push('revenue ieri = 0');
   }
 
-  // ALERT B: spesa anomala (today >> 7d avg)
-  if (m.spend_delta_pct != null && m.spend_delta_pct >= th.spend_anomaly_pct - 100) {
-    alerts.push({
-      type: 'spend_anomaly',
-      severity: 'medium',
-      msg: `Spesa anomala: €${m.spend_today.toFixed(0)} oggi vs €${m.spend_7day_avg.toFixed(0)} media 7g (+${m.spend_delta_pct}%).`,
-    });
-  }
-
-  // ALERT C: calo ordini drammatico vs DOW
-  if (m.orders_delta_pct != null && m.orders_delta_pct <= -th.orders_drop_pct && m.orders_dow_avg >= 3) {
+  // === ALERT C (calo ordini today vs DOW): non richiede zombie, basta ===
+  // che orderSync sia fresh (< 6h). Dato cumulativo crescente, confronto con
+  // media DOW alla stessa ora del giorno è robusto.
+  const ordersFresh = m.order_import_age_h <= 6;
+  if (ordersFresh && m.orders_delta_pct != null && m.orders_delta_pct <= -th.orders_drop_pct
+      && m.orders_dow_avg_so_far >= 3) {
     alerts.push({
       type: 'orders_drop',
       severity: 'high',
-      msg: `Ordini in calo: <b>${m.orders_today}</b> oggi vs <b>${m.orders_dow_avg.toFixed(1)}</b> media stesso giorno (${m.orders_delta_pct}%).`,
+      msg: `Ordini in calo: <b>${m.orders_today}</b> oggi vs media stesso DOW <b>${m.orders_dow_avg_so_far.toFixed(1)}</b> (${m.orders_delta_pct}%).`,
     });
   }
 
-  return alerts;
+  return { alerts, reasonsSkipped, incidenceDataFresh };
 }
 
 async function maybeAlert(tenantName, tenantId, alert) {
@@ -209,12 +264,16 @@ async function runCheck() {
 
     for (const t of tenants) {
       const m = await getTenantMetrics(t.id);
-      const alerts = await checkAlerts(t.name, m, th);
+      const { alerts, reasonsSkipped, incidenceDataFresh } = await checkAlerts(t.name, m, th);
+
+      const incLabel = incidenceDataFresh
+        ? `inc-y${m.incidence_yest_pct}%`
+        : `inc=skip(${reasonsSkipped.join(';') || 'no-data'})`;
       summary.push({
         tenant: t.name,
-        spend: Math.round(m.spend_today),
-        incidence_pct: m.incidence_pct,
-        orders: m.orders_today,
+        spend_yest: Math.round(m.spend_yest || 0),
+        incLabel,
+        orders_today: m.orders_today,
         alerts_count: alerts.length,
       });
 
@@ -228,7 +287,7 @@ async function runCheck() {
       }
     }
 
-    console.log(`[SpendMonitor] Check complete: ${summary.map(s => `${s.tenant} €${s.spend}/inc${s.incidence_pct||'-'}/${s.orders}ord${s.alerts_count?'!':''}`).join(' | ')}`);
+    console.log(`[SpendMonitor] Check complete: ${summary.map(s => `${s.tenant} €${s.spend_yest}y/${s.incLabel}/${s.orders_today}otd${s.alerts_count?'!':''}`).join(' | ')}`);
   } catch (err) {
     console.error('[SpendMonitor] Check error:', err.message);
   }

@@ -132,6 +132,11 @@ async function start() {
     const { startMagentoSyncCron } = require('./services/magentoSyncCron');
     startMagentoSyncCron();
 
+    // Start spend monitor cron (every 3h, alert su incidenza alta / spesa
+    // anomala / calo ordini per tenant operational)
+    const { startSpendMonitorCron } = require('./services/spendMonitorCron');
+    startSpendMonitorCron();
+
     app.listen(PORT, '0.0.0.0', () => {
       console.log(`[xHUMANPRO] Backend running on http://0.0.0.0:${PORT}`);
     });

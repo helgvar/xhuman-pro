@@ -30,11 +30,12 @@ const THRESHOLDS_HOURS = {
   orders: 8,                  // OrderSync 60min cycle
   zombieClicks: 36,           // ZombieCron daily 03:00 UTC
   healthScores: 6,            // HealthCron 60min ma loop tenant lungo
-  productSync: 3,             // ProductSync ora ogni 1h (era 24h con cron 6h), abbassato a 3h alert
-                              // per i tenant operational dove dati prezzo/costo devono essere freschi
-  driveScraper: 25,           // gira ogni 4-6h dal productSync, 25h = safe
+  productSync: 3,             // ProductSync ogni 1h, soglia 3h
+  driveScraper: 25,           // gira ogni 4-6h dal productSync
   mcSync: 30,                 // gira 1x/24h finestra 04-12 UTC
-  magentoSync: 4,             // gira ogni 2h, 4h copre 2 cicli persi
+  magentoSync: 5,             // gira ogni 4h allineato TP, soglia 5h
+  stableCache: 1.5,           // gira ogni 30 min via stableCacheCron, soglia 1.5h
+                              // (se vecchio, Farmabooster serve dati stale)
 };
 
 async function readGlobalConfig(key) {
@@ -93,6 +94,12 @@ async function getFreshnessByTenant() {
       (SELECT MAX(updated_at) FROM products WHERE tenant_id=t.id) AS last_product,
       (SELECT MAX(completed_at) FROM merchant_center_runs WHERE tenant_id=t.id AND status='completed') AS last_mc,
       (SELECT MAX(dispatched_at) FROM feed_dispatch_log WHERE tenant_id=t.id AND endpoint='magento-sync') AS last_magento_sync,
+      (SELECT updated_at FROM tenant_configs WHERE tenant_id=t.id AND config_key='stable_price_cuts') AS last_stable_cache,
+      -- Disallineamento: PRICE_CUT in feed_actions vs PRICE_CUT in stable cache
+      (SELECT COUNT(*) FROM feed_actions WHERE tenant_id=t.id AND action='PRICE_CUT' AND recommended_price IS NOT NULL) AS pc_in_actions,
+      (SELECT jsonb_array_length((config_value::jsonb)->'products')
+       FROM tenant_configs WHERE tenant_id=t.id AND config_key='stable_price_cuts'
+       AND config_value IS NOT NULL AND config_value::jsonb ? 'products') AS pc_in_cache,
       (SELECT config_value FROM tenant_configs WHERE tenant_id=t.id AND config_key='xhumanpro_magento_mode') AS magento_mode
     FROM tenants t
     WHERE t.status = 'active'
@@ -142,6 +149,9 @@ async function checkAll() {
     if (isOperational) {
       checks.push({ loop: 'MagentoSync', last: t.last_magento_sync, threshold: THRESHOLDS_HOURS.magentoSync, label: 'Magento sync (civettaai)' });
     }
+    // StableCache: serve a Farmabooster via /feed/civetta, /feed/prices.
+    // Se non si aggiorna, Farmabooster riceve dati stale (zero PC, civetta vecchi).
+    checks.push({ loop: 'StableCache', last: t.last_stable_cache, threshold: THRESHOLDS_HOURS.stableCache, label: 'Stable cache (feed Farmabooster)' });
 
     for (const c of checks) {
       const h = hoursAgo(c.last);
@@ -151,6 +161,19 @@ async function checkAll() {
           hoursAgo: h, threshold: c.threshold,
         });
       }
+    }
+
+    // Disallineamento PRICE_CUT: se in feed_actions ne abbiamo ≥10 e la cache
+    // /feed/prices ne ha 0 (o <10% di quelli reali), Farmabooster non li vede.
+    const pcActions = Number(t.pc_in_actions) || 0;
+    const pcCache = Number(t.pc_in_cache) || 0;
+    if (pcActions >= 10 && pcCache < pcActions * 0.5) {
+      issues.push({
+        tenantId: t.id, tenant: t.name, loop: 'PCMismatch',
+        label: `PRICE_CUT misalignment (feed_actions ${pcActions} vs cache ${pcCache})`,
+        hoursAgo: 0, threshold: 0,
+        details: `Farmabooster sta ricevendo ${pcCache} PC ma ne abbiamo ${pcActions} pronti. Forzare recalculateStableCache.`,
+      });
     }
   }
 

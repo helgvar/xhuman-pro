@@ -137,6 +137,13 @@ async function start() {
     const { startSpendMonitorCron } = require('./services/spendMonitorCron');
     startSpendMonitorCron();
 
+    // Start stable cache cron (ogni 30 min, indipendente da healthCron).
+    // healthCron step stable_cache era ULTIMO della pipeline: se uno step
+    // precedente timeout-ava per un tenant, la cache di /feed/civetta e
+    // /feed/prices non veniva mai aggiornata. Loop autonomo risolve.
+    const { startStableCacheCron } = require('./services/stableCacheCron');
+    startStableCacheCron();
+
     app.listen(PORT, '0.0.0.0', () => {
       console.log(`[xHUMANPRO] Backend running on http://0.0.0.0:${PORT}`);
     });

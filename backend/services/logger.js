@@ -115,13 +115,15 @@ function _dedupKey(record) {
 // Pattern di fatal che NON spammiamo su Telegram (sono rumore noto, restano in DB per debug)
 const TELEGRAM_EXCLUDE_PATTERNS = [
   // apiQueue timeout: causa nota (Farmabooster API lenta + race condition timer);
-  // i fix applicati a Promise.race non hanno chiuso l'unhandled, ma e' inocuo
+  // i fix applicati a Promise.race non hanno chiuso l'unhandled, ma e' innocuo
   // (process.on cattura, backend non crasha). Telegram qui sarebbe puro rumore.
-  /UNHANDLED REJECTION: Timeout after \d+ms \(avg:/,
+  // Pattern volutamente largo per matchare TUTTE le varianti di prefisso:
+  // "UNHANDLED REJECTION:", "[UnhandledRejection]", "[unhandledRejection]" ecc.
+  /Timeout after \d+ms \(avg: \d+ms\)/i,
   // Step TIMEOUT healthCron: ricorrenti per tenant grossi (San Vito 800k SKU).
   // I fix di timeout+skip-intelligent riducono la frequenza ma non vogliamo
   // spam Telegram quando un tenant supera il budget tempo. Restano in DB.
-  /Step TIMEOUT: (health_scores|mc_sync|civetta_sync) on /,
+  /Step TIMEOUT: (health_scores|mc_sync|civetta_sync) on /i,
 ];
 
 async function maybeTelegramAlert(record) {

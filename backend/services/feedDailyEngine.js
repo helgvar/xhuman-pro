@@ -56,11 +56,20 @@ function calculatePriceCut(sellPrice, erpCost, bestPrice) {
 // ─── CONFIG ────────────────────────────────────────────
 
 async function loadConfig(tenantId) {
-  // Ignora i valori scaduti (expires_at <= NOW): permette configurazioni
-  // a tempo (es. push commerciale ponte 2/6) con rollback automatico.
+  // Briglie con scadenza:
+  //   expires_at IS NULL OR expires_at > NOW()    → usa config_value
+  //   expires_at scaduta AND expired_revert_to    → usa expired_revert_to
+  //   expires_at scaduta AND nessun revert        → riga ignorata (default codice)
   const { rows } = await pool.query(
-    `SELECT config_key, config_value FROM health_config
-     WHERE tenant_id = $1 AND (expires_at IS NULL OR expires_at > NOW())`,
+    `SELECT config_key,
+       CASE
+         WHEN expires_at IS NULL OR expires_at > NOW() THEN config_value
+         WHEN expired_revert_to IS NOT NULL THEN expired_revert_to
+         ELSE NULL
+       END AS config_value
+     FROM health_config
+     WHERE tenant_id = $1
+       AND (expires_at IS NULL OR expires_at > NOW() OR expired_revert_to IS NOT NULL)`,
     [tenantId]
   );
   const c = {};
@@ -733,8 +742,15 @@ async function loadPepiteRules(tenantId) {
   // automatico al timestamp.
   try {
     const { rows } = await pool.query(
-      `SELECT config_key, config_value FROM health_config
-       WHERE tenant_id=$1 AND (expires_at IS NULL OR expires_at > NOW())
+      `SELECT config_key,
+         CASE
+           WHEN expires_at IS NULL OR expires_at > NOW() THEN config_value
+           WHEN expired_revert_to IS NOT NULL THEN expired_revert_to
+           ELSE NULL
+         END AS config_value
+       FROM health_config
+       WHERE tenant_id=$1
+         AND (expires_at IS NULL OR expires_at > NOW() OR expired_revert_to IS NOT NULL)
          AND config_key IN ('pepite_golden_position_max','pepite_golden_margin_min',
                             'pepite_golden_sales_min','pepite_silver_position_min',
                             'pepite_silver_position_max','pepite_silver_margin_min',

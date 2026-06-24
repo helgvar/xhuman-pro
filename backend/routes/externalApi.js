@@ -114,6 +114,36 @@ async function loadStableCache(tenantId) {
  * Passed to Farmabooster every time so it can deactivate them.
  */
 async function recalculateStableCache(tenantId) {
+  // Filtro qualità feed: se health_config.feed_filter_inactive_filler='true',
+  // escludo SKU senza nessun segnale (filler dormienti che diluiscono il feed).
+  // Regola TIENI: health_score>=30 OR ord_tp>0 OR (erp+MOL>=18) OR MOL>=22
+  //               OR (pos<=7 AND MOL>=12 AND stock>=5) "pepita borderline"
+  //               OR (pos<=20 AND erp>=5 AND MOL>=15) "stock farmacia pos decente"
+  const { rows: filterCfgRows } = await pool.query(
+    `SELECT config_value FROM health_config WHERE tenant_id = $1 AND config_key = 'feed_filter_inactive_filler'`,
+    [tenantId]
+  );
+  const filterEnabled = filterCfgRows.length > 0 && filterCfgRows[0].config_value === 'true';
+  const qualityFilter = filterEnabled ? `
+        AND (
+          EXISTS (
+            SELECT 1 FROM product_health_scores phs
+            WHERE phs.tenant_id = p.tenant_id AND phs.sku = p.sku
+              AND (
+                COALESCE(phs.health_score, 0) >= 30
+                OR COALESCE(phs.tp_attributed_orders, 0) > 0
+                OR (phs.scraper_position IS NOT NULL AND phs.scraper_position <= 7
+                    AND COALESCE(p.margin_pct, 0) >= 12
+                    AND (COALESCE(p.erp_stock, 0) + COALESCE(p.supplier_stock, 0)) >= 5)
+                OR (phs.scraper_position IS NOT NULL AND phs.scraper_position <= 20
+                    AND COALESCE(p.erp_stock, 0) >= 5
+                    AND COALESCE(p.margin_pct, 0) >= 15)
+              )
+          )
+          OR (COALESCE(p.erp_stock, 0) > 0 AND COALESCE(p.margin_pct, 0) >= 18)
+          OR COALESCE(p.margin_pct, 0) >= 22
+        )` : '';
+
   // Build civetta=1 list (keep in feed)
   const { rows: keepProducts } = await pool.query(`
     SELECT p.sku
@@ -127,7 +157,7 @@ async function recalculateStableCache(tenantId) {
         (p.is_civetta = true AND (fa.action IS NULL OR fa.action NOT IN ('REMOVE')) AND fq.id IS NULL)
         OR
         (fa.action = 'ADD' AND fq.id IS NULL)
-      )
+      )${qualityFilter}
   `, [tenantId]);
 
   let feedCodes = keepProducts.map(p => p.sku);

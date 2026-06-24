@@ -127,6 +127,18 @@ async function loadConfig(tenantId) {
     // Default 1 = prova minima di domanda. Per tenant con conversion debole sui
     // candidati appena ammessi, alzare a 3-5 per filtrare SKU mediocri.
     promoteSalesAggMin: parseInt(c.promote_sales_agg_min || 1),
+    // Soglie domanda per accettare un SKU candidato PRICE_CUT (FASE 4b).
+    // Default conservativi: agg>=5, seller>=2, mc_impr>=50. Da rilasciare
+    // su tenant con scarso volume PRICE_CUT (es. MPF: 20 PRICE_CUT su 35k
+    // pool teorico = filtro troppo stretto). Setting suggested rilasciato:
+    //   price_cut_demand_agg_min=1, ..._seller_min=1, ..._mc_impr_min=20
+    //   price_cut_position_override_max=7 (accetta anche top7 senza vendite)
+    //   price_cut_limit=1000
+    priceCutDemandAggMin: parseInt(c.price_cut_demand_agg_min || 5),
+    priceCutDemandSellerMin: parseInt(c.price_cut_demand_seller_min || 2),
+    priceCutDemandMcImprMin: parseInt(c.price_cut_demand_mc_impr_min || 50),
+    priceCutPositionOverrideMax: parseInt(c.price_cut_position_override_max || 0),
+    priceCutLimit: parseInt(c.price_cut_limit || 300),
     // Filtri qualita' posizione TP (cfr. feedback_dictat_fatturare_incidenza_bassa):
     //  - ADD puro: posizione <= goldenPositionMaxForAdd (default 7 = top 7,
     //    visibilita' reale con click qualificati).
@@ -724,6 +736,32 @@ async function triageProducts(tenantId, config, snapshot, ruleSet = null) {
 async function findPriceCutCandidates(tenantId, config, snapshot) {
   if (!snapshot) return [];
 
+  // Soglie domanda parametrizzabili (default conservativi):
+  //   priceCutDemandAggMin (default 5)        - sales globali 30g
+  //   priceCutDemandSellerMin (default 2)     - sales locali 30g
+  //   priceCutDemandMcImprMin (default 50)    - impressions Merchant Center 14g
+  //   priceCutPositionOverrideMax (default 0) - se >0, accetta SKU pos<=val anche senza altri segnali
+  //   priceCutLimit (default 300)             - max candidati ritornati
+  const aggMin = config.priceCutDemandAggMin ?? 5;
+  const sellerMin = config.priceCutDemandSellerMin ?? 2;
+  const mcMin = config.priceCutDemandMcImprMin ?? 50;
+  const posOverride = config.priceCutPositionOverrideMax ?? 0;
+  const limit = config.priceCutLimit ?? 300;
+
+  const demandClause = posOverride > 0
+    ? `(
+        COALESCE(p.sales_30d_aggregated, 0) >= ${aggMin}
+        OR COALESCE(p.sales_30d_seller, 0) >= ${sellerMin}
+        OR COALESCE(phs.mc_impressions_14d, 0) >= ${mcMin}
+        OR (phs.scraper_position IS NOT NULL AND phs.scraper_position <= ${posOverride}
+            AND (COALESCE(p.erp_stock, 0) + COALESCE(p.supplier_stock, 0)) >= 5)
+      )`
+    : `(
+        COALESCE(p.sales_30d_aggregated, 0) >= ${aggMin}
+        OR COALESCE(p.sales_30d_seller, 0) >= ${sellerMin}
+        OR COALESCE(phs.mc_impressions_14d, 0) >= ${mcMin}
+      )`;
+
   // Prodotti civetta=1 che non ricevono click ma hanno domanda
   // Il prezzo è troppo alto → taglio per renderli competitivi
   const { rows: candidates } = await pool.query(`
@@ -751,13 +789,9 @@ async function findPriceCutCandidates(tenantId, config, snapshot) {
       AND phs.scraper_best_price > 0
       AND p.sell_price > phs.scraper_best_price * 1.05
       AND (pr.rule_type IS NULL OR pr.rule_type != 'sconto')
-      AND (
-        COALESCE(p.sales_30d_aggregated, 0) >= 5
-        OR COALESCE(p.sales_30d_seller, 0) >= 2
-        OR COALESCE(phs.mc_impressions_14d, 0) >= 50
-      )
+      AND ${demandClause}
     ORDER BY p.sales_30d_aggregated DESC
-    LIMIT 300
+    LIMIT ${limit}
   `, [tenantId]);
 
   const priceCuts = [];

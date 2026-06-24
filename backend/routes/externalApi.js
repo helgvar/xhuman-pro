@@ -132,11 +132,11 @@ async function recalculateStableCache(tenantId) {
               AND (
                 COALESCE(phs.health_score, 0) >= 30
                 OR COALESCE(phs.tp_attributed_orders, 0) > 0
-                OR (phs.scraper_position IS NOT NULL AND phs.scraper_position <= 7
+                OR (phs.scraper_position IS NOT NULL AND phs.scraper_position <= 10
                     AND COALESCE(p.margin_pct, 0) >= 12
-                    AND (COALESCE(p.erp_stock, 0) + COALESCE(p.supplier_stock, 0)) >= 5)
-                OR (phs.scraper_position IS NOT NULL AND phs.scraper_position <= 20
-                    AND COALESCE(p.erp_stock, 0) >= 5
+                    AND (COALESCE(p.erp_stock, 0) + COALESCE(p.supplier_stock, 0)) >= 3)
+                OR (phs.scraper_position IS NOT NULL AND phs.scraper_position <= 25
+                    AND COALESCE(p.erp_stock, 0) >= 3
                     AND COALESCE(p.margin_pct, 0) >= 15)
               )
           )

@@ -249,7 +249,9 @@ async function importProducts(tenantId, jobId = null) {
       console.log('[Products] Fetching products from Farmabooster...');
       updateProgress({ phase: 'fetch_products', phase_label: 'Download catalogo prodotti...', pages_done: 0, pages_total: 0, pct: 5 });
 
-      const productsData = await fetchAllPages(tenantId, config, 'products', 100, (done, total) => {
+      // maxPages 500 = fino a 500k SKU. Papa aveva >100k e veniva troncato silenziosamente,
+      // perdendo prodotti come 951870310 mai importati.
+      const productsData = await fetchAllPages(tenantId, config, 'products', 500, (done, total) => {
         const pct = 5 + Math.round((done / total) * 35); // 5-40%
         updateProgress({
           phase: 'fetch_products', phase_label: `Download catalogo: ${done}/${total} pagine`,

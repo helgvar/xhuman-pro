@@ -250,7 +250,7 @@ async function updateDailyTracking(tenantId, config) {
     // Get clicks for this date
     const { rows: clicks } = await pool.query(`
       SELECT zc.product_code as sku, zc.clicks,
-             p.margin, p.margin_pct, p.erp_stock, p.supplier_stock,
+             p.margin, p.margin_pct, p.brand, p.manufacturer, p.erp_stock, p.supplier_stock,
              p.sales_30d_aggregated, p.is_civetta,
              phs.scraper_position, phs.scraper_competitor_count
       FROM zombie_clicks zc
@@ -437,7 +437,7 @@ async function triageProducts(tenantId, config, snapshot, ruleSet = null) {
       GROUP BY sku
     )
     SELECT pt.*,
-      p.product_name, p.is_civetta, p.erp_stock, p.supplier_stock,
+      p.product_name, p.is_civetta, p.brand, p.manufacturer, p.erp_stock, p.supplier_stock,
       p.sell_price, p.erp_cost, p.margin as margin_eur,
       p.sales_30d_seller, p.price_rule_id,
       phs.ga4_tp_purchases, phs.ga4_assisted_sales,
@@ -732,7 +732,7 @@ async function findPriceCutCandidates(tenantId, config, snapshot) {
       ROUND(p.erp_cost::numeric, 2) as erp_cost,
       ROUND(p.margin_pct::numeric, 1) as margin_pct,
       p.sales_30d_seller, p.sales_30d_aggregated,
-      p.erp_stock, p.supplier_stock,
+      p.brand, p.manufacturer, p.erp_stock, p.supplier_stock,
       phs.scraper_position, phs.scraper_competitor_count,
       ROUND(phs.scraper_best_price::numeric, 2) as best_price,
       phs.mc_click_potential, phs.mc_impressions_14d,
@@ -889,7 +889,7 @@ async function queryPepiteTier(tenantId, posMin, posMax, marginMin, salesMin, li
       ROUND(p.sell_price::numeric, 2) as sell_price,
       ROUND(p.margin_pct::numeric, 1) as margin_pct,
       p.sales_30d_seller, p.sales_30d_aggregated,
-      p.erp_stock, p.supplier_stock,
+      p.brand, p.manufacturer, p.erp_stock, p.supplier_stock,
       phs.scraper_position, phs.scraper_competitor_count,
       ROUND(phs.scraper_best_price::numeric, 2) as best_price,
       phs.mc_click_potential, phs.health_score, phs.seasonal_score,

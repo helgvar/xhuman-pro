@@ -89,6 +89,21 @@ async function loadConfig(tenantId) {
     // tenant via health_config.store_sales_safety_net per essere meno
     // aggressivi su tenant dove il calo TP coincide con calo ordini store.
     storeSalesSafetyNet: parseInt(c.store_sales_safety_net || 0),
+    // Stock safety net: SKU con magazzino fisico (erp+supplier) >= soglia E
+    // margin_pct >= margine soglia => MAI killer / quarantena / REMOVE.
+    // Logica: investimento gia' fatto sul magazzino, brand premium / consumabili.
+    // L'engine fara' solo MONITOR/KEEP. Default disattivato (0 = off).
+    // Settare es. 5 per attivare con stock_min=5+MOL>=18.
+    stockSafetyNetMinUnits: parseInt(c.stock_safety_net_min_units || 0),
+    stockSafetyNetMinMolPct: parseFloat(c.stock_safety_net_min_mol_pct || 18),
+    // Bypass safety net se l'incidenza reale dello SKU ultimi 30g supera la
+    // soglia (default 30%). Logica: anche se vende store, se TP brucia il
+    // doppio di quanto rende, non vale la pena proteggerlo. Esempio storico:
+    // IRILENS Papa 30g: €46 spesa per €25 revenue (inc 180%) era safety_net=true.
+    safetyNetMaxIncidencePct: parseFloat(c.safety_net_max_incidence_pct || 30),
+    // Numero minimo di click per considerare l'incidenza significativa
+    // (evita falsi positivi su SKU con pochi click).
+    safetyNetMinClicksForCheck: parseInt(c.safety_net_min_clicks_for_check || 30),
     // Briglie più larghe: se SKU quarantenato/killer ha sales_30d_seller >=
     // soglia, NON viene rimosso ma marcato MONITOR. Default 0 = disabilitato.
     // Filosofia: meglio spendere un po' più su SKU che venderanno comunque
@@ -100,6 +115,30 @@ async function loadConfig(tenantId) {
     // qualità: pos TP 1-7 (zona click) + margine rispetto fascia prezzo
     // (<10€→18%, 10-30€→14%, >30€→12%). Default 3 = abilitato.
     promoteStoreSellerMinSales: parseInt(c.promote_store_seller_min_sales || 3),
+    // Cap massimo SKU nuovi promossi per ciclo.
+    // Default 2000 = DICTAT fatturare con incidenza bassa (cfr.
+    // feedback_dictat_fatturare_incidenza_bassa). Self-throttle:
+    // se snapshot.overTarget=true la promote viene saltata; se l'incidenza
+    // recente sale, l'engine riduce candidati naturalmente.
+    // I filtri di qualita' (sales_30d_aggregated >= 1, posizione TP <= silver_pos_max,
+    // margine OK, no killer/quarantena) restringono comunque la lista.
+    promoteMaxSkusPerRun: parseInt(c.promote_max_skus_per_run || 2000),
+    // Soglia minima vendite cross-tenant per ammettere uno SKU come ADD.
+    // Default 1 = prova minima di domanda. Per tenant con conversion debole sui
+    // candidati appena ammessi, alzare a 3-5 per filtrare SKU mediocri.
+    promoteSalesAggMin: parseInt(c.promote_sales_agg_min || 1),
+    // Filtri qualita' posizione TP (cfr. feedback_dictat_fatturare_incidenza_bassa):
+    //  - ADD puro: posizione <= goldenPositionMaxForAdd (default 7 = top 7,
+    //    visibilita' reale con click qualificati).
+    //  - PRICE_CUT competitivo (Salva Bilancio): posizione fra goldenPos e
+    //    silverPositionMaxForCut. Tagliamo il prezzo per scalare la classifica.
+    goldenPositionMaxForAdd: parseInt(c.pepite_golden_position_max || 7),
+    silverPositionMaxForCut: parseInt(c.pepite_silver_position_max || 15),
+    // Quando attivo (=1), findStoreSellerPromotions richiede erp_stock > 0
+    // (magazzino farmacia) invece di accettare anche supplier_stock (grossista).
+    // Usato per spingere il magazzino interno senza sporcare con prodotti
+    // disponibili solo via terzista.
+    preferErpStockOnly: parseInt(c.prefer_erp_stock_only || 0) === 1,
     // Salva Bilancio: criterio fallback per accettare cut anche se margin_pct
     // sotto fascia, purchè margine ASSOLUTO EUR sia significativo. SKU costosi
     // possono vendere bene con 5-6€ di margine anche se in % sono al 8-9%.
@@ -404,6 +443,8 @@ async function triageProducts(tenantId, config, snapshot, ruleSet = null) {
       phs.ga4_tp_purchases, phs.ga4_assisted_sales,
       phs.mc_click_potential, phs.classification,
       phs.scraper_best_price,
+      -- KPI 30g consolidati per check bypass safety net (cfr. caso IRILENS).
+      phs.tp_clicks_30d, phs.tp_click_cost_30d, phs.ga4_tp_revenue,
       fk.id as is_killer,
       fq.id as is_quarantined, fq.quarantine_level
     FROM product_totals pt
@@ -440,6 +481,51 @@ async function triageProducts(tenantId, config, snapshot, ruleSet = null) {
     const hasAssistedSales = (parseInt(p.ga4_assisted_sales) || 0) > 0;
 
     const storeSales30dRaw = parseFloat(p.sales_30d_seller) || 0;
+
+    // Calcolo bypass safety net usando i KPI consolidati 30g da phs (se
+    // disponibili). I dati del triage (totalCost/totalRevenue) sono periodi
+    // variabili e non includono ga4_tp_revenue. Usiamo phs per allineare al
+    // calcolo che l'utente vede in dashboard.
+    // Cfr. caso IRILENS Papa 23/6/2026 (€46 cost 30g / €25 rev = inc 180%).
+    const phs30dClicks = parseFloat(p.tp_clicks_30d) || 0;
+    const phs30dCost = parseFloat(p.tp_click_cost_30d) || 0;
+    const phs30dRev = parseFloat(p.ga4_tp_revenue) || 0;
+    const skuBurnIncidence = (phs30dRev > 0)
+      ? (phs30dCost / phs30dRev * 100)
+      : (phs30dClicks >= config.safetyNetMinClicksForCheck ? 9999 : 0);
+    const exceedsBurnThreshold =
+      phs30dClicks >= config.safetyNetMinClicksForCheck &&
+      skuBurnIncidence > config.safetyNetMaxIncidencePct;
+
+    // STOCK SAFETY NET — protezione massima per SKU con magazzino fisico
+    // (erp+supplier) e MOL adeguato. Logica: investimento gia' fatto sul
+    // magazzino, brand premium / consumabili / linee in linea con la farmacia.
+    // L'engine NON puo' REMOVE/killer/quarantena questi SKU.
+    // Eccezione: bypass se incidenza reale ultimi 30g supera la soglia
+    // (config.safetyNetMaxIncidencePct, default 30%).
+    // Cfr. feedback_stock_safety_net_brand_premium.
+    if (config.stockSafetyNetMinUnits > 0 && !exceedsBurnThreshold) {
+      const totalStock = (parseFloat(p.erp_stock) || 0) + (parseFloat(p.supplier_stock) || 0);
+      if (totalStock >= config.stockSafetyNetMinUnits && marginPct >= config.stockSafetyNetMinMolPct) {
+        // Se vende store >=1, lo classifichiamo KEEP (convertitore reale).
+        // Altrimenti MONITOR (in feed sotto osservazione, ma protetto).
+        if (storeSales30dRaw >= 1) {
+          actions.keep.push({
+            sku: p.sku, name: p.product_name, action: 'KEEP',
+            reason: `Stock safety: ${totalStock}u stock + MOL ${marginPct.toFixed(1)}% + vende ${storeSales30dRaw}/30g store. Protetto.`,
+            category: 'stock_safety_net', cost: totalCost, clicks: totalClicks, orders: totalOrders,
+          });
+        } else {
+          actions.monitor.push({
+            sku: p.sku, name: p.product_name, action: 'MONITOR',
+            reason: `Stock safety: ${totalStock}u stock + MOL ${marginPct.toFixed(1)}%. Mai REMOVE anche se 0 ord store.`,
+            category: 'stock_safety_net', cost: totalCost, clicks: totalClicks, orders: totalOrders,
+          });
+        }
+        stats.stock_safety_net = (stats.stock_safety_net || 0) + 1;
+        continue;
+      }
+    }
 
     // Already quarantined → di norma REMOVE. Briglie larghe: se vende nello
     // store sopra soglia, sposta in MONITOR invece di REMOVE (il sistema NON
@@ -487,8 +573,10 @@ async function triageProducts(tenantId, config, snapshot, ruleSet = null) {
     // SAFETY NET — SKU che vendono nello store >= soglia → protetti dal REMOVE.
     // Si applica solo se config.storeSalesSafetyNet > 0 (per tenant specifico).
     // Skippa killer/quarantined (gestiti sopra) e SKU senza vendite reali.
+    // Bypass: se incidenza reale 30g supera safetyNetMaxIncidencePct, lo SKU
+    // brucia troppo budget per essere protetto (cfr. caso IRILENS Papa).
     const storeSales30d = parseFloat(p.sales_30d_seller) || 0;
-    if (config.storeSalesSafetyNet > 0 && storeSales30d >= config.storeSalesSafetyNet) {
+    if (config.storeSalesSafetyNet > 0 && storeSales30d >= config.storeSalesSafetyNet && !exceedsBurnThreshold) {
       actions.monitor.push({
         sku: p.sku, name: p.product_name, action: 'MONITOR',
         reason: `Safety net: ${storeSales30d} vendite store/30g (>= soglia ${config.storeSalesSafetyNet}). Non rimosso anche se burner TP.`,
@@ -500,6 +588,19 @@ async function triageProducts(tenantId, config, snapshot, ruleSet = null) {
 
     // D) CONVERTITORE — ha ordini nel periodo
     if (totalOrders > 0 || hasGA4Orders || hasAssistedSales) {
+      // Se brucia troppo budget rispetto alla revenue 30g, valutiamo REMOVE
+      // anche se ha qualche ordine. Caso IRILENS Papa: 166 click/€46 cost 30g
+      // per €25 rev = inc 180%, "convertitore" ma in perdita netta.
+      if (exceedsBurnThreshold && canRemoveProduct(p)) {
+        actions.remove.push({
+          sku: p.sku, name: p.product_name, action: 'REMOVE',
+          reason: `Burner ad alta incidenza 30g: ${skuBurnIncidence.toFixed(0)}% (${phs30dClicks}clk/€${phs30dCost.toFixed(2)}cost / €${phs30dRev.toFixed(2)}rev). Soglia max ${config.safetyNetMaxIncidencePct}%.`,
+          category: 'burner_high_incidence', cost: totalCost, clicks: totalClicks, orders: totalOrders,
+          quarantineDays: 15,
+        });
+        stats.bruciatori++;
+        continue;
+      }
       const productIncidence = totalRevenue > 0 ? (totalCost / totalRevenue * 100) : 0;
 
       if (productIncidence > 10 && position > 3 && canCutPrice(p)) {
@@ -901,40 +1002,89 @@ async function findStoreSellerPromotions(tenantId, config, snapshot, excludeSkus
   if (!snapshot || snapshot.overTarget) return [];
 
   const minSales = config.promoteStoreSellerMinSales;
-  // Esclude regole Sconto: prezzi imposti, non tocchiamo mai.
-  // Priorità stagionalità: SKU in-season o entrante prima (seasonal_score DESC).
-  const { rows } = await pool.query(`
-    SELECT p.sku, p.product_name,
-      ROUND(p.sell_price::numeric, 2) AS sell_price,
-      ROUND(COALESCE(p.erp_cost, p.erp_cost_imputed, 0)::numeric, 4) AS erp_cost,
-      ROUND(p.margin_pct::numeric, 1) AS margin_pct,
-      p.sales_30d_seller,
-      phs.mc_click_potential,
-      phs.scraper_position,
-      phs.scraper_competitor_count,
-      phs.seasonal_score,
-      ROUND(phs.scraper_best_price::numeric, 2) AS best_price
-    FROM products p
-    LEFT JOIN product_health_scores phs ON phs.tenant_id=p.tenant_id AND phs.sku=p.sku
-    LEFT JOIN feed_killers fk ON fk.tenant_id=p.tenant_id AND fk.sku=p.sku AND fk.is_active=true
-    LEFT JOIN feed_quarantine fq ON fq.tenant_id=p.tenant_id AND fq.sku=p.sku AND fq.reactivated=false
-    LEFT JOIN price_rules pr ON pr.rule_id = p.price_rule_id AND pr.tenant_id = $1
-    WHERE p.tenant_id = $1
-      AND COALESCE(p.is_civetta, false) = false
-      AND p.saleable = true
-      AND (COALESCE(p.erp_stock,0) + COALESCE(p.supplier_stock,0)) > 0
-      AND fk.id IS NULL AND fq.id IS NULL
-      AND (pr.rule_type IS NULL OR pr.rule_type != 'sconto')
-      AND (
-        COALESCE(p.sales_30d_seller, 0) >= $2
-        OR (phs.scraper_best_price > 0 AND p.sell_price > phs.scraper_best_price + 0.01)
-      )
-    ORDER BY
-      COALESCE(phs.seasonal_score, 70) DESC,
-      COALESCE(p.sales_30d_seller, 0) DESC,
-      CASE phs.mc_click_potential WHEN 'HIGH' THEN 1 WHEN 'MEDIUM' THEN 2 ELSE 3 END
-    LIMIT 600
-  `, [tenantId, minSales]);
+  // Paginazione: leggiamo la lista candidati a batch di 600 (per non saturare il
+  // query planner), iterando finche' ci sono righe. Hard cap 10000 per safety.
+  // NOTA: il 600 NON e' un cap di promozioni totali, e' solo la dimensione del
+  // batch — l'engine valuta TUTTI i candidati che escono dal filtro.
+  const PAGE_SIZE = 600;
+  // HARD_CAP = limite SQL di sicurezza. Il vero cap operativo e' promoteMaxSkusPerRun
+  // (default 600), che limita il NUMERO finale di ADD passati al feed. Cfr.
+  // feedback_gradualita_promote_no_botto.
+  const HARD_CAP = Math.max(config.promoteMaxSkusPerRun * 2, 1200);
+  const rows = [];
+  let offset = 0;
+  while (offset < HARD_CAP) {
+    const { rows: batch } = await pool.query(`
+      SELECT p.sku, p.product_name,
+        ROUND(p.sell_price::numeric, 2) AS sell_price,
+        ROUND(COALESCE(p.erp_cost, p.erp_cost_imputed, 0)::numeric, 4) AS erp_cost,
+        ROUND(p.margin_pct::numeric, 1) AS margin_pct,
+        p.sales_30d_seller,
+        phs.mc_click_potential,
+        phs.scraper_position,
+        phs.scraper_competitor_count,
+        phs.seasonal_score,
+        ROUND(phs.scraper_best_price::numeric, 2) AS best_price
+      FROM products p
+      LEFT JOIN product_health_scores phs ON phs.tenant_id=p.tenant_id AND phs.sku=p.sku
+      LEFT JOIN feed_killers fk ON fk.tenant_id=p.tenant_id AND fk.sku=p.sku AND fk.is_active=true
+      LEFT JOIN feed_quarantine fq ON fq.tenant_id=p.tenant_id AND fq.sku=p.sku AND fq.reactivated=false
+      LEFT JOIN price_rules pr ON pr.rule_id = p.price_rule_id AND pr.tenant_id = $1
+      WHERE p.tenant_id = $1
+        AND COALESCE(p.is_civetta, false) = false
+        AND p.saleable = true
+        AND ${config.preferErpStockOnly
+          ? 'COALESCE(p.erp_stock,0) > 0'
+          : '(COALESCE(p.erp_stock,0) + COALESCE(p.supplier_stock,0)) > 0'}
+        AND fk.id IS NULL AND fq.id IS NULL
+        AND (pr.rule_type IS NULL OR pr.rule_type != 'sconto')
+        AND (
+          COALESCE(p.sales_30d_seller, 0) >= $2
+          OR (phs.scraper_best_price > 0 AND p.sell_price > phs.scraper_best_price + 0.01)
+        )
+        -- DICTAT (cfr. feedback_dictat_fatturare_incidenza_bassa):
+        -- 1) Vende cross-tenant (domanda dimostrata).
+        -- 2) Scraper ha tracciato il prodotto (best_price > 0 = visibile su TP).
+        -- 3) Posizione TP gestibile:
+        --    - top goldenPos (default 7): puo' essere ADD puro.
+        --    - top silverPos (default 15) E sell_price > best: puo' essere
+        --      PRICE_CUT Salva Bilancio (scalando classifica).
+        AND (
+          -- Bypass cross-tenant: se vende almeno 1 volta in store, ha domanda
+          -- locale dimostrata, non serve passare il check sales_agg.
+          COALESCE(p.sales_30d_seller, 0) >= 1
+          OR COALESCE(p.sales_30d_aggregated, 0) >= $6
+        )
+        AND phs.scraper_best_price > 0
+        AND (
+          -- (a) Gia' nel top goldenPos (default 7): ADD puro.
+          phs.scraper_position <= $5::int
+          OR (
+            -- (b) Posizione qualunque MA possiamo tagliarci a best-0.01.
+            p.sell_price > phs.scraper_best_price + 0.01
+          )
+          OR (
+            -- (c) Posizione NULL MA siamo gia' competitivi (sotto o uguale best).
+            -- Lo scraper potrebbe non averlo tracciato ma il prezzo regge.
+            phs.scraper_position IS NULL
+            AND p.sell_price <= phs.scraper_best_price + 0.01
+          )
+        )
+      ORDER BY
+        COALESCE(phs.seasonal_score, 70) DESC,
+        COALESCE(p.sales_30d_aggregated, 0) DESC,
+        COALESCE(p.sales_30d_seller, 0) DESC,
+        CASE phs.mc_click_potential WHEN 'HIGH' THEN 1 WHEN 'MEDIUM' THEN 2 ELSE 3 END,
+        p.sku
+      LIMIT $3 OFFSET $4
+    `, [tenantId, minSales, PAGE_SIZE, offset,
+        config.goldenPositionMaxForAdd || 7,
+        config.promoteSalesAggMin || 1]);
+    if (batch.length === 0) break;
+    rows.push(...batch);
+    if (batch.length < PAGE_SIZE) break;
+    offset += PAGE_SIZE;
+  }
 
   const out = [];
   for (const r of rows) {
@@ -977,6 +1127,14 @@ async function findStoreSellerPromotions(tenantId, config, snapshot, excludeSkus
       category: 'promotion_store_seller',
       sellPrice, marginPct: mp, demand: sales, position: r.scraper_position,
     });
+  }
+  // Cap finale sul numero totale di ADD per ciclo (anti picco spesa).
+  // I candidati arrivano gia' ordinati per scoring, quindi tagliamo i meno
+  // qualificati. Default 600, override via promote_max_skus_per_run.
+  const cap = config.promoteMaxSkusPerRun;
+  if (out.length > cap) {
+    console.log(`[FeedDaily] Promote cap: ${out.length} candidati → ${cap} (promote_max_skus_per_run)`);
+    return out.slice(0, cap);
   }
   return out;
 }
@@ -1083,15 +1241,29 @@ async function saveDailySummary(tenantId, snapshot, actions, killerCount) {
 // ─── APPLY ACTIONS TO FEED ────────────────────────────
 
 async function applyActions(tenantId, actions, config) {
+  // Archive previous non-KEEP actions to feed_action_history (audit trail)
+  await pool.query(`
+    INSERT INTO feed_action_history (tenant_id, sku, action, action_reason, action_source, recommended_price, health_score, classification)
+    SELECT fa.tenant_id, fa.sku, fa.action, fa.action_reason, fa.action_source, fa.recommended_price,
+           (SELECT health_score FROM product_health_scores WHERE tenant_id = fa.tenant_id AND sku = fa.sku),
+           (SELECT classification FROM product_health_scores WHERE tenant_id = fa.tenant_id AND sku = fa.sku)
+    FROM feed_actions fa
+    WHERE fa.tenant_id = $1 AND fa.action IN ('REMOVE', 'ADD', 'PRICE_CUT')
+  `, [tenantId]);
+
   // Clear old feed_actions
   await pool.query(`DELETE FROM feed_actions WHERE tenant_id = $1`, [tenantId]);
 
+  // Ordine = priorita' in caso di conflitto SKU (ON CONFLICT DO NOTHING tiene
+  // il primo). REMOVE prima (decisione definitiva di uscita); ADD subito dopo
+  // (promozione attiva sovrascrive eventuali MONITOR delle briglie larghe);
+  // PRICE_CUT e KEEP (in feed); MONITOR ultimo (osservazione passiva).
   const allActions = [
     ...actions.remove.map(a => ({ ...a, action: 'REMOVE' })),
-    ...actions.keep.map(a => ({ ...a, action: 'KEEP' })),
-    ...actions.priceCut.map(a => ({ ...a, action: 'PRICE_CUT' })),
-    ...actions.monitor.map(a => ({ ...a, action: 'MONITOR' })),
     ...(actions.add || []).map(a => ({ ...a, action: 'ADD' })),
+    ...actions.priceCut.map(a => ({ ...a, action: 'PRICE_CUT' })),
+    ...actions.keep.map(a => ({ ...a, action: 'KEEP' })),
+    ...actions.monitor.map(a => ({ ...a, action: 'MONITOR' })),
   ];
 
   // Batch insert
@@ -1171,11 +1343,12 @@ async function loadTenantRules(tenantId) {
   }
 }
 
-function buildRuleSet(rules, priceRulesMap) {
+async function buildRuleSet(tenantId, rules, priceRulesMap) {
   const excludedPriceRuleTypes = new Set();
   const excludedBrands = new Set();
   const protectedSkus = new Set();
   const excludedSkus = new Set();
+  const noPriceCutSkus = new Set();   // SKU precomputati che non devono ricevere PRICE_CUT
 
   for (const rule of rules) {
     const cfg = typeof rule.rule_config === 'string' ? JSON.parse(rule.rule_config) : rule.rule_config;
@@ -1193,10 +1366,25 @@ function buildRuleSet(rules, priceRulesMap) {
     }
   }
 
+  // Precomputo SKU da escludere PRICE_CUT in base a excludedBrands.
+  // Match su brand E su manufacturer (UNIFARCO/BAKEL hanno brand vuoto in
+  // Magento ma manufacturer popolato con codice Farmadati).
+  if (excludedBrands.size > 0) {
+    const list = [...excludedBrands];
+    const { rows: bs } = await pool.query(
+      `SELECT sku FROM products
+       WHERE tenant_id = $1
+         AND (LOWER(COALESCE(brand,'')) = ANY($2)
+              OR LOWER(COALESCE(manufacturer,'')) = ANY($2))`,
+      [tenantId, list]
+    );
+    for (const r of bs) noPriceCutSkus.add(r.sku);
+  }
+
   return {
     canPriceCut(p) {
       if (p.rule_type && excludedPriceRuleTypes.has(p.rule_type)) return false;
-      if (p.brand && excludedBrands.has(p.brand.toLowerCase())) return false;
+      if (noPriceCutSkus.has(p.sku)) return false;
       return true;
     },
     canRemove(p) {
@@ -1227,7 +1415,7 @@ async function runDailyFeedEngine(tenantId) {
 
   // Load tenant-specific rules
   const tenantRules = await loadTenantRules(tenantId);
-  const ruleSet = buildRuleSet(tenantRules);
+  const ruleSet = await buildRuleSet(tenantId, tenantRules);
   if (tenantRules.length > 0) {
     console.log(`[FeedDaily] Tenant rules: ${tenantRules.length} active (${JSON.stringify(ruleSet.summary())})`);
   }
@@ -1329,7 +1517,9 @@ async function runDailyFeedEngine(tenantId) {
   //  - vendono in store >= soglia AND margine fascia OK → ADD puro
   //  - sopra best_price competitor + Salva Bilancio (margin_eur OR margin_pct
   //    fascia) → ADD con PRICE_CUT contestuale (pepita vera).
-  if (config.promoteStoreSellerMinSales > 0) {
+  // 0 = "attiva promozione senza vincolo sales" (apre tutto stock>0).
+  // Negativo = disattivato. Default 3 = abilitato con minSales=3.
+  if (config.promoteStoreSellerMinSales >= 0) {
     const promoted = await findStoreSellerPromotions(
       tenantId, config, snapshot,
       new Set(actions.add.map(a => a.sku))
@@ -1373,6 +1563,26 @@ async function runDailyFeedEngine(tenantId) {
   };
 
   console.log(`[FeedDaily] Risparmio stimato: €${removedCost.toFixed(2)} da ${actions.remove.length} rimozioni`);
+
+  // Log to optimization_log (audit timeline visible in UI "Log modifiche")
+  try {
+    const { logAction } = require('./optimizationLog');
+    await logAction(tenantId, 'feed_daily_engine',
+      `Ciclo giornaliero: ${result.stats.REMOVE} REMOVE, ${result.stats.PRICE_CUT} PRICE_CUT, ${result.stats.KEEP} KEEP, ${result.stats.ADD} ADD, ${result.stats.MONITOR} MONITOR`,
+      actions.remove.length + actions.priceCut.length + (actions.add?.length || 0),
+      [],
+      { stats: result.stats, savedCost: removedCost, killers: killers.detected.length });
+  } catch (logErr) {
+    console.warn('[FeedDaily] optimization_log write failed:', logErr.message);
+  }
+
+  // AI audit (fire-and-forget, non blocca; throttle interno 30 min).
+  // Errori AI vengono solo loggati: l'engine procede normalmente.
+  try {
+    const { auditTenantRun } = require('./aiAuditor');
+    auditTenantRun(tenantId, snapshot, result.stats).catch(() => {});
+  } catch (e) { /* aiAuditor non disponibile, skip */ }
+
   return result;
 }
 

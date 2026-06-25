@@ -142,6 +142,10 @@ async function recalculateStableCache(tenantId) {
           )
           OR (COALESCE(p.erp_stock, 0) > 0 AND COALESCE(p.margin_pct, 0) >= 18)
           OR COALESCE(p.margin_pct, 0) >= 22
+          -- Estensione utente 25/6: grossista valido + MOL discreto + prezzo non bagatelle
+          OR (COALESCE(p.supplier_stock, 0) >= 5
+              AND COALESCE(p.margin_pct, 0) >= 14
+              AND COALESCE(p.sell_price, 0) >= 8)
         )` : '';
 
   // Build civetta=1 list (keep in feed)

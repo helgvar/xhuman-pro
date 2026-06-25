@@ -377,8 +377,23 @@ async function updateDailyTracking(tenantId, config) {
 
 async function detectKillers(tenantId) {
   // Killer = prodotti con molti seller su TP, tutti prendono click,
-  // ma venduto globale = 0 → nessuno li compra online
+  // ma venduto globale = 0 → nessuno li compra online.
+  //
+  // Protezioni aggiunte:
+  // - tp_attributed_orders > 1 (almeno 2 ordini attribuiti TP nei 30g): l'SKU
+  //   vende su TP — non killare anche se sales_30d_aggregated è 0
+  //   (i dati cross-tenant da Farmabooster possono non essere aggiornati).
+  // - ordini reali 30g sul tenant >= 2 (orders.grand_total su questo SKU):
+  //   se vende localmente sul Magento del tenant, non killare.
   const { rows: killers } = await pool.query(`
+    WITH actual_orders_30d AS (
+      SELECT oi.sku, COUNT(DISTINCT o.id) as ord_30d
+      FROM orders o JOIN order_items oi ON oi.order_id = o.id
+      WHERE o.tenant_id = $1
+        AND o.order_status NOT IN ('canceled','closed','pending_payment')
+        AND o.order_date >= NOW() - INTERVAL '30 days'
+      GROUP BY oi.sku
+    )
     SELECT p.sku, p.product_name,
       phs.scraper_competitor_count as sellers,
       COALESCE(p.sales_30d_aggregated, 0) as global_demand,
@@ -389,11 +404,14 @@ async function detectKillers(tenantId) {
     JOIN product_health_scores phs ON phs.sku = p.sku AND phs.tenant_id = p.tenant_id
     JOIN zombie_clicks zc ON zc.product_code = p.sku AND zc.tenant_id = p.tenant_id
     LEFT JOIN feed_killers fk ON fk.sku = p.sku AND fk.tenant_id = p.tenant_id AND fk.is_active = true
+    LEFT JOIN actual_orders_30d ao ON ao.sku = p.sku
     WHERE p.tenant_id = $1
       AND p.is_civetta = true
       AND phs.scraper_competitor_count >= 8
       AND COALESCE(p.sales_30d_aggregated, 0) <= 1
       AND COALESCE(p.sales_30d_seller, 0) = 0
+      AND COALESCE(phs.tp_attributed_orders, 0) <= 1
+      AND COALESCE(ao.ord_30d, 0) < 2
       AND fk.id IS NULL
     GROUP BY p.sku, p.product_name, phs.scraper_competitor_count,
              p.sales_30d_aggregated, phs.scraper_position
@@ -447,6 +465,21 @@ async function triageProducts(tenantId, config, snapshot, ruleSet = null) {
       FROM feed_daily_tracking
       WHERE tenant_id = $1
       GROUP BY sku
+    ),
+    -- Revenue reale 30g dagli ordini importati (NON da GA4: tracking GA4 KO
+    -- su alcuni tenant rendeva l'incidenza calcolata 9999% e tutti i SKU
+    -- diventavano "burner alta incidenza" anche se in realta' convertono.
+    -- Usiamo il revenue dei veri ordini Magento per il calcolo bypass safety net.
+    actual_rev_30d AS (
+      SELECT oi.sku,
+        SUM(oi.row_total) as rev_30d,
+        COUNT(DISTINCT o.id) as ord_30d
+      FROM orders o
+      JOIN order_items oi ON oi.order_id = o.id
+      WHERE o.tenant_id = $1
+        AND o.order_status NOT IN ('canceled','closed','pending_payment')
+        AND o.order_date >= NOW() - INTERVAL '30 days'
+      GROUP BY oi.sku
     )
     SELECT pt.*,
       p.product_name, p.is_civetta, p.brand, p.manufacturer, p.erp_stock, p.supplier_stock,
@@ -457,11 +490,15 @@ async function triageProducts(tenantId, config, snapshot, ruleSet = null) {
       phs.scraper_best_price,
       -- KPI 30g consolidati per check bypass safety net (cfr. caso IRILENS).
       phs.tp_clicks_30d, phs.tp_click_cost_30d, phs.ga4_tp_revenue,
+      -- Revenue/ordini REALI 30g dai veri orders Magento (fallback se GA4 KO)
+      COALESCE(ar.rev_30d, 0) as actual_rev_30d,
+      COALESCE(ar.ord_30d, 0) as actual_ord_30d,
       fk.id as is_killer,
       fq.id as is_quarantined, fq.quarantine_level
     FROM product_totals pt
     JOIN products p ON p.sku = pt.sku AND p.tenant_id = $1
     LEFT JOIN product_health_scores phs ON phs.sku = pt.sku AND phs.tenant_id = $1
+    LEFT JOIN actual_rev_30d ar ON ar.sku = pt.sku
     LEFT JOIN feed_killers fk ON fk.sku = pt.sku AND fk.tenant_id = $1 AND fk.is_active = true
     LEFT JOIN feed_quarantine fq ON fq.sku = pt.sku AND fq.tenant_id = $1 AND fq.reactivated = false
     LEFT JOIN price_rules pr ON pr.rule_id = p.price_rule_id AND pr.tenant_id = $1
@@ -489,19 +526,24 @@ async function triageProducts(tenantId, config, snapshot, ruleSet = null) {
     const stockSource = p.stock_source || 'supplier';
     const marginPct = parseFloat(p.margin_pct) || 0;
     const hasSalesStore = (parseFloat(p.sales_30d_seller) || 0) > 0;
-    const hasGA4Orders = (parseInt(p.ga4_tp_purchases) || 0) > 0;
+    // Fonte ordini: prima i veri orders dal Magento (actual_ord_30d),
+    // poi fallback GA4 per coerenza dashboard.
+    const actualOrders30d = parseInt(p.actual_ord_30d) || 0;
+    const hasGA4Orders = (parseInt(p.ga4_tp_purchases) || 0) > 0 || actualOrders30d > 0;
     const hasAssistedSales = (parseInt(p.ga4_assisted_sales) || 0) > 0;
 
     const storeSales30dRaw = parseFloat(p.sales_30d_seller) || 0;
 
-    // Calcolo bypass safety net usando i KPI consolidati 30g da phs (se
-    // disponibili). I dati del triage (totalCost/totalRevenue) sono periodi
-    // variabili e non includono ga4_tp_revenue. Usiamo phs per allineare al
-    // calcolo che l'utente vede in dashboard.
+    // Calcolo bypass safety net SU REVENUE REALE 30g (orders.grand_total
+    // aggregato per SKU dai veri ordini Magento). GA4 tracking è KO su
+    // diversi tenant (ga4_tp_revenue=0) e ci faceva calcolare incidenza
+    // 9999% facendo killer/quarantena automatica anche su convertitori veri.
     // Cfr. caso IRILENS Papa 23/6/2026 (€46 cost 30g / €25 rev = inc 180%).
     const phs30dClicks = parseFloat(p.tp_clicks_30d) || 0;
     const phs30dCost = parseFloat(p.tp_click_cost_30d) || 0;
-    const phs30dRev = parseFloat(p.ga4_tp_revenue) || 0;
+    const actualRev30d = parseFloat(p.actual_rev_30d) || 0;
+    // Fallback: revenue reale, poi GA4, poi 0
+    const phs30dRev = actualRev30d > 0 ? actualRev30d : (parseFloat(p.ga4_tp_revenue) || 0);
     const skuBurnIncidence = (phs30dRev > 0)
       ? (phs30dCost / phs30dRev * 100)
       : (phs30dClicks >= config.safetyNetMinClicksForCheck ? 9999 : 0);

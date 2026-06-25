@@ -376,21 +376,26 @@ async function updateDailyTracking(tenantId, config) {
 // ─── FASE 3: KILLER DETECTION ──────────────────────────
 
 async function detectKillers(tenantId) {
-  // Killer DINAMICO basato su consumo budget (cfr. utente 25/6/2026):
+  // Killer DINAMICO basato su RAPPORTO VENDITE/COSTO (cfr. utente 25/6/2026):
   //
-  // Budget SKU = margine EUR (sell_price - erp_cost).
-  // Killer se cost_click_accumulato_30g >= 70% del budget E 0 conversioni.
+  // Bilancio TP 30g = (ordini_TP * margine_eur) - costo_click_30g
+  // Killer SE bilancio < 0 di una quota significativa del costo.
   //
-  // Esempio Aspirina: cost 5€, prezzo 7€ → budget €2 → killer se cost >= €1.40
-  // (con CPC ~0.27€+iva = ~5-6 click bruciati).
+  // Formula: killer se costo_click - (ord * margin) > 50% del costo_click
+  //          ovvero (ord * margin) < costo_click * 0.5
   //
-  // Protezioni aggiunte (cfr. fix GA4 broken 25/6):
-  // - tp_attributed_orders > 1 (almeno 2 ordini attribuiti TP nei 30g)
-  // - ordini reali 30g >= 2 (orders su questo SKU sul tenant)
-  // - sales_30d_aggregated >= 1 (vendita FB cross-tenant)
+  // Esempio MPF 949645295: 90 click / €25 cost / 2 ord / margin €1.11
+  //   = profitto = 2 * 1.11 - 25 = -22.78 (perdita totale)
+  //   = orders*margin (€2.22) < cost*0.5 (€12.5) → KILLER
   //
-  // Posizione: irrilevante per il killer. Un SKU pos 1 che brucia 70% del
-  // margine senza vendere è killer; uno pos 25 senza click NON e' killer.
+  // Esempio Aspirina: 5 click / €1.35 cost / 0 ord / margin €2
+  //   = orders*margin (€0) < cost*0.5 (€0.68) → KILLER
+  //
+  // Esempio Tachipirina: 100 click / €27 cost / 30 ord / margin €1.5
+  //   = orders*margin (€45) > cost*0.5 (€13.5) → NON KILLER
+  //
+  // Ordini considerati: GREATEST tra tp_attributed_orders e actual orders 30g
+  // (per coprire i casi GA4 KO).
   const { rows: killers } = await pool.query(`
     WITH actual_orders_30d AS (
       SELECT oi.sku, COUNT(DISTINCT o.id) as ord_30d
@@ -404,25 +409,28 @@ async function detectKillers(tenantId) {
       phs.scraper_competitor_count as sellers,
       COALESCE(p.sales_30d_aggregated, 0) as global_demand,
       phs.scraper_position as our_position,
-      COALESCE(p.margin, p.sell_price - p.erp_cost) as budget_eur,
+      COALESCE(p.margin, p.sell_price - p.erp_cost) as margin_eur,
       COALESCE(phs.tp_click_cost_30d, 0) as cost_30d,
-      COALESCE(phs.tp_clicks_30d, 0) as clicks_30d
+      COALESCE(phs.tp_clicks_30d, 0) as clicks_30d,
+      GREATEST(COALESCE(phs.tp_attributed_orders, 0), COALESCE(ao.ord_30d, 0)) as orders_30d,
+      COALESCE(p.margin, p.sell_price - p.erp_cost) *
+        GREATEST(COALESCE(phs.tp_attributed_orders, 0), COALESCE(ao.ord_30d, 0)) as revenue_margine_30d
     FROM products p
     JOIN product_health_scores phs ON phs.sku = p.sku AND phs.tenant_id = p.tenant_id
     LEFT JOIN feed_killers fk ON fk.sku = p.sku AND fk.tenant_id = p.tenant_id AND fk.is_active = true
     LEFT JOIN actual_orders_30d ao ON ao.sku = p.sku
     WHERE p.tenant_id = $1
       AND p.is_civetta = true
-      -- Convertitori NON killer
-      AND COALESCE(p.sales_30d_aggregated, 0) <= 1
-      AND COALESCE(p.sales_30d_seller, 0) = 0
-      AND COALESCE(phs.tp_attributed_orders, 0) <= 1
-      AND COALESCE(ao.ord_30d, 0) < 2
       AND fk.id IS NULL
-      -- Budget consumato >= 70%
+      -- Costo significativo (almeno 3 click)
+      AND COALESCE(phs.tp_clicks_30d, 0) >= 3
+      AND COALESCE(phs.tp_click_cost_30d, 0) > 0
       AND COALESCE(p.margin, p.sell_price - p.erp_cost) > 0
-      AND COALESCE(phs.tp_click_cost_30d, 0) >= 0.70 * COALESCE(p.margin, p.sell_price - p.erp_cost)
-      AND COALESCE(phs.tp_clicks_30d, 0) >= 2
+      -- Burner: il margine generato copre < 50% del costo click
+      -- ovvero (ordini * margin) < cost * 0.5
+      AND COALESCE(p.margin, p.sell_price - p.erp_cost)
+          * GREATEST(COALESCE(phs.tp_attributed_orders, 0), COALESCE(ao.ord_30d, 0))
+          < COALESCE(phs.tp_click_cost_30d, 0) * 0.5
     ORDER BY phs.tp_click_cost_30d DESC
   `, [tenantId]);
 
@@ -436,7 +444,7 @@ async function detectKillers(tenantId) {
         quarantine_until = NOW() + INTERVAL '30 days', is_active = true, detected_at = NOW()
     `, [
       tenantId, k.sku, k.sellers, k.global_demand, k.our_position,
-      `Killer dinamico: budget €${parseFloat(k.budget_eur).toFixed(2)} consumato al ${Math.round(parseFloat(k.cost_30d) / parseFloat(k.budget_eur) * 100)}% (€${parseFloat(k.cost_30d).toFixed(2)}, ${k.clicks_30d} click 30g) - 0 conversioni`
+      `Killer dinamico: bilancio TP 30g €${(parseFloat(k.revenue_margine_30d) - parseFloat(k.cost_30d)).toFixed(2)} (${k.clicks_30d} click €${parseFloat(k.cost_30d).toFixed(2)} - ${k.orders_30d} ord × €${parseFloat(k.margin_eur).toFixed(2)} margin = €${parseFloat(k.revenue_margine_30d).toFixed(2)} ricavo) - rapporto vendite/costo insufficiente`
     ]);
     inserted++;
   }

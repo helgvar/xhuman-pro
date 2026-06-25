@@ -853,14 +853,29 @@ async function findPriceCutCandidates(tenantId, config, snapshot) {
       AND p.is_civetta = true
       AND p.saleable = true
       AND COALESCE(p.margin_pct, 0) >= 8
-      AND phs.tp_clicks_30d = 0
+      -- Rimosso filtro tp_clicks_30d = 0 (escludeva SKU in top7 ma overpriced).
+      -- Ora accettiamo:
+      --  - zero-click + domanda (logica originale)
+      --  - OR ha click MA il margine generato NON copre il costo
+      --    (= bilancio negativo = SKU che andrebbe killato; tagliando il prezzo
+      --     puo' convertire di piu')
+      AND (
+        phs.tp_clicks_30d = 0
+        OR (
+          COALESCE(p.margin, p.sell_price - p.erp_cost) > 0
+          AND COALESCE(phs.tp_click_cost_30d, 0) > 0
+          AND COALESCE(p.margin, p.sell_price - p.erp_cost)
+              * COALESCE(phs.tp_attributed_orders, 0)
+              < COALESCE(phs.tp_click_cost_30d, 0) * 1.0
+        )
+      )
       AND fk.id IS NULL
       AND phs.scraper_best_price IS NOT NULL
       AND phs.scraper_best_price > 0
       AND p.sell_price > phs.scraper_best_price * 1.05
       AND (pr.rule_type IS NULL OR pr.rule_type != 'sconto')
       AND ${demandClause}
-    ORDER BY p.sales_30d_aggregated DESC
+    ORDER BY phs.tp_click_cost_30d DESC NULLS LAST, p.sales_30d_aggregated DESC
     LIMIT ${limit}
   `, [tenantId]);
 

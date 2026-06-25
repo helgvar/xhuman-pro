@@ -376,15 +376,21 @@ async function updateDailyTracking(tenantId, config) {
 // ─── FASE 3: KILLER DETECTION ──────────────────────────
 
 async function detectKillers(tenantId) {
-  // Killer = prodotti con molti seller su TP, tutti prendono click,
-  // ma venduto globale = 0 → nessuno li compra online.
+  // Killer DINAMICO basato su consumo budget (cfr. utente 25/6/2026):
   //
-  // Protezioni aggiunte:
-  // - tp_attributed_orders > 1 (almeno 2 ordini attribuiti TP nei 30g): l'SKU
-  //   vende su TP — non killare anche se sales_30d_aggregated è 0
-  //   (i dati cross-tenant da Farmabooster possono non essere aggiornati).
-  // - ordini reali 30g sul tenant >= 2 (orders.grand_total su questo SKU):
-  //   se vende localmente sul Magento del tenant, non killare.
+  // Budget SKU = margine EUR (sell_price - erp_cost).
+  // Killer se cost_click_accumulato_30g >= 70% del budget E 0 conversioni.
+  //
+  // Esempio Aspirina: cost 5€, prezzo 7€ → budget €2 → killer se cost >= €1.40
+  // (con CPC ~0.27€+iva = ~5-6 click bruciati).
+  //
+  // Protezioni aggiunte (cfr. fix GA4 broken 25/6):
+  // - tp_attributed_orders > 1 (almeno 2 ordini attribuiti TP nei 30g)
+  // - ordini reali 30g >= 2 (orders su questo SKU sul tenant)
+  // - sales_30d_aggregated >= 1 (vendita FB cross-tenant)
+  //
+  // Posizione: irrilevante per il killer. Un SKU pos 1 che brucia 70% del
+  // margine senza vendere è killer; uno pos 25 senza click NON e' killer.
   const { rows: killers } = await pool.query(`
     WITH actual_orders_30d AS (
       SELECT oi.sku, COUNT(DISTINCT o.id) as ord_30d
@@ -398,26 +404,27 @@ async function detectKillers(tenantId) {
       phs.scraper_competitor_count as sellers,
       COALESCE(p.sales_30d_aggregated, 0) as global_demand,
       phs.scraper_position as our_position,
-      SUM(zc.clicks) as our_clicks,
-      ROUND(SUM(zc.clicks) * $2::numeric, 2) as our_cost
+      COALESCE(p.margin, p.sell_price - p.erp_cost) as budget_eur,
+      COALESCE(phs.tp_click_cost_30d, 0) as cost_30d,
+      COALESCE(phs.tp_clicks_30d, 0) as clicks_30d
     FROM products p
     JOIN product_health_scores phs ON phs.sku = p.sku AND phs.tenant_id = p.tenant_id
-    JOIN zombie_clicks zc ON zc.product_code = p.sku AND zc.tenant_id = p.tenant_id
     LEFT JOIN feed_killers fk ON fk.sku = p.sku AND fk.tenant_id = p.tenant_id AND fk.is_active = true
     LEFT JOIN actual_orders_30d ao ON ao.sku = p.sku
     WHERE p.tenant_id = $1
       AND p.is_civetta = true
-      AND phs.scraper_competitor_count >= 8
+      -- Convertitori NON killer
       AND COALESCE(p.sales_30d_aggregated, 0) <= 1
       AND COALESCE(p.sales_30d_seller, 0) = 0
       AND COALESCE(phs.tp_attributed_orders, 0) <= 1
       AND COALESCE(ao.ord_30d, 0) < 2
       AND fk.id IS NULL
-    GROUP BY p.sku, p.product_name, phs.scraper_competitor_count,
-             p.sales_30d_aggregated, phs.scraper_position
-    HAVING SUM(zc.clicks) >= 2
-    ORDER BY SUM(zc.clicks) DESC
-  `, [tenantId, DEFAULT_CPC]);
+      -- Budget consumato >= 70%
+      AND COALESCE(p.margin, p.sell_price - p.erp_cost) > 0
+      AND COALESCE(phs.tp_click_cost_30d, 0) >= 0.70 * COALESCE(p.margin, p.sell_price - p.erp_cost)
+      AND COALESCE(phs.tp_clicks_30d, 0) >= 2
+    ORDER BY phs.tp_click_cost_30d DESC
+  `, [tenantId]);
 
   let inserted = 0;
   for (const k of killers) {
@@ -429,7 +436,7 @@ async function detectKillers(tenantId) {
         quarantine_until = NOW() + INTERVAL '30 days', is_active = true, detected_at = NOW()
     `, [
       tenantId, k.sku, k.sellers, k.global_demand, k.our_position,
-      `Killer: ${k.sellers} seller su TP, 0 vendite globali, ${k.our_clicks} click nostri (€${k.our_cost} sprecati)`
+      `Killer dinamico: budget €${parseFloat(k.budget_eur).toFixed(2)} consumato al ${Math.round(parseFloat(k.cost_30d) / parseFloat(k.budget_eur) * 100)}% (€${parseFloat(k.cost_30d).toFixed(2)}, ${k.clicks_30d} click 30g) - 0 conversioni`
     ]);
     inserted++;
   }
@@ -709,8 +716,22 @@ async function triageProducts(tenantId, config, snapshot, ruleSet = null) {
     else if (position && position <= 7) { stayScore += 1; stayReasons.push(`pos ${position}`); }
 
     if (hasSalesStore) { stayScore += 2; stayReasons.push('vende in store'); }
+    // MC eliminato: poco affidabile, segnale ridondante con scraper_position.
 
-    if (p.mc_click_potential === 'HIGH') { stayScore += 1; stayReasons.push('MC HIGH'); }
+    // B0) NESSUNA POSIZIONE SCRAPER — se l'SKU prende click ma non sappiamo
+    // dove sta nella SERP TP, non possiamo decidere se è competitivo. Lo
+    // togliamo dal feed per non sprecare budget alla cieca. Eccezione:
+    // se ha 0 click (es. SKU appena entrato) lo lasciamo girare.
+    if (!position && totalClicks >= 3) {
+      actions.remove.push({
+        sku: p.sku, name: p.product_name, action: 'REMOVE',
+        reason: `Nessuna posizione scraper, ${totalClicks} click in ${daysClicked}gg → blocchiamo per evitare spreco`,
+        category: 'no_scraper_position', cost: totalCost, clicks: totalClicks,
+        quarantineDays: 7,
+      });
+      stats.no_scraper = (stats.no_scraper || 0) + 1;
+      continue;
+    }
 
     // B) BRUCIATORE PURO — score basso, via
     if (stayScore <= 1) {
@@ -790,18 +811,17 @@ async function findPriceCutCandidates(tenantId, config, snapshot) {
   const posOverride = config.priceCutPositionOverrideMax ?? 0;
   const limit = config.priceCutLimit ?? 300;
 
+  // MC eliminato dai criteri di domanda: poco affidabile.
   const demandClause = posOverride > 0
     ? `(
         COALESCE(p.sales_30d_aggregated, 0) >= ${aggMin}
         OR COALESCE(p.sales_30d_seller, 0) >= ${sellerMin}
-        OR COALESCE(phs.mc_impressions_14d, 0) >= ${mcMin}
         OR (phs.scraper_position IS NOT NULL AND phs.scraper_position <= ${posOverride}
             AND (COALESCE(p.erp_stock, 0) + COALESCE(p.supplier_stock, 0)) >= 5)
       )`
     : `(
         COALESCE(p.sales_30d_aggregated, 0) >= ${aggMin}
         OR COALESCE(p.sales_30d_seller, 0) >= ${sellerMin}
-        OR COALESCE(phs.mc_impressions_14d, 0) >= ${mcMin}
       )`;
 
   // Prodotti civetta=1 che non ricevono click ma hanno domanda
@@ -1154,7 +1174,6 @@ async function findStoreSellerPromotions(tenantId, config, snapshot, excludeSkus
         COALESCE(phs.seasonal_score, 70) DESC,
         COALESCE(p.sales_30d_aggregated, 0) DESC,
         COALESCE(p.sales_30d_seller, 0) DESC,
-        CASE phs.mc_click_potential WHEN 'HIGH' THEN 1 WHEN 'MEDIUM' THEN 2 ELSE 3 END,
         p.sku
       LIMIT $3 OFFSET $4
     `, [tenantId, minSales, PAGE_SIZE, offset,

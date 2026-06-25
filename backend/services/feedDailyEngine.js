@@ -819,7 +819,11 @@ async function findPriceCutCandidates(tenantId, config, snapshot) {
     if (targetPrice < sellPrice * 0.75) continue;
 
     const newMarginPct = erpCost > 0 ? ((targetPrice - erpCost) / targetPrice * 100) : 0;
-    if (newMarginPct < minMarginPct) continue;
+    const newMarginEur = targetPrice - erpCost;
+    // Accetta se MOL% per fascia OK, oppure (Salva Bilancio) se margine EUR
+    // assoluto >= soglia: SKU costosi possono vendere con poco % ma molti EUR.
+    const salvaBilancioMin = config.salvaBilancioMinEur || 3;
+    if (newMarginPct < minMarginPct && newMarginEur < salvaBilancioMin) continue;
 
     priceCuts.push({
       sku: c.sku, name: c.product_name, action: 'PRICE_CUT',

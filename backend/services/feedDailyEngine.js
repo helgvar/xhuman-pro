@@ -1162,6 +1162,10 @@ async function findStoreSellerPromotions(tenantId, config, snapshot, excludeSkus
           -- locale dimostrata, non serve passare il check sales_agg.
           COALESCE(p.sales_30d_seller, 0) >= 1
           OR COALESCE(p.sales_30d_aggregated, 0) >= $6
+          -- Bypass ord_tp_storici: SKU che vendeva via TP ma ora NON in civetta FB.
+          -- Spesso FB esclude SKU che invece convertono. Usiamo ord_tp >= 1 come
+          -- segnale forte di domanda specifica.
+          OR COALESCE(phs.tp_attributed_orders, 0) >= 1
         )
         AND phs.scraper_best_price > 0
         AND (

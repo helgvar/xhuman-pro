@@ -170,6 +170,10 @@ async function start() {
     const { startOblioCron } = require('./services/crossTenantOblio');
     startOblioCron();
 
+    // Weekend Learning: analisi lunedì 30/6 23:00 italia
+    const { startWeekendLearningCron } = require('./services/weekendLearning');
+    startWeekendLearningCron();
+
     app.listen(PORT, '0.0.0.0', () => {
       console.log(`[xHUMANPRO] Backend running on http://0.0.0.0:${PORT}`);
     });

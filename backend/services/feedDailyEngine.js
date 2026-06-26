@@ -412,9 +412,9 @@ async function detectKillers(tenantId) {
       COALESCE(p.margin, p.sell_price - p.erp_cost) as margin_eur,
       COALESCE(phs.tp_click_cost_30d, 0) as cost_30d,
       COALESCE(phs.tp_clicks_30d, 0) as clicks_30d,
-      GREATEST(COALESCE(phs.tp_attributed_orders, 0), COALESCE(ao.ord_30d, 0)) as orders_30d,
+      COALESCE(ao.ord_30d, 0) as orders_30d,
       COALESCE(p.margin, p.sell_price - p.erp_cost) *
-        GREATEST(COALESCE(phs.tp_attributed_orders, 0), COALESCE(ao.ord_30d, 0)) as revenue_margine_30d
+        COALESCE(ao.ord_30d, 0) as revenue_margine_30d
     FROM products p
     JOIN product_health_scores phs ON phs.sku = p.sku AND phs.tenant_id = p.tenant_id
     LEFT JOIN feed_killers fk ON fk.sku = p.sku AND fk.tenant_id = p.tenant_id AND fk.is_active = true
@@ -422,14 +422,16 @@ async function detectKillers(tenantId) {
     WHERE p.tenant_id = $1
       AND p.is_civetta = true
       AND fk.id IS NULL
-      -- Costo significativo (almeno 3 click)
+      -- REGOLA CARDINALE (feedback_solo_ordini_reali_magento):
+      -- mai killer se vendite Magento reali >= 2 (anche se TP perde soldi,
+      -- l'SKU ha domanda → meglio PRICE_CUT, non REMOVE).
+      AND COALESCE(ao.ord_30d, 0) < 2
       AND COALESCE(phs.tp_clicks_30d, 0) >= 3
       AND COALESCE(phs.tp_click_cost_30d, 0) > 0
       AND COALESCE(p.margin, p.sell_price - p.erp_cost) > 0
-      -- Burner: il margine generato copre < 50% del costo click
-      -- ovvero (ordini * margin) < cost * 0.5
+      -- Burner: margine generato (ord_reali * margin) < cost * 0.5
       AND COALESCE(p.margin, p.sell_price - p.erp_cost)
-          * GREATEST(COALESCE(phs.tp_attributed_orders, 0), COALESCE(ao.ord_30d, 0))
+          * COALESCE(ao.ord_30d, 0)
           < COALESCE(phs.tp_click_cost_30d, 0) * 0.5
     ORDER BY phs.tp_click_cost_30d DESC
   `, [tenantId]);
@@ -612,12 +614,14 @@ async function triageProducts(tenantId, config, snapshot, ruleSet = null) {
       }
     }
 
-    // PROFIT GUARD — SKU con ordini reali profittevoli mai REMOVE (cfr. sopra).
-    // Eccezione UNICA: quarantena attiva (gestita subito sotto, in DB).
-    if (profitGuardActive && !p.is_quarantined) {
+    // PROFIT GUARD — SKU con vendite reali Magento mai REMOVE.
+    // Soglia semplice: ord_reali_30d >= 2 → domanda comprovata, va in feed.
+    // (Se brucia su TP serve PRICE_CUT, non REMOVE.)
+    // Eccezione UNICA: quarantena attiva DB.
+    if (realOrders30d >= 2 && !p.is_quarantined) {
       actions.keep.push({
         sku: p.sku, name: p.product_name, action: 'KEEP',
-        reason: `Profit guard: ${realOrders30d} ord reali × €${marginEurForGuard.toFixed(2)} = €${realRevMargine.toFixed(2)} vs cost €${phs30dCost.toFixed(2)} → profitevole`,
+        reason: `Profit guard: ${realOrders30d} ord reali Magento 30g - domanda comprovata, mantengo in feed`,
         category: 'profit_guard', cost: totalCost, clicks: totalClicks, orders: realOrders30d,
       });
       stats.profit_guard = (stats.profit_guard || 0) + 1;

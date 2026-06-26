@@ -100,7 +100,23 @@ async function populateOblio(batchSize = POPOLA_BATCH_SIZE) {
 }
 
 /**
- * Check daily: rilascia SKU OBLIO che ora hanno vendite.
+ * Rotate 30gg: SKU dentro OBLIO da >30 giorni vengono rilasciati per essere
+ * rivalutati. Se ricominciano a bruciare senza vendere, il populate
+ * settimanale li rimetterà dentro. Evita "sepoltura permanente".
+ */
+async function rotateExpiredOblio(maxDays = 30) {
+  const { rowCount } = await pool.query(`
+    UPDATE cross_tenant_oblio
+    SET status='released', released_at=NOW(),
+        released_reason='Rotate ${maxDays}gg - rivalutazione automatica'
+    WHERE status='active' AND added_at < NOW() - INTERVAL '${maxDays} days'
+  `);
+  if (rowCount > 0) console.log(`[OBLIO] Rotate ${maxDays}gg: ${rowCount} SKU rilasciati per rivalutazione`);
+  return { rotated: rowCount };
+}
+
+/**
+ * Check 6h: rilascia SKU OBLIO che ora hanno vendite.
  */
 async function checkAndReleaseOblio() {
   const { rows: oblioSkus } = await pool.query(
@@ -174,10 +190,14 @@ function startOblioCron() {
   if (cronStarted) return;
   cronStarted = true;
 
-  // Check vendite ogni 6h (00:30, 06:30, 12:30, 18:30 UTC) per rilasciare
-  // SKU che iniziano a vendere
+  // Check vendite ogni 6h (00:30, 06:30, 12:30, 18:30 UTC):
+  // - rilascia SKU che hanno iniziato a vendere
+  // - rilascia SKU dentro OBLIO da >30gg (rotate)
   scheduleEveryHours(6, 30, async () => {
-    try { await checkAndReleaseOblio(); }
+    try {
+      await rotateExpiredOblio(30);
+      await checkAndReleaseOblio();
+    }
     catch (e) { console.error('[OBLIO] 6h check error:', e.message); }
   });
 
@@ -224,6 +244,7 @@ module.exports = {
   findCrossTenantBurners,
   populateOblio,
   checkAndReleaseOblio,
+  rotateExpiredOblio,
   getActiveOblioSkus,
   startOblioCron,
 };

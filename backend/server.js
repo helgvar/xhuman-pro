@@ -17,9 +17,24 @@ const { initDB } = require('./db/pool');
 // Defensive: log unhandled rejections instead of crashing the process.
 // A single tenant misconfiguration (e.g. missing API permission) must not take down
 // the entire backend and bring all crons to a halt.
+//
+// Pattern noti rumorosi che NON spammiamo su Telegram (restano in stdout/log):
+// - apiQueue timeout race (innocuo, Promise.race del modulo)
+// - 401 Magento per tenant senza permessi corretti (allertato gia' dal cron specifico)
+// - Step TIMEOUT healthCron per tenant grossi
+const TELEGRAM_EXCLUDE_PATTERNS = [
+  /Timeout after \d+ms \(avg: \d+ms\)/i,
+  /Step TIMEOUT: (health_scores|mc_sync|civetta_sync) on /i,
+  /Magento API error 401/i,
+  /The operation was aborted due to timeout/i,
+];
+
 process.on('unhandledRejection', (reason, promise) => {
   const msg = reason?.message || String(reason);
   console.error('[UnhandledRejection]', msg, reason?.stack?.split('\n').slice(0, 4).join(' | '));
+  for (const re of TELEGRAM_EXCLUDE_PATTERNS) {
+    if (re.test(msg)) return; // rumore noto, niente Telegram
+  }
   try {
     const { sendTelegram } = require('./services/telegramNotifier');
     sendTelegram(`🚨 <b>xHumanPro unhandledRejection</b>\n<code>${msg.slice(0, 500)}</code>`, {
@@ -81,6 +96,7 @@ const crossChannelRoutes = require('./routes/crossChannel');
 const shoppingRoutes = require('./routes/shopping');
 const googleAdsRoutes = require('./routes/googleAds');
 const logsRoutes = require('./routes/logs');
+const aiAuditRoutes = require('./routes/aiAudit');
 app.use('/api/tenants', tenantsRoutes);
 app.use('/api/users', usersRoutes);
 app.use('/api/orders', ordersRoutes);
@@ -101,6 +117,7 @@ app.use('/api/cross-channel', crossChannelRoutes);
 app.use('/api/shopping', shoppingRoutes);
 app.use('/api/google-ads', googleAdsRoutes);
 app.use('/api/logs', logsRoutes);
+app.use('/api/ai-audit', aiAuditRoutes);
 
 // Start server
 async function start() {
@@ -143,6 +160,14 @@ async function start() {
     // /feed/prices non veniva mai aggiornata. Loop autonomo risolve.
     const { startStableCacheCron } = require('./services/stableCacheCron');
     startStableCacheCron();
+
+    // AI audit cron: digest UTC 09:00 + auto-apply UTC 04:00, 16:00
+    const { start: startAiAuditCron } = require('./services/aiAuditCron');
+    startAiAuditCron();
+
+    // OBLIO cron: populate giovedì 02:00 + daily release check 03:00
+    const { startOblioCron } = require('./services/crossTenantOblio');
+    startOblioCron();
 
     app.listen(PORT, '0.0.0.0', () => {
       console.log(`[xHUMANPRO] Backend running on http://0.0.0.0:${PORT}`);

@@ -169,6 +169,8 @@ async function recalculateStableCache(tenantId) {
     WHERE p.tenant_id = $1
       AND (COALESCE(p.erp_stock, 0) + COALESCE(p.supplier_stock, 0)) > 0
       AND COALESCE(p.sell_price, 0) > 0   -- Skip SKU senza prezzo (sync sporco): non sprecare click TP
+      -- OBLIO cross-tenant: SKU burner globali esclusi da TUTTI i tenant
+      AND NOT EXISTS (SELECT 1 FROM cross_tenant_oblio o WHERE o.sku = p.sku AND o.status = 'active')
       AND (
         (p.is_civetta = true AND (fa.action IS NULL OR fa.action NOT IN ('REMOVE')) AND fq.id IS NULL)
         OR

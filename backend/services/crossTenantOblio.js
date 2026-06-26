@@ -18,41 +18,52 @@ const POPOLA_BATCH_SIZE = 50;
  */
 async function findCrossTenantBurners(limit = 50, excludeSkus = []) {
   const { rows } = await pool.query(`
-    WITH ord_reali AS (
-      SELECT oi.sku, COUNT(DISTINCT o.id) AS ord_30d
+    -- Ordini reali Magento 90g (qualunque tenant)
+    WITH ord_reali_90d AS (
+      SELECT oi.sku, COUNT(DISTINCT o.id) AS ord_90d
       FROM orders o JOIN order_items oi ON oi.order_id=o.id
       WHERE o.order_status NOT IN ('canceled','closed','pending_payment')
-        AND o.order_date >= NOW() - INTERVAL '30 days'
+        AND o.order_date >= NOW() - INTERVAL '90 days'
       GROUP BY oi.sku
     ),
+    -- Sales seller/aggregated (FB fornisce 30d, fallback)
     sales_all AS (
       SELECT sku,
         SUM(COALESCE(sales_30d_seller,0)) AS store_tot,
         MAX(COALESCE(sales_30d_aggregated,0)) AS aggr_max
       FROM products GROUP BY sku
     ),
-    clicks_civetta AS (
-      SELECT p.sku,
-        MAX(p.product_name) AS product_name,
-        MAX(p.brand) AS brand,
-        COUNT(DISTINCT p.tenant_id) FILTER (WHERE phs.tp_clicks_30d>0) AS n_tenant,
-        SUM(phs.tp_clicks_30d) AS click_tot,
-        SUM(phs.tp_click_cost_30d) AS cost_tot
-      FROM products p
-      JOIN product_health_scores phs ON phs.tenant_id=p.tenant_id AND phs.sku=p.sku
-      WHERE p.is_civetta=true
-      GROUP BY p.sku
+    -- Click e cost 90g aggregati da feed_daily_tracking (per tenant + sku)
+    clicks_90d AS (
+      SELECT sku, tenant_id,
+        SUM(clicks) AS click_tot, SUM(click_cost) AS cost_tot
+      FROM feed_daily_tracking
+      WHERE track_date >= NOW() - INTERVAL '90 days'
+      GROUP BY sku, tenant_id HAVING SUM(clicks) > 0
+    ),
+    -- Aggregazione cross-tenant: n_tenant distinti + click/cost totale
+    cross_tenant AS (
+      SELECT c.sku,
+        COUNT(DISTINCT c.tenant_id) AS n_tenant,
+        SUM(c.click_tot) AS click_tot,
+        SUM(c.cost_tot) AS cost_tot
+      FROM clicks_90d c
+      GROUP BY c.sku
     )
-    SELECT c.sku, c.product_name, c.brand, c.n_tenant, c.click_tot, c.cost_tot
-    FROM clicks_civetta c
-    LEFT JOIN sales_all s ON s.sku = c.sku
-    LEFT JOIN ord_reali o ON o.sku = c.sku
-    WHERE c.n_tenant > 2
+    SELECT
+      ct.sku,
+      (SELECT MAX(product_name) FROM products WHERE sku=ct.sku) AS product_name,
+      (SELECT MAX(brand) FROM products WHERE sku=ct.sku) AS brand,
+      ct.n_tenant, ct.click_tot, ct.cost_tot
+    FROM cross_tenant ct
+    LEFT JOIN sales_all s ON s.sku = ct.sku
+    LEFT JOIN ord_reali_90d o ON o.sku = ct.sku
+    WHERE ct.n_tenant > 2
       AND COALESCE(s.store_tot,0) = 0
       AND COALESCE(s.aggr_max,0) = 0
-      AND COALESCE(o.ord_30d,0) = 0
-      AND ($2::text[] IS NULL OR NOT (c.sku = ANY($2::text[])))
-    ORDER BY c.cost_tot DESC
+      AND COALESCE(o.ord_90d,0) = 0
+      AND ($2::text[] IS NULL OR NOT (ct.sku = ANY($2::text[])))
+    ORDER BY ct.cost_tot DESC
     LIMIT $1
   `, [limit, excludeSkus.length > 0 ? excludeSkus : null]);
   return rows;
@@ -100,13 +111,13 @@ async function checkAndReleaseOblio() {
 
   const skuList = oblioSkus.map(o => o.sku);
 
-  // Verifica vendite (store, aggregated, reali) per ogni SKU
+  // Verifica vendite (store/aggregated 30d + ord reali 90g) per ogni SKU
   const { rows: stillBurner } = await pool.query(`
-    WITH ord_reali AS (
-      SELECT oi.sku, COUNT(DISTINCT o.id) AS ord_30d
+    WITH ord_reali_90d AS (
+      SELECT oi.sku, COUNT(DISTINCT o.id) AS ord_90d
       FROM orders o JOIN order_items oi ON oi.order_id=o.id
       WHERE o.order_status NOT IN ('canceled','closed','pending_payment')
-        AND o.order_date >= NOW() - INTERVAL '30 days'
+        AND o.order_date >= NOW() - INTERVAL '90 days'
       GROUP BY oi.sku
     ),
     sales_all AS (
@@ -117,10 +128,10 @@ async function checkAndReleaseOblio() {
       GROUP BY sku
     )
     SELECT s.sku
-    FROM sales_all s LEFT JOIN ord_reali o ON o.sku = s.sku
+    FROM sales_all s LEFT JOIN ord_reali_90d o ON o.sku = s.sku
     WHERE COALESCE(s.store_tot,0) = 0
       AND COALESCE(s.aggr_max,0) = 0
-      AND COALESCE(o.ord_30d,0) = 0
+      AND COALESCE(o.ord_90d,0) = 0
   `, [skuList]);
 
   const stillBurnerSet = new Set(stillBurner.map(r => r.sku));

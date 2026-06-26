@@ -619,22 +619,19 @@ async function triageProducts(tenantId, config, snapshot, ruleSet = null) {
 
     // A) KILLER — di norma via subito. Briglie larghe + protezione convertitori.
     if (p.is_killer) {
-      // Protezione: se ord (TP attribuiti O store sales O reali 30g) sono >= 2
-      // E il margine generato copre almeno il 50% del costo click → SKU profittevole,
-      // il flag killer è obsoleto (lo cleanup-eremo). Manteniamo in feed.
-      const ordsForCheck = Math.max(
-        parseInt(p.tp_attributed_orders) || 0,
-        parseInt(p.actual_ord_30d) || 0,
-        storeSales30dRaw
-      );
+      // Protezione: usiamo SOLO ordini reali Magento 30g (no tp_attributed,
+      // no GA4: l'utente vuole sempre valutare sui veri ordini).
+      // Se ordini reali >= 2 E margine generato copre >= 50% del costo click TP
+      // → SKU profittevole, killer obsoleto, mantengo in feed.
+      const realOrders30d = parseInt(p.actual_ord_30d) || 0;
       const marginEur = parseFloat(p.margin_eur) || (parseFloat(p.sell_price) - parseFloat(p.erp_cost)) || 0;
-      const profitGuard = ordsForCheck >= 2 && marginEur > 0
-        && (ordsForCheck * marginEur) >= (phs30dCost * 0.5);
+      const profitGuard = realOrders30d >= 2 && marginEur > 0
+        && (realOrders30d * marginEur) >= (phs30dCost * 0.5);
       if (profitGuard) {
         actions.keep.push({
           sku: p.sku, name: p.product_name, action: 'KEEP',
-          reason: `Killer obsoleto: ${ordsForCheck} ord × €${marginEur.toFixed(2)} = €${(ordsForCheck * marginEur).toFixed(2)} vs cost €${phs30dCost.toFixed(2)} → profitevole, mantengo`,
-          category: 'killer_obsoleto', cost: totalCost, clicks: totalClicks, orders: ordsForCheck,
+          reason: `Killer obsoleto: ${realOrders30d} ord reali × €${marginEur.toFixed(2)} = €${(realOrders30d * marginEur).toFixed(2)} vs cost €${phs30dCost.toFixed(2)} → profitevole, mantengo`,
+          category: 'killer_obsoleto', cost: totalCost, clicks: totalClicks, orders: realOrders30d,
         });
         stats.killer_release = (stats.killer_release || 0) + 1;
         continue;

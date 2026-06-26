@@ -118,6 +118,7 @@ app.use('/api/shopping', shoppingRoutes);
 app.use('/api/google-ads', googleAdsRoutes);
 app.use('/api/logs', logsRoutes);
 app.use('/api/ai-audit', aiAuditRoutes);
+app.use('/api/oblio', require('./routes/oblio'));
 
 // Start server
 async function start() {

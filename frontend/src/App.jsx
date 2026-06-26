@@ -25,6 +25,8 @@ import CrossChannel from './pages/CrossChannel';
 import Shopping from './pages/Shopping';
 import GoogleAdsSetup from './pages/GoogleAdsSetup';
 import Logs from './pages/Logs';
+import AiAudit from './pages/AiAudit';
+import Oblio from './pages/Oblio';
 
 export default function App() {
   const { loading, needsTenantSelection } = useAuth();
@@ -67,6 +69,12 @@ export default function App() {
                 <Route path="/cross-channel" element={<CrossChannel />} />
                 <Route path="/shopping" element={<Shopping />} />
                 <Route path="/feed-health" element={<Shopping />} />
+                <Route path="/ai-audit" element={
+                  <ProtectedRoute roles={['superadmin', 'admin', 'viewer']}><AiAudit /></ProtectedRoute>
+                } />
+                <Route path="/oblio" element={
+                  <ProtectedRoute roles={['superadmin', 'admin', 'viewer']}><Oblio /></ProtectedRoute>
+                } />
                 <Route path="/admin/google-ads" element={<GoogleAdsSetup />} />
                 <Route path="/logs" element={
                   <ProtectedRoute roles={['superadmin', 'admin']}><Logs /></ProtectedRoute>

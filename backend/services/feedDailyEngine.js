@@ -80,9 +80,12 @@ async function loadConfig(tenantId) {
     monthlyBudget: parseFloat(c.feed_monthly_budget || 2600),
     observationDays: parseInt(c.feed_observation_days || 3),
     // Quarantine escalation
-    q1Days: parseInt(c.feed_q1_days || 7),
-    q2Days: parseInt(c.feed_q2_days || 15),
-    q3Days: parseInt(c.feed_q3_days || 30),
+    // Quarantena escalation: Q1=3 Q2=7 Q3=15 Q4=30 Q5=60 (poi reset a Q1)
+    q1Days: parseInt(c.feed_q1_days || 3),
+    q2Days: parseInt(c.feed_q2_days || 7),
+    q3Days: parseInt(c.feed_q3_days || 15),
+    q4Days: parseInt(c.feed_q4_days || 30),
+    q5Days: parseInt(c.feed_q5_days || 60),
     // Safety-net: se un SKU vende N+ volte nello store negli ultimi 30g,
     // NON viene rimosso anche se figura come burner sul feed TP. Default 0
     // (disabilitato, manteniamo il comportamento storico). Settabile per
@@ -912,8 +915,12 @@ async function findPriceCutCandidates(tenantId, config, snapshot) {
         OR (
           COALESCE(p.margin, p.sell_price - p.erp_cost) > 0
           AND COALESCE(phs.tp_click_cost_30d, 0) > 0
+          -- SOLO ordini reali Magento (no tp_attributed)
           AND COALESCE(p.margin, p.sell_price - p.erp_cost)
-              * COALESCE(phs.tp_attributed_orders, 0)
+              * (SELECT COUNT(DISTINCT o.id) FROM orders o JOIN order_items oi ON oi.order_id=o.id
+                 WHERE o.tenant_id=p.tenant_id AND oi.sku=p.sku
+                 AND o.order_status NOT IN ('canceled','closed','pending_payment')
+                 AND o.order_date >= NOW() - INTERVAL '30 days')
               < COALESCE(phs.tp_click_cost_30d, 0) * 1.0
         )
       )
@@ -1225,10 +1232,14 @@ async function findStoreSellerPromotions(tenantId, config, snapshot, excludeSkus
           -- locale dimostrata, non serve passare il check sales_agg.
           COALESCE(p.sales_30d_seller, 0) >= 1
           OR COALESCE(p.sales_30d_aggregated, 0) >= $6
-          -- Bypass ord_tp_storici: SKU che vendeva via TP ma ora NON in civetta FB.
-          -- Spesso FB esclude SKU che invece convertono. Usiamo ord_tp >= 1 come
-          -- segnale forte di domanda specifica.
-          OR COALESCE(phs.tp_attributed_orders, 0) >= 1
+          -- Bypass ord_storici: SKU venduto >=1 volta su Magento ultimi 30g
+          -- (orders reali, no tp_attributed). Domanda comprovata.
+          OR EXISTS (
+            SELECT 1 FROM orders o JOIN order_items oi ON oi.order_id=o.id
+            WHERE o.tenant_id=p.tenant_id AND oi.sku=p.sku
+              AND o.order_status NOT IN ('canceled','closed','pending_payment')
+              AND o.order_date >= NOW() - INTERVAL '30 days'
+          )
         )
         AND phs.scraper_best_price > 0
         AND (
@@ -1487,8 +1498,13 @@ async function applyActions(tenantId, actions, config) {
       [tenantId, a.sku]
     );
     const prevLevel = prevQ.length > 0 ? parseInt(prevQ[0].quarantine_level) : 0;
-    const newLevel = Math.min(prevLevel + 1, 4);
-    const qDays = newLevel === 1 ? config.q1Days : newLevel === 2 ? config.q2Days : newLevel === 3 ? config.q3Days : 365;
+    // Escalation Q1->Q2->...->Q5, poi reset a Q1 (utente: "sblocca e ricomincia").
+    const newLevel = prevLevel >= 5 ? 1 : prevLevel + 1;
+    const qDays = newLevel === 1 ? config.q1Days
+                : newLevel === 2 ? config.q2Days
+                : newLevel === 3 ? config.q3Days
+                : newLevel === 4 ? config.q4Days
+                : config.q5Days;
 
     await pool.query(`
       INSERT INTO feed_quarantine (tenant_id, sku, quarantine_level, reason, quarantine_start, quarantine_end)

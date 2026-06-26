@@ -131,7 +131,12 @@ async function recalculateStableCache(tenantId) {
             WHERE phs.tenant_id = p.tenant_id AND phs.sku = p.sku
               AND (
                 COALESCE(phs.health_score, 0) >= 30
-                OR COALESCE(phs.tp_attributed_orders, 0) > 0
+                OR EXISTS (
+                  SELECT 1 FROM orders o JOIN order_items oi ON oi.order_id=o.id
+                  WHERE o.tenant_id=p.tenant_id AND oi.sku=p.sku
+                    AND o.order_status NOT IN ('canceled','closed','pending_payment')
+                    AND o.order_date >= NOW() - INTERVAL '30 days'
+                )
                 OR (phs.scraper_position IS NOT NULL AND phs.scraper_position <= 10
                     AND COALESCE(p.margin_pct, 0) >= 12
                     AND (COALESCE(p.erp_stock, 0) + COALESCE(p.supplier_stock, 0)) >= 3)

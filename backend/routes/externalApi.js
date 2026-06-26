@@ -124,6 +124,17 @@ async function recalculateStableCache(tenantId) {
     [tenantId]
   );
   const filterEnabled = filterCfgRows.length > 0 && filterCfgRows[0].config_value === 'true';
+  // Pre-compute SKU con ordini reali 30g (per evitare EXISTS nested = 92s timeout).
+  // Una sola scansione orders+order_items, poi JOIN nella query principale.
+  const ctePrefix = filterEnabled ? `
+    WITH skus_with_orders_30d AS (
+      SELECT DISTINCT oi.sku
+      FROM orders o JOIN order_items oi ON oi.order_id = o.id
+      WHERE o.tenant_id = $1
+        AND o.order_status NOT IN ('canceled','closed','pending_payment')
+        AND o.order_date >= NOW() - INTERVAL '30 days'
+    )` : '';
+
   const qualityFilter = filterEnabled ? `
         AND (
           EXISTS (
@@ -131,12 +142,6 @@ async function recalculateStableCache(tenantId) {
             WHERE phs.tenant_id = p.tenant_id AND phs.sku = p.sku
               AND (
                 COALESCE(phs.health_score, 0) >= 30
-                OR EXISTS (
-                  SELECT 1 FROM orders o JOIN order_items oi ON oi.order_id=o.id
-                  WHERE o.tenant_id=p.tenant_id AND oi.sku=p.sku
-                    AND o.order_status NOT IN ('canceled','closed','pending_payment')
-                    AND o.order_date >= NOW() - INTERVAL '30 days'
-                )
                 OR (phs.scraper_position IS NOT NULL AND phs.scraper_position <= 10
                     AND COALESCE(p.margin_pct, 0) >= 12
                     AND (COALESCE(p.erp_stock, 0) + COALESCE(p.supplier_stock, 0)) >= 3)
@@ -145,6 +150,7 @@ async function recalculateStableCache(tenantId) {
                     AND COALESCE(p.margin_pct, 0) >= 15)
               )
           )
+          OR EXISTS (SELECT 1 FROM skus_with_orders_30d so WHERE so.sku = p.sku)
           OR (COALESCE(p.erp_stock, 0) > 0 AND COALESCE(p.margin_pct, 0) >= 18)
           OR COALESCE(p.margin_pct, 0) >= 22
           -- Estensione utente 25/6: grossista valido + MOL discreto + prezzo non bagatelle
@@ -155,6 +161,7 @@ async function recalculateStableCache(tenantId) {
 
   // Build civetta=1 list (keep in feed)
   const { rows: keepProducts } = await pool.query(`
+    ${ctePrefix}
     SELECT p.sku
     FROM products p
     LEFT JOIN feed_actions fa ON fa.tenant_id = p.tenant_id AND fa.sku = p.sku

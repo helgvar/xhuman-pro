@@ -617,9 +617,28 @@ async function triageProducts(tenantId, config, snapshot, ruleSet = null) {
       continue;
     }
 
-    // A) KILLER — di norma via subito. Briglie larghe: se vende nello store
-    // sopra soglia, MONITOR invece di REMOVE.
+    // A) KILLER — di norma via subito. Briglie larghe + protezione convertitori.
     if (p.is_killer) {
+      // Protezione: se ord (TP attribuiti O store sales O reali 30g) sono >= 2
+      // E il margine generato copre almeno il 50% del costo click → SKU profittevole,
+      // il flag killer è obsoleto (lo cleanup-eremo). Manteniamo in feed.
+      const ordsForCheck = Math.max(
+        parseInt(p.tp_attributed_orders) || 0,
+        parseInt(p.actual_ord_30d) || 0,
+        storeSales30dRaw
+      );
+      const marginEur = parseFloat(p.margin_eur) || (parseFloat(p.sell_price) - parseFloat(p.erp_cost)) || 0;
+      const profitGuard = ordsForCheck >= 2 && marginEur > 0
+        && (ordsForCheck * marginEur) >= (phs30dCost * 0.5);
+      if (profitGuard) {
+        actions.keep.push({
+          sku: p.sku, name: p.product_name, action: 'KEEP',
+          reason: `Killer obsoleto: ${ordsForCheck} ord × €${marginEur.toFixed(2)} = €${(ordsForCheck * marginEur).toFixed(2)} vs cost €${phs30dCost.toFixed(2)} → profitevole, mantengo`,
+          category: 'killer_obsoleto', cost: totalCost, clicks: totalClicks, orders: ordsForCheck,
+        });
+        stats.killer_release = (stats.killer_release || 0) + 1;
+        continue;
+      }
       if (config.killerSkipMinStoreSales > 0 && storeSales30dRaw >= config.killerSkipMinStoreSales) {
         actions.monitor.push({
           sku: p.sku, name: p.product_name, action: 'MONITOR',

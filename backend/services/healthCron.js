@@ -31,6 +31,8 @@ const log = require('./logger');
 
 let cronTimer = null;
 let _cronRunning = false; // Prevent overlapping cron runs
+let _cronRunningSince = null;
+const HEALTHCRON_LOCK_MAX_AGE_MS = 90 * 60 * 1000; // 90min: oltre questo, lock zombie
 const INTERVAL_MS = 1 * 60 * 60 * 1000; // 1 hour
 // Lo stato "ultimo sync MC" viene letto direttamente da merchant_center_runs:
 // la Map in-memory si resettava ad ogni restart container facendo perdere il
@@ -74,14 +76,20 @@ async function withStepTimeout(stepName, tenantId, tenantName, fn, timeoutMs) {
 
 async function runForAllTenants() {
   if (_cronRunning) {
-    console.log('[HealthCron] Previous run still in progress, skipping');
-    return [];
+    const ageMs = _cronRunningSince ? Date.now() - _cronRunningSince : 0;
+    if (ageMs < HEALTHCRON_LOCK_MAX_AGE_MS) {
+      console.log(`[HealthCron] Previous run still in progress (${Math.round(ageMs / 60000)}min), skipping`);
+      return [];
+    }
+    console.warn(`[HealthCron] Lock zombie da ${Math.round(ageMs / 60000)}min, forzato reset (anti-stuck)`);
   }
   _cronRunning = true;
+  _cronRunningSince = Date.now();
   try {
     return await _runForAllTenantsInner();
   } finally {
     _cronRunning = false;
+    _cronRunningSince = null;
   }
 }
 
@@ -197,11 +205,12 @@ async function _runForAllTenantsInner() {
 
       // Step 1: Health scores (timeout 1800s = 30 min). San Vito (800k SKU)
       // richiede 12-15 min. Skip se ultima esecuzione con successo entro
-      // SKIP_THRESHOLD: lookup MAX(updated_at) in product_health_scores per
-      // capire se serve girare ora o se i dati sono già freschi.
+      // SKIP_THRESHOLD: usa computed_at (vero timestamp del ricalcolo punteggi);
+      // updated_at viene toccato anche da observation_window/classification e
+      // produceva false-skip per ore (bug 6-9/6/2026).
       {
         const { rows } = await pool.query(
-          `SELECT MAX(updated_at) AS last_ok
+          `SELECT MAX(computed_at) AS last_ok
            FROM product_health_scores WHERE tenant_id=$1`, [tenant.id]
         );
         const lastOkSec = rows[0]?.last_ok ? (Date.now() - new Date(rows[0].last_ok).getTime()) / 1000 : Infinity;
@@ -253,9 +262,9 @@ async function _runForAllTenantsInner() {
         }
       }
 
-      // Step 3: Feed Daily Engine (timeout 120s)
+      // Step 3: Feed Daily Engine (timeout 300s - query con JOIN orders può richiedere tempo)
       await withStepTimeout('feed_daily', tenant.id, tLabel,
-        () => runDailyFeedEngine(tenant.id), 120 * 1000);
+        () => runDailyFeedEngine(tenant.id), 300 * 1000);
 
       // Step 4: Reactivations (timeout 60s)
       await withStepTimeout('reactivations', tenant.id, tLabel,

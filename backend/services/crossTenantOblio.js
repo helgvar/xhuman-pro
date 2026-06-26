@@ -174,10 +174,11 @@ function startOblioCron() {
   if (cronStarted) return;
   cronStarted = true;
 
-  // Daily check ore 03:00 UTC
-  scheduleDaily(3, 0, async () => {
+  // Check vendite ogni 6h (00:30, 06:30, 12:30, 18:30 UTC) per rilasciare
+  // SKU che iniziano a vendere
+  scheduleEveryHours(6, 30, async () => {
     try { await checkAndReleaseOblio(); }
-    catch (e) { console.error('[OBLIO] daily check error:', e.message); }
+    catch (e) { console.error('[OBLIO] 6h check error:', e.message); }
   });
 
   // Weekly populate giovedì 02:00 UTC (getDay()=4)
@@ -186,20 +187,22 @@ function startOblioCron() {
     catch (e) { console.error('[OBLIO] weekly populate error:', e.message); }
   });
 
-  console.log('[OBLIO] Cron started: daily check 03:00 UTC, weekly populate Thu 02:00 UTC');
+  console.log('[OBLIO] Cron started: 6h release check, weekly populate Thu 02:00 UTC');
 }
 
-function scheduleDaily(hourUTC, minuteUTC, fn) {
-  const tick = () => {
-    const now = new Date();
-    const next = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), hourUTC, minuteUTC, 0));
-    if (next <= now) next.setUTCDate(next.getUTCDate() + 1);
-    setTimeout(async () => {
-      await fn();
-      tick();
-    }, next.getTime() - now.getTime());
-  };
-  tick();
+function scheduleEveryHours(hours, minuteOffset, fn) {
+  const intervalMs = hours * 3600 * 1000;
+  // Trova prossimo slot allineato (es. 00:30, 06:30, 12:30, 18:30)
+  const now = new Date();
+  const slotMinutes = minuteOffset;
+  const currentMs = now.getUTCHours() * 3600000 + now.getUTCMinutes() * 60000 + now.getUTCSeconds() * 1000;
+  const slotAlignMs = (Math.floor(currentMs / intervalMs) + 1) * intervalMs + slotMinutes * 60000;
+  const dayStartMs = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+  const firstFire = dayStartMs + slotAlignMs;
+  setTimeout(() => {
+    fn();
+    setInterval(fn, intervalMs);
+  }, firstFire - now.getTime());
 }
 
 function scheduleWeekly(dayUTC, hourUTC, minuteUTC, fn) {

@@ -566,6 +566,22 @@ async function triageProducts(tenantId, config, snapshot, ruleSet = null) {
       phs30dClicks >= config.safetyNetMinClicksForCheck &&
       skuBurnIncidence > config.safetyNetMaxIncidencePct;
 
+    // ─── PROTEZIONE GLOBALE: SKU CON ORDINI REALI ─────
+    // REGOLA CARDINALE (cfr. feedback_solo_ordini_reali_magento):
+    // un SKU che vende davvero (ordini reali Magento >= 2) E genera margine
+    // sufficiente a coprire il costo click TP NON puo' uscire dal feed
+    // per nessuna ragione (no killer, no bruciatore, no budget_cut, no
+    // no_scraper_position, no quarantena scaduta). L'unica eccezione e'
+    // la quarantena ATTIVA (DB), gestita subito sotto.
+    //
+    // Formula: real_orders × margin_eur >= cost_click × 0.5
+    // (= il margine generato copre almeno il 50% della spesa TP).
+    const realOrders30d = parseInt(p.actual_ord_30d) || 0;
+    const marginEurForGuard = parseFloat(p.margin_eur) || (parseFloat(p.sell_price) - parseFloat(p.erp_cost)) || 0;
+    const realRevMargine = realOrders30d * marginEurForGuard;
+    const profitGuardActive = realOrders30d >= 2 && marginEurForGuard > 0
+      && realRevMargine >= (phs30dCost * 0.5);
+
     // STOCK SAFETY NET — protezione massima per SKU con magazzino fisico
     // (erp+supplier) e MOL adeguato. Logica: investimento gia' fatto sul
     // magazzino, brand premium / consumabili / linee in linea con la farmacia.
@@ -594,6 +610,18 @@ async function triageProducts(tenantId, config, snapshot, ruleSet = null) {
         stats.stock_safety_net = (stats.stock_safety_net || 0) + 1;
         continue;
       }
+    }
+
+    // PROFIT GUARD — SKU con ordini reali profittevoli mai REMOVE (cfr. sopra).
+    // Eccezione UNICA: quarantena attiva (gestita subito sotto, in DB).
+    if (profitGuardActive && !p.is_quarantined) {
+      actions.keep.push({
+        sku: p.sku, name: p.product_name, action: 'KEEP',
+        reason: `Profit guard: ${realOrders30d} ord reali × €${marginEurForGuard.toFixed(2)} = €${realRevMargine.toFixed(2)} vs cost €${phs30dCost.toFixed(2)} → profitevole`,
+        category: 'profit_guard', cost: totalCost, clicks: totalClicks, orders: realOrders30d,
+      });
+      stats.profit_guard = (stats.profit_guard || 0) + 1;
+      continue;
     }
 
     // Already quarantined → di norma REMOVE. Briglie larghe: se vende nello

@@ -15,6 +15,7 @@ const GLOBAL_KEYS = new Set([
   'google_ads_oauth_client_secret',
   'google_ads_oauth_refresh_token',
   'google_ads_login_customer_id',
+  'killer_detection_paused_until',
 ]);
 
 const _cache = new Map();

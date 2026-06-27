@@ -379,6 +379,18 @@ async function updateDailyTracking(tenantId, config) {
 // ─── FASE 3: KILLER DETECTION ──────────────────────────
 
 async function detectKillers(tenantId) {
+  // Pausa globale killer detection (gestita via global_config.killer_detection_paused_until).
+  // Set dal 27/6/2026 fino al 1/7/2026 italia: fine mese le persone non comprano in attesa
+  // ricarica carte, evita falsi positivi. Le regole OBLIO restano attive.
+  try {
+    const { getGlobal } = require('./globalConfig');
+    const pausedUntil = await getGlobal('killer_detection_paused_until');
+    if (pausedUntil && new Date(pausedUntil) > new Date()) {
+      console.log(`[FeedDaily] Killer detection PAUSED fino a ${pausedUntil} (global flag)`);
+      return [];
+    }
+  } catch (e) {}
+
   // Killer DINAMICO basato su RAPPORTO VENDITE/COSTO (cfr. utente 25/6/2026):
   //
   // Bilancio TP 30g = (ordini_TP * margine_eur) - costo_click_30g
@@ -1487,8 +1499,20 @@ async function applyActions(tenantId, actions, config) {
     }
   }
 
+  // Pausa globale quarantine insert (allineata a killer detection)
+  let quarantinePaused = false;
+  try {
+    const { getGlobal } = require('./globalConfig');
+    const pausedUntil = await getGlobal('killer_detection_paused_until');
+    if (pausedUntil && new Date(pausedUntil) > new Date()) {
+      quarantinePaused = true;
+      console.log(`[FeedDaily] Quarantine insert PAUSED fino a ${pausedUntil}`);
+    }
+  } catch (e) {}
+
   // Apply quarantines for NEW REMOVE only (not already quarantined)
   for (const a of actions.remove) {
+    if (quarantinePaused) break;
     if (a.category === 'quarantined') continue; // Already in quarantine
     const days = a.quarantineDays || config.q1Days;
 

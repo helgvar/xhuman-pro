@@ -379,44 +379,35 @@ async function updateDailyTracking(tenantId, config) {
 // ─── FASE 3: KILLER DETECTION ──────────────────────────
 
 async function detectKillers(tenantId) {
-  // Pausa globale killer detection (gestita via global_config.killer_detection_paused_until).
-  // Set dal 27/6/2026 fino al 1/7/2026 italia: fine mese le persone non comprano in attesa
-  // ricarica carte, evita falsi positivi. Le regole OBLIO restano attive.
-  try {
-    const { getGlobal } = require('./globalConfig');
-    const pausedUntil = await getGlobal('killer_detection_paused_until');
-    if (pausedUntil && new Date(pausedUntil) > new Date()) {
-      console.log(`[FeedDaily] Killer detection PAUSED fino a ${pausedUntil} (global flag)`);
-      return [];
-    }
-  } catch (e) {}
+  // REGOLA KILLER PULITA (29/6/2026, utente):
+  // Killer = SKU che bruciano CLICK e NON GENERANO VENDITE su nessun tenant.
+  //
+  // Criterio:
+  //   - click 30g >= clickThreshold (default 20)
+  //   - 0 ordini cross-tenant 30g (su NESSUN tenant della rete xHumanPro)
+  //   - cost 30g > 2€ (filtra noise di pochi cent)
+  //
+  // Niente formule di rapporto vendite/costo. Niente killer solo per margine basso.
+  // Se ha click e non vende anche solo su 1 tenant → bruciatore puro.
+  //
+  // Override via health_config:
+  //   - killer_click_min (default 20)
+  //   - killer_cost_min_eur (default 2)
+  const { rows: cfg } = await pool.query(
+    `SELECT config_key, config_value FROM health_config
+     WHERE tenant_id = $1 AND config_key IN ('killer_click_min','killer_cost_min_eur')
+       AND (expires_at IS NULL OR expires_at > NOW())`,
+    [tenantId]
+  );
+  const c = Object.fromEntries(cfg.map(r => [r.config_key, r.config_value]));
+  const clickMin = parseInt(c.killer_click_min || 20);
+  const costMinEur = parseFloat(c.killer_cost_min_eur || 2);
 
-  // Killer DINAMICO basato su RAPPORTO VENDITE/COSTO (cfr. utente 25/6/2026):
-  //
-  // Bilancio TP 30g = (ordini_TP * margine_eur) - costo_click_30g
-  // Killer SE bilancio < 0 di una quota significativa del costo.
-  //
-  // Formula: killer se costo_click - (ord * margin) > 50% del costo_click
-  //          ovvero (ord * margin) < costo_click * 0.5
-  //
-  // Esempio MPF 949645295: 90 click / €25 cost / 2 ord / margin €1.11
-  //   = profitto = 2 * 1.11 - 25 = -22.78 (perdita totale)
-  //   = orders*margin (€2.22) < cost*0.5 (€12.5) → KILLER
-  //
-  // Esempio Aspirina: 5 click / €1.35 cost / 0 ord / margin €2
-  //   = orders*margin (€0) < cost*0.5 (€0.68) → KILLER
-  //
-  // Esempio Tachipirina: 100 click / €27 cost / 30 ord / margin €1.5
-  //   = orders*margin (€45) > cost*0.5 (€13.5) → NON KILLER
-  //
-  // Ordini considerati: GREATEST tra tp_attributed_orders e actual orders 30g
-  // (per coprire i casi GA4 KO).
   const { rows: killers } = await pool.query(`
-    WITH actual_orders_30d AS (
+    WITH cross_orders_30d AS (
       SELECT oi.sku, COUNT(DISTINCT o.id) as ord_30d
       FROM orders o JOIN order_items oi ON oi.order_id = o.id
-      WHERE o.tenant_id = $1
-        AND o.order_status NOT IN ('canceled','closed','pending_payment')
+      WHERE o.order_status NOT IN ('canceled','closed','pending_payment')
         AND o.order_date >= NOW() - INTERVAL '30 days'
       GROUP BY oi.sku
     )
@@ -427,29 +418,19 @@ async function detectKillers(tenantId) {
       COALESCE(p.margin, p.sell_price - p.erp_cost) as margin_eur,
       COALESCE(phs.tp_click_cost_30d, 0) as cost_30d,
       COALESCE(phs.tp_clicks_30d, 0) as clicks_30d,
-      COALESCE(ao.ord_30d, 0) as orders_30d,
-      COALESCE(p.margin, p.sell_price - p.erp_cost) *
-        COALESCE(ao.ord_30d, 0) as revenue_margine_30d
+      0 as orders_30d
     FROM products p
     JOIN product_health_scores phs ON phs.sku = p.sku AND phs.tenant_id = p.tenant_id
     LEFT JOIN feed_killers fk ON fk.sku = p.sku AND fk.tenant_id = p.tenant_id AND fk.is_active = true
-    LEFT JOIN actual_orders_30d ao ON ao.sku = p.sku
+    LEFT JOIN cross_orders_30d ao ON ao.sku = p.sku
     WHERE p.tenant_id = $1
       AND p.is_civetta = true
       AND fk.id IS NULL
-      -- REGOLA CARDINALE (feedback_solo_ordini_reali_magento):
-      -- mai killer se vendite Magento reali >= 2 (anche se TP perde soldi,
-      -- l'SKU ha domanda → meglio PRICE_CUT, non REMOVE).
-      AND COALESCE(ao.ord_30d, 0) < 2
-      AND COALESCE(phs.tp_clicks_30d, 0) >= 3
-      AND COALESCE(phs.tp_click_cost_30d, 0) > 0
-      AND COALESCE(p.margin, p.sell_price - p.erp_cost) > 0
-      -- Burner: margine generato (ord_reali * margin) < cost * 0.5
-      AND COALESCE(p.margin, p.sell_price - p.erp_cost)
-          * COALESCE(ao.ord_30d, 0)
-          < COALESCE(phs.tp_click_cost_30d, 0) * 0.5
+      AND COALESCE(ao.ord_30d, 0) = 0
+      AND COALESCE(phs.tp_clicks_30d, 0) >= $2
+      AND COALESCE(phs.tp_click_cost_30d, 0) >= $3
     ORDER BY phs.tp_click_cost_30d DESC
-  `, [tenantId]);
+  `, [tenantId, clickMin, costMinEur]);
 
   let inserted = 0;
   for (const k of killers) {
@@ -461,7 +442,7 @@ async function detectKillers(tenantId) {
         quarantine_until = NOW() + INTERVAL '30 days', is_active = true, detected_at = NOW()
     `, [
       tenantId, k.sku, k.sellers, k.global_demand, k.our_position,
-      `Killer dinamico: bilancio TP 30g €${(parseFloat(k.revenue_margine_30d) - parseFloat(k.cost_30d)).toFixed(2)} (${k.clicks_30d} click €${parseFloat(k.cost_30d).toFixed(2)} - ${k.orders_30d} ord × €${parseFloat(k.margin_eur).toFixed(2)} margin = €${parseFloat(k.revenue_margine_30d).toFixed(2)} ricavo) - rapporto vendite/costo insufficiente`
+      `Bruciatore: ${k.clicks_30d} click 30g (€${parseFloat(k.cost_30d).toFixed(2)} spesi) e 0 vendite cross-tenant`
     ]);
     inserted++;
   }

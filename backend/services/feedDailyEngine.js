@@ -1771,6 +1771,19 @@ async function runDailyFeedEngine(tenantId) {
     console.warn('[FeedDaily] optimization_log write failed:', logErr.message);
   }
 
+  // Aggiorna feed_last_run in health_config (letto dal frontend Dashboard).
+  // Il vecchio feedEngine.js scriveva questo campo ma è stato deprecato: senza
+  // questo update la UI mostrava sempre 26/05/2026.
+  try {
+    await pool.query(`
+      INSERT INTO health_config (tenant_id, config_key, config_value, updated_at)
+      VALUES ($1, 'feed_last_run', $2, NOW())
+      ON CONFLICT (tenant_id, config_key) DO UPDATE SET config_value=$2, updated_at=NOW()
+    `, [tenantId, new Date().toISOString()]);
+  } catch (e) {
+    console.warn('[FeedDaily] feed_last_run update failed:', e.message);
+  }
+
   // AI audit (fire-and-forget, non blocca; throttle interno 30 min).
   // Errori AI vengono solo loggati: l'engine procede normalmente.
   try {

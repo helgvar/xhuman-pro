@@ -59,19 +59,33 @@ function pickMatchingRule(rules, cost) {
   if (applicable.length === 0) {
     return { targetPos: DEFAULT_TARGET_POS, minRicarico: DEFAULT_MIN_RICARICO, ruleName: null };
   }
-  // Usa MAX posizione (per pescare il maggior numero di pepite candidate) e
-  // MAX ricarico (soglia più restrittiva per la promozione).
-  const targetPos = Math.max(...applicable.map(r => r.to_pos || DEFAULT_TARGET_POS));
-  const minRicarico = Math.max(...applicable.map(r => r.ricarico_pct || DEFAULT_MIN_RICARICO));
-  const ruleWithMaxPos = applicable.find(r => r.to_pos === targetPos);
-  return { targetPos, minRicarico, ruleName: ruleWithMaxPos?.rule_name };
+  // Ignora regole "sospette" SKU/brand-specifiche con recharge_pct anomalo:
+  // - regole il cui nome inizia con un codice SKU numerico (>= 8 cifre)
+  // - regole con recharge_pct < 15 (sotto mantra MOL 15% hard floor)
+  const generic = applicable.filter(r => {
+    const name = (r.rule_name || '').trim();
+    const startsWithSku = /^\d{8,}/.test(name); // es. "975816315 Colpharma..."
+    return !startsWithSku && (r.ricarico_pct || 0) >= DEFAULT_MIN_RICARICO;
+  });
+  const pool = generic.length > 0 ? generic : applicable;
+
+  // Target posizione: MIN (regola più stringente = definisce top competitivo reale)
+  // Ricarico minimo: MIN sopra il floor 15% (mantra MOL, mai sotto)
+  const targetPos = Math.min(...pool.map(r => r.to_pos || DEFAULT_TARGET_POS));
+  const minRicaricoRaw = Math.min(...pool.map(r => r.ricarico_pct || DEFAULT_MIN_RICARICO));
+  const minRicarico = Math.max(DEFAULT_MIN_RICARICO, minRicaricoRaw);
+  const ruleWithMinPos = pool.find(r => r.to_pos === targetPos);
+  return { targetPos, minRicarico, ruleName: ruleWithMinPos?.rule_name };
 }
 
 async function findPepiteForTenant(tenantId, tenantName) {
   const rules = await getTenantRuleTargets(tenantId);
 
-  const globalMaxTargetPos = rules.length > 0
-    ? Math.max(...rules.map(r => r.to_pos || DEFAULT_TARGET_POS))
+  // Prefiltro grezzo: usa MIN pos delle regole per pescare TUTTI gli SKU sotto
+  // la regola più stringente. Il filtro fine per regola-fascia avviene dopo
+  // in pickMatchingRule (che confronta pos SKU vs target-fascia specifico).
+  const globalMinTargetPos = rules.length > 0
+    ? Math.min(...rules.map(r => r.to_pos || DEFAULT_TARGET_POS))
     : DEFAULT_TARGET_POS;
 
   // Candidati grezzi: SKU sotto pos target + vendite + stock
@@ -90,10 +104,11 @@ async function findPepiteForTenant(tenantId, tenantName) {
       AND p.is_civetta = true
       AND p.sales_30d_seller > 0
       AND p.erp_stock > 0
-      AND p.erp_cost > 0
+      AND p.erp_cost >= 0.50          -- filtro bug dati: costo troppo basso = sync errato
+      AND p.sell_price >= 0.50
       AND phs.scraper_position > $2
-      AND phs.scraper_best_price > 0
-  `, [tenantId, globalMaxTargetPos]);
+      AND phs.scraper_best_price >= 0.50
+  `, [tenantId, globalMinTargetPos]);
 
   // Filtra per ricarico post-cut ≥ min richiesto per la fascia
   const pepite = [];
@@ -176,7 +191,7 @@ async function findPepiteForTenant(tenantId, tenantName) {
     ]);
   }
 
-  return { tenantName, found: pepite.length, targetPos: globalMaxTargetPos, pepite };
+  return { tenantName, found: pepite.length, targetPos: globalMinTargetPos, pepite };
 }
 
 async function runMonitor() {

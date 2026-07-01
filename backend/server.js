@@ -27,6 +27,9 @@ const TELEGRAM_EXCLUDE_PATTERNS = [
   /Step TIMEOUT: (health_scores|mc_sync|civetta_sync) on /i,
   /Magento API error 401/i,
   /The operation was aborted due to timeout/i,
+  // Magento 5xx (Cloudflare origin down/timeout): retry gestito da apiQueue,
+  // l'alert via AlertMonitor lo raggruppa già per tenant. Inutile spam.
+  /Magento API error 5\d\d/i,
 ];
 
 process.on('unhandledRejection', (reason, promise) => {
@@ -173,6 +176,10 @@ async function start() {
     // Weekend Learning: analisi lunedì 30/6 23:00 italia
     const { startWeekendLearningCron } = require('./services/weekendLearning');
     startWeekendLearningCron();
+
+    // Pepite Monitor: ogni 4h scova SKU in Salva Bilancio attivabili in top competitiva
+    const { startPepiteCron } = require('./services/pepiteMonitor');
+    startPepiteCron();
 
     app.listen(PORT, '0.0.0.0', () => {
       console.log(`[xHUMANPRO] Backend running on http://0.0.0.0:${PORT}`);

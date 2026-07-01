@@ -1144,28 +1144,32 @@ async function findPepite(tenantId, config, snapshot, removedCost) {
 //   sell_price < 10€   → margin_pct ≥ 18
 //   10€ ≤ p < 30€      → margin_pct ≥ 14
 //   sell_price ≥ 30€   → margin_pct ≥ 12
-// Helper: regola di accettazione cut. MANTRA: Fatturato UP, MOL ~20%, Costo TP DOWN.
-// HARD FLOOR MOL 15% (mai accettato sotto, cfr. feedback_mol_3_fasce). Sopra
-// 15% accettiamo tutti — l'ORDER BY del chiamante priorizza SKU con margin_eur
+// Helper: regola di accettazione cut. MANTRA: Fatturato UP, Ricarico >= 15%, Costo TP DOWN.
+// HARD FLOOR RICARICO 15% (mai accettato sotto, cfr. feedback_ricarico_non_margine).
+// RICARICO = (prezzo - costo) / COSTO × 100 (formula Farmabooster).
+// NON margine = (prezzo - costo) / PREZZO × 100.
+// Il ricarico 15% è più permissivo del margine 15% (es. costo €10 + ricarico 15% = prezzo €11.50
+// = margine 13%, mentre margine 15% = prezzo €11.76 = ricarico 17.65%).
+// Sopra 15% accettiamo tutti — l'ORDER BY del chiamante priorizza SKU con margin_eur
 // post-cut piu' alto, quindi i piu' redditizi entrano per primi nel LIMIT.
 // Salva Bilancio EUR e' un AND (no fallback %): per fascia >= 30€ richiediamo
-// ANCHE che il margine assoluto sia >= soglia (default €3): non promuoviamo
-// SKU costosi con €1 di margine assoluto perche' anche con MOL 15% sarebbe
-// strategicamente debole.
+// ANCHE che il margine assoluto sia >= soglia (default €3).
 function isCutAcceptable(newPrice, erpCost, salvaBilancioMinEur) {
   if (newPrice <= erpCost) return { ok: false };
   const marginEur = newPrice - erpCost;
+  const ricaricoPct = (marginEur / erpCost) * 100;
+  // margin % mantenuto per compatibilita' log/report
   const marginPct = (marginEur / newPrice) * 100;
 
-  // HARD FLOOR MOL 15% — mantra, mai sotto
-  if (marginPct < 15) return { ok: false, marginEur, marginPct, reason: 'sotto MOL hard floor 15%' };
+  // HARD FLOOR RICARICO 15% — mantra, mai sotto
+  if (ricaricoPct < 15) return { ok: false, marginEur, marginPct, ricaricoPct, reason: `sotto ricarico hard floor 15% (${ricaricoPct.toFixed(1)}%)` };
 
-  // Fascia >= 30€: HARD FLOOR 15% + Salva Bilancio (margine assoluto minimo)
+  // Fascia >= 30€: HARD FLOOR + Salva Bilancio (margine assoluto minimo)
   if (newPrice >= 30 && marginEur < salvaBilancioMinEur) {
-    return { ok: false, marginEur, marginPct, reason: `margin_eur ${marginEur.toFixed(2)} < SB ${salvaBilancioMinEur} (fascia ≥30€)` };
+    return { ok: false, marginEur, marginPct, ricaricoPct, reason: `margin_eur ${marginEur.toFixed(2)} < SB ${salvaBilancioMinEur} (fascia ≥30€)` };
   }
 
-  // OK: sopra floor 15% (e per fascia ≥30€ anche Salva Bilancio EUR ok)
+  // OK: sopra floor ricarico 15% (e per fascia ≥30€ anche Salva Bilancio EUR ok)
   return { ok: true, marginEur, marginPct, tier: 15, okBy: marginPct >= 20 ? 'target_20+' : 'floor_15' };
 }
 

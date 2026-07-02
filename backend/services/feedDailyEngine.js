@@ -402,6 +402,12 @@ async function detectKillers(tenantId) {
   const c = Object.fromEntries(cfg.map(r => [r.config_key, r.config_value]));
   const clickMin = parseInt(c.killer_click_min || 20);
   const costMinEur = parseFloat(c.killer_cost_min_eur || 2);
+  // killer_protected_brands: lista brand tenant-specific da NON killare mai
+  // (default nessuno, per MPF impostare 'UNI,GAD,MYC' via health_config).
+  // stock_safety_top_pos: se true, escludi anche SKU stock>=stockSafetyNetMinUnits + pos<=3.
+  const protectedBrands = (c.killer_protected_brands || '')
+    .split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
+  const killerStockSafetyTopPos = (c.killer_stock_safety_top_pos || '0') === '1';
 
   const { rows: killers } = await pool.query(`
     WITH cross_orders_30d AS (
@@ -429,16 +435,19 @@ async function detectKillers(tenantId) {
       AND COALESCE(ao.ord_30d, 0) = 0
       AND COALESCE(phs.tp_clicks_30d, 0) >= $2
       AND COALESCE(phs.tp_click_cost_30d, 0) >= $3
-      -- Regola cardinale [[feedback_killer_bulk_check_before]]:
-      -- MAI killer su brand protetti UNI/GAD/MYC (regola cliente 26/6/2026)
-      -- e mai su SKU con stock+MOL alto (safety net magazzino farmacia).
-      AND COALESCE(p.brand,'') NOT IN ('UNI','GAD','MYC')
+      -- Brand protetti PER-TENANT via health_config.killer_protected_brands
+      -- ($4 array). Default vuoto: nessun brand escluso.
+      AND ($4::text[] = '{}' OR COALESCE(UPPER(p.brand),'') <> ALL($4::text[]))
+      -- Stock safety net top-pos PER-TENANT via killer_stock_safety_top_pos.
+      -- Se $5=true, escludi anche SKU stock>=10 + pos<=3 (magazzino investito
+      -- + gia' in vetrina TP).
       AND NOT (
-        COALESCE(p.erp_stock, 0) >= 10
+        $5::boolean = true
+        AND COALESCE(p.erp_stock, 0) >= 10
         AND COALESCE(phs.scraper_position, 99) <= 3
       )
     ORDER BY phs.tp_click_cost_30d DESC
-  `, [tenantId, clickMin, costMinEur]);
+  `, [tenantId, clickMin, costMinEur, protectedBrands, killerStockSafetyTopPos]);
 
   let inserted = 0;
   for (const k of killers) {

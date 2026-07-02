@@ -1133,36 +1133,107 @@ async function findPepite(tenantId, config, snapshot, removedCost) {
   const availableBudget = removedCost * (rules.budget_split_pct / 100);
   if (availableBudget < rules.min_budget_eur) return [];
 
+  // CARDINALE (cfr. [[feedback_regole_tecniche_tp_e_feed]] + [[feedback_add_da_salvabilancio_con_pc]]):
+  // xHumanPro è la fonte del CSV TP. Attivare civetta su SKU fuori pos target =
+  // pagare click improduttivi. Le pepite si pescano DAL SALVA BILANCIO (pos > target)
+  // solo se hanno stock + vendite + margine da tagliare per applicare un PC che le
+  // riporti in pos vendibile mantenendo ricarico >= 15%.
+  const { rows: ruleTargets } = await pool.query(
+    `SELECT MAX((rule_data->>'scraper_position')::int) AS max_pos_target
+     FROM price_rules
+     WHERE tenant_id = $1 AND is_active = true AND rule_type = 'ricarico'
+       AND (rule_data->>'scraper_position')::int > 0`,
+    [tenantId]
+  );
+  const maxPosTarget = ruleTargets[0]?.max_pos_target || 10;
+  console.log(`[FeedDaily] Pepite pos target letto da regole prezzo: <=${maxPosTarget}`);
+
+  // GOLDEN: SKU non-civetta che sono GIÀ in pos target (top-competitivi), con
+  // vendite e stock. Attivare civetta è sufficiente, no PC.
   const goldenRows = await queryPepiteTier(
-    tenantId, 1, rules.golden.position_max,
+    tenantId, 1, Math.min(rules.golden.position_max, maxPosTarget),
     rules.golden.margin_min, rules.golden.sales_min, rules.golden.limit
   );
 
-  let silverRows = [];
-  if (rules.silver.enabled) {
-    silverRows = await queryPepiteTier(
-      tenantId, rules.silver.position_min, rules.silver.position_max,
-      rules.silver.margin_min, rules.silver.sales_min, rules.silver.limit
-    );
-    // Dedup: se per qualche motivo un SKU compare in entrambi (es. range che si
-    // sovrappone in config custom), tieni solo Golden.
-    const goldenSkus = new Set(goldenRows.map(r => r.sku));
-    silverRows = silverRows.filter(r => !goldenSkus.has(r.sku));
-  }
+  // SILVER (nuova logica): SKU in Salva Bilancio (pos > target) con stock, vendite
+  // e margine da tagliare. Attivare civetta SOLO se PC applicabile mantiene ricarico
+  // post-cut >= 15% (floor cardinale) e porta il prezzo sotto competitor.
+  const MIN_STOCK = parseInt(rules.silver.stock_min || 3);
+  const MIN_SALES = parseInt(rules.silver.sales_min || 2);
+  const silverRows = rules.silver.enabled ? await pool.query(`
+    SELECT p.sku, p.product_name,
+      ROUND(p.sell_price::numeric, 2) AS sell_price,
+      ROUND(p.erp_cost::numeric, 2) AS erp_cost,
+      ROUND(p.margin_pct::numeric, 1) AS margin_pct,
+      p.sales_30d_seller, p.sales_30d_aggregated,
+      p.brand, p.erp_stock,
+      phs.scraper_position, phs.scraper_competitor_count,
+      ROUND(phs.scraper_best_price::numeric, 2) AS best_price,
+      p.price_rule_id
+    FROM products p
+    JOIN product_health_scores phs ON phs.sku = p.sku AND phs.tenant_id = p.tenant_id
+    LEFT JOIN feed_killers fk ON fk.sku = p.sku AND fk.tenant_id = p.tenant_id AND fk.is_active = true
+    LEFT JOIN feed_quarantine fq ON fq.sku = p.sku AND fq.tenant_id = p.tenant_id AND fq.reactivated = false
+    LEFT JOIN price_rules pr ON pr.rule_id = p.price_rule_id AND pr.tenant_id = p.tenant_id
+    WHERE p.tenant_id = $1
+      AND (p.is_civetta = false OR phs.scraper_position > $2)
+      AND p.saleable = true
+      AND fk.id IS NULL AND fq.id IS NULL
+      AND (pr.rule_type IS NULL OR pr.rule_type != 'sconto')
+      AND COALESCE(p.brand,'') NOT IN ('UNI','GAD','MYC') -- brand protetti
+      AND p.erp_stock >= $3
+      AND (COALESCE(p.sales_30d_seller,0) >= $4 OR COALESCE(p.sales_30d_aggregated,0) >= $4)
+      AND phs.scraper_position > $2       -- in Salva Bilancio (fuori target)
+      AND phs.scraper_position <= $2 + 15 -- ma raggiungibile (non troppo lontano)
+      AND phs.scraper_best_price > 0
+      AND p.erp_cost > 0
+      AND p.sell_price >= 5              -- soglia minima TP
+      -- ricarico post-cut (best_comp - 0.01) >= 15%
+      AND (phs.scraper_best_price - 0.01 - p.erp_cost) / p.erp_cost * 100 >= 15
+      -- new_price sotto sell_price attuale (deve essere un cut vero)
+      AND phs.scraper_best_price - 0.01 < p.sell_price
+    ORDER BY
+      COALESCE(p.sales_30d_aggregated,0) + COALESCE(p.sales_30d_seller,0) DESC,
+      phs.scraper_position ASC
+    LIMIT $5
+  `, [tenantId, maxPosTarget, MIN_STOCK, MIN_SALES, rules.silver.limit]).then(r => r.rows) : [];
 
-  const toAction = (p, tier) => ({
+  // Dedup golden vs silver
+  const goldenSkus = new Set(goldenRows.map(r => r.sku));
+  const silverFiltered = silverRows.filter(r => !goldenSkus.has(r.sku));
+
+  const toActionGolden = (p) => ({
     sku: p.sku, name: p.product_name, action: 'ADD',
-    reason: `Pepita ${tier.toUpperCase()}: venduto globale ${p.sales_30d_aggregated}, pos ${p.scraper_position}/${p.scraper_competitor_count}, margine ${p.margin_pct}%`,
-    category: `pepita_${tier}`,
+    reason: `Pepita GOLDEN: pos ${p.scraper_position}<=${maxPosTarget}, vend ${p.sales_30d_aggregated}, stock ${p.erp_stock}, ricarico ${p.margin_pct}%. Attivazione senza PC.`,
+    category: 'pepita_golden',
     sellPrice: parseFloat(p.sell_price),
     marginPct: parseFloat(p.margin_pct),
     demand: parseFloat(p.sales_30d_aggregated),
     position: p.scraper_position,
   });
 
+  const toActionSilver = (p) => {
+    const newPrice = Math.round((parseFloat(p.best_price) - 0.01) * 100) / 100;
+    const ricaricoPostCut = ((newPrice - parseFloat(p.erp_cost)) / parseFloat(p.erp_cost)) * 100;
+    return {
+      sku: p.sku, name: p.product_name, action: 'ADD',
+      reason: `Pepita SILVER Salva-Bilancio: pos ${p.scraper_position} (target ${maxPosTarget}), vend ${p.sales_30d_aggregated}, stock ${p.erp_stock}. PC a €${newPrice} (ricarico ${ricaricoPostCut.toFixed(1)}%).`,
+      category: 'pepita_silver_sb',
+      sellPrice: parseFloat(p.sell_price),
+      marginPct: parseFloat(p.margin_pct),
+      demand: parseFloat(p.sales_30d_aggregated),
+      position: p.scraper_position,
+      // PC associato obbligatorio
+      recommendedPrice: newPrice,
+      priceCutPct: Math.round(((parseFloat(p.sell_price) - newPrice) / parseFloat(p.sell_price)) * 100 * 10) / 10,
+      newMarginPct: Math.round(((newPrice - parseFloat(p.erp_cost)) / newPrice) * 100 * 10) / 10,
+      currentPrice: parseFloat(p.sell_price),
+    };
+  };
+
   return [
-    ...goldenRows.map(p => toAction(p, 'golden')),
-    ...silverRows.map(p => toAction(p, 'silver')),
+    ...goldenRows.map(toActionGolden),
+    ...silverFiltered.map(toActionSilver),
   ];
 }
 

@@ -41,7 +41,7 @@ router.get('/kpi-range', requireRole('superadmin', 'admin', 'viewer'), async (re
         SELECT COUNT(DISTINCT o.id) as ordini, ROUND(COALESCE(SUM(oi.row_total), 0)::numeric, 2) as revenue
         FROM orders o JOIN order_items oi ON oi.order_id = o.id
         WHERE o.tenant_id = $1 AND o.order_date::date >= $2::date AND o.order_date::date <= $3::date
-          AND o.order_status IN ('complete','processing')
+          AND o.order_status NOT IN ('canceled','closed','pending_payment')
       `, [tenantId, dateFrom, dateTo]);
 
       // Ordini solo da prodotti civetta (attribuibili a TP)
@@ -50,7 +50,7 @@ router.get('/kpi-range', requireRole('superadmin', 'admin', 'viewer'), async (re
         FROM orders o JOIN order_items oi ON oi.order_id = o.id
         JOIN products p ON p.sku = oi.sku AND p.tenant_id = o.tenant_id AND p.is_civetta = true
         WHERE o.tenant_id = $1 AND o.order_date::date >= $2::date AND o.order_date::date <= $3::date
-          AND o.order_status IN ('complete','processing')
+          AND o.order_status NOT IN ('canceled','closed','pending_payment')
       `, [tenantId, dateFrom, dateTo]);
 
       const clickCount = parseInt(clicks.click) || 0;
@@ -640,7 +640,7 @@ router.get('/dashboard', requireRole('superadmin', 'admin', 'viewer'), async (re
                COALESCE(SUM(o.grand_total_products), 0) AS total_revenue
         FROM orders o
         JOIN active_days a ON a.d = o.order_date::date
-        WHERE o.tenant_id = $1 AND o.order_status IN ('complete','processing')
+        WHERE o.tenant_id = $1 AND o.order_status NOT IN ('canceled','closed','pending_payment')
       )
       SELECT clicks30.total_clicks,
              clicks30.active_days,
@@ -775,7 +775,7 @@ router.get('/segments', requireRole('superadmin', 'admin', 'viewer'), async (req
       ord AS (
         SELECT oi.sku, COUNT(DISTINCT o.id) AS ords
         FROM orders o JOIN order_items oi ON oi.order_id = o.id
-        WHERE o.tenant_id = $1 AND o.order_status IN ('complete','processing')
+        WHERE o.tenant_id = $1 AND o.order_status NOT IN ('canceled','closed','pending_payment')
           AND o.order_date::date >= CURRENT_DATE - 30
         GROUP BY 1
       ),
@@ -858,7 +858,7 @@ router.get('/segments/:type', requireRole('superadmin', 'admin', 'viewer'), asyn
         ord AS (
           SELECT oi.sku, COUNT(DISTINCT o.id) AS ords
           FROM orders o JOIN order_items oi ON oi.order_id = o.id
-          WHERE o.tenant_id = $1 AND o.order_status IN ('complete','processing')
+          WHERE o.tenant_id = $1 AND o.order_status NOT IN ('canceled','closed','pending_payment')
             AND o.order_date::date >= CURRENT_DATE - 30
           GROUP BY 1
         ),
@@ -987,7 +987,7 @@ async function getDailyTrend(tenantId, days, ga4StartDate) {
     orders_d AS (
       SELECT order_date::date d, COUNT(*) o, SUM(grand_total_products) r
       FROM orders
-      WHERE tenant_id = $1 AND order_status IN ('complete','processing')
+      WHERE tenant_id = $1 AND order_status NOT IN ('canceled','closed','pending_payment')
       GROUP BY 1
     ),
     cfg AS (SELECT COALESCE(MAX(config_value)::numeric, 0.27) cpc FROM health_config WHERE tenant_id=$1 AND config_key='avg_tp_cpc')
@@ -1048,17 +1048,22 @@ async function getOpenFindings(tenantId) {
 router.get('/feed-actions', requireRole('superadmin', 'admin', 'viewer'), async (req, res) => {
   try {
     const actionFilter = req.query.action;
+    // available=1 filtra solo SKU con erp_stock > 0 (prodotti realmente disponibili)
+    const availableOnly = req.query.available === '1' || req.query.available === 'true';
     const page = Math.max(1, parseInt(req.query.page) || 1);
     const limit = Math.min(100, parseInt(req.query.limit) || 25);
     const offset = (page - 1) * limit;
 
-    // Summary
+    // Summary (rispetta filtro available se attivo)
+    const summaryWhere = availableOnly
+      ? `WHERE fa.tenant_id = $1 AND EXISTS (SELECT 1 FROM products p2 WHERE p2.tenant_id = fa.tenant_id AND p2.sku = fa.sku AND COALESCE(p2.erp_stock, 0) > 0)`
+      : 'WHERE fa.tenant_id = $1';
     const { rows: summary } = await pool.query(`
-      SELECT action, COUNT(*) as count,
-             SUM(cost_consumed)::numeric(12,2) as total_cost,
-             SUM(direct_revenue)::numeric(12,2) as total_revenue
-      FROM feed_actions WHERE tenant_id = $1
-      GROUP BY action ORDER BY count DESC
+      SELECT fa.action, COUNT(*) as count,
+             SUM(fa.cost_consumed)::numeric(12,2) as total_cost,
+             SUM(fa.direct_revenue)::numeric(12,2) as total_revenue
+      FROM feed_actions fa ${summaryWhere}
+      GROUP BY fa.action ORDER BY count DESC
     `, [req.tenantId]);
 
     // Paginated list
@@ -1069,13 +1074,22 @@ router.get('/feed-actions', requireRole('superadmin', 'admin', 'viewer'), async 
       where += ` AND fa.action = $${idx++}`;
       params.push(actionFilter);
     }
+    if (availableOnly) {
+      where += ` AND COALESCE(p.erp_stock, 0) > 0`;
+    }
 
     const { rows: [countRow] } = await pool.query(
-      `SELECT COUNT(*) FROM feed_actions fa ${where}`, params
+      `SELECT COUNT(*) FROM feed_actions fa
+       LEFT JOIN products p ON p.tenant_id = fa.tenant_id AND p.sku = fa.sku
+       ${where}`, params
     );
 
     const { rows: actions } = await pool.query(`
-      SELECT fa.*, p.product_name, p.brand, p.sell_price as p_sell_price
+      SELECT fa.*, p.product_name, p.brand,
+        p.sell_price as p_sell_price, p.erp_stock,
+        -- current_price effettivo: valorizza sempre col sell_price dei products se
+        -- feed_actions non lo ha (comune sui REMOVE dove non serve al calcolo cut).
+        COALESCE(NULLIF(fa.current_price, 0), p.sell_price) AS display_price
       FROM feed_actions fa
       LEFT JOIN products p ON p.tenant_id = fa.tenant_id AND p.sku = fa.sku
       ${where}

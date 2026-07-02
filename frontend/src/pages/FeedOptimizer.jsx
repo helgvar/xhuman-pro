@@ -922,6 +922,7 @@ function TabFeedActions() {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [filter, setFilter] = useState('');
+  const [availableOnly, setAvailableOnly] = useState(false);
   const [page, setPage] = useState(1);
 
   const load = useCallback(async () => {
@@ -929,11 +930,12 @@ function TabFeedActions() {
     try {
       const params = new URLSearchParams({ page, limit: 25 });
       if (filter) params.set('action', filter);
+      if (availableOnly) params.set('available', '1');
       const result = await api(`/optimization/feed-actions?${params}`);
       setData(result);
     } catch (err) { console.error(err); }
     setLoading(false);
-  }, [filter, page]);
+  }, [filter, availableOnly, page]);
 
   useEffect(() => { load(); }, [load]);
 
@@ -972,7 +974,18 @@ function TabFeedActions() {
         <>
           <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
             <div className="flex items-center justify-between px-4 py-2 border-b border-gray-100">
-              <span className="text-sm font-medium text-gray-700">Feed Actions {filter ? `(${filter})` : ''}</span>
+              <div className="flex items-center gap-4">
+                <span className="text-sm font-medium text-gray-700">Feed Actions {filter ? `(${filter})` : ''}</span>
+                <label className="inline-flex items-center gap-2 text-sm text-gray-600 cursor-pointer select-none">
+                  <input
+                    type="checkbox"
+                    checked={availableOnly}
+                    onChange={(e) => { setAvailableOnly(e.target.checked); setPage(1); }}
+                    className="rounded border-gray-300 text-brand-600 focus:ring-brand-500"
+                  />
+                  Solo disponibili (stock &gt; 0)
+                </label>
+              </div>
               <ExportButton type="feed-actions" label="Scarica Excel" />
             </div>
             <div className="overflow-x-auto">
@@ -1010,7 +1023,7 @@ function TabFeedActions() {
                           </span>
                         </td>
                         <td className="px-3 py-3 text-right text-gray-700">{a.tp_position || '-'}</td>
-                        <td className="px-3 py-3 text-right text-gray-700">{formatEur(parseFloat(a.current_price) || 0)}</td>
+                        <td className="px-3 py-3 text-right text-gray-700">{formatEur(parseFloat(a.display_price ?? a.current_price ?? a.p_sell_price) || 0)}</td>
                         <td className="px-3 py-3 text-right">
                           {a.recommended_price ? (
                             <span className="text-amber-600 font-medium">{formatEur(parseFloat(a.recommended_price))}</span>

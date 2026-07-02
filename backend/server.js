@@ -169,6 +169,11 @@ async function start() {
     const { start: startAiAuditCron } = require('./services/aiAuditCron');
     startAiAuditCron();
 
+    // AI health monitor: ogni 4h verifica che l'AI Audit stia girando
+    // (MAX(run_at) < 8h) e che applichi (no flood pending senza applied)
+    const { startAiHealthMonitor } = require('./services/aiHealthMonitor');
+    startAiHealthMonitor();
+
     // OBLIO cron: populate giovedì 02:00 + daily release check 03:00
     const { startOblioCron } = require('./services/crossTenantOblio');
     startOblioCron();
@@ -180,6 +185,11 @@ async function start() {
     // Pepite Monitor: ogni 4h scova SKU in Salva Bilancio attivabili in top competitiva
     const { startPepiteCron } = require('./services/pepiteMonitor');
     startPepiteCron();
+
+    // Winner Stock Alert (Master Plan L6): giornaliero 09:30 italia — winner
+    // con vendite reali >= 5/30gg e stock in esaurimento senza backup fornitore
+    const { startWinnerStockAlert } = require('./services/winnerStockAlert');
+    startWinnerStockAlert();
 
     app.listen(PORT, '0.0.0.0', () => {
       console.log(`[xHUMANPRO] Backend running on http://0.0.0.0:${PORT}`);

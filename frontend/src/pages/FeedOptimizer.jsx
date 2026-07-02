@@ -922,7 +922,7 @@ function TabFeedActions() {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [filter, setFilter] = useState('');
-  const [availableOnly, setAvailableOnly] = useState(false);
+  const [availableOnly, setAvailableOnly] = useState(true);
   const [page, setPage] = useState(1);
 
   const load = useCallback(async () => {
@@ -1018,11 +1018,11 @@ function TabFeedActions() {
                         <td className="px-3 py-3 text-right text-gray-700">{a.clicks_consumed || 0}</td>
                         <td className="px-3 py-3 text-right text-gray-700">{formatEur(parseFloat(a.cost_consumed) || 0)}</td>
                         <td className="px-3 py-3 text-right">
-                          <span className={parseFloat(a.budget_pct_used) > 100 ? 'text-red-600 font-medium' : 'text-gray-600'}>
-                            {parseFloat(a.budget_pct_used) > 0 ? parseFloat(a.budget_pct_used).toFixed(0) + '%' : '-'}
+                          <span className={parseFloat(a.display_budget_pct ?? a.budget_pct_used) > 100 ? 'text-red-600 font-medium' : 'text-gray-600'}>
+                            {parseFloat(a.display_budget_pct ?? a.budget_pct_used) > 0 ? parseFloat(a.display_budget_pct ?? a.budget_pct_used).toFixed(0) + '%' : '-'}
                           </span>
                         </td>
-                        <td className="px-3 py-3 text-right text-gray-700">{a.tp_position || '-'}</td>
+                        <td className="px-3 py-3 text-right text-gray-700">{a.display_tp_position ?? a.tp_position ?? '-'}</td>
                         <td className="px-3 py-3 text-right text-gray-700">{formatEur(parseFloat(a.display_price ?? a.current_price ?? a.p_sell_price) || 0)}</td>
                         <td className="px-3 py-3 text-right">
                           {a.recommended_price ? (

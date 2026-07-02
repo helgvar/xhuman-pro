@@ -1086,12 +1086,25 @@ router.get('/feed-actions', requireRole('superadmin', 'admin', 'viewer'), async 
 
     const { rows: actions } = await pool.query(`
       SELECT fa.*, p.product_name, p.brand,
-        p.sell_price as p_sell_price, p.erp_stock,
+        p.sell_price as p_sell_price, p.erp_stock, p.erp_cost as p_erp_cost,
+        p.margin_pct as p_margin_pct,
         -- current_price effettivo: valorizza sempre col sell_price dei products se
         -- feed_actions non lo ha (comune sui REMOVE dove non serve al calcolo cut).
-        COALESCE(NULLIF(fa.current_price, 0), p.sell_price) AS display_price
+        COALESCE(NULLIF(fa.current_price, 0), p.sell_price) AS display_price,
+        -- pos TP effettiva: fa.tp_position è spesso 0. Fallback su phs.scraper_position.
+        COALESCE(NULLIF(fa.tp_position, 0), phs.scraper_position) AS display_tp_position,
+        -- budget_pct_used calcolato: se DB ha 0, ratio cost_consumed / (margine per click
+        -- accettabile, cioè margin_eur assoluto per SKU). Rappresenta quanto stiamo
+        -- bruciando rispetto al break-even.
+        CASE
+          WHEN fa.budget_pct_used > 0 THEN fa.budget_pct_used
+          WHEN p.erp_cost > 0 AND p.sell_price > 0
+            THEN ROUND(LEAST(100, fa.cost_consumed / NULLIF(p.sell_price - p.erp_cost, 0) * 100)::numeric, 1)
+          ELSE NULL
+        END AS display_budget_pct
       FROM feed_actions fa
       LEFT JOIN products p ON p.tenant_id = fa.tenant_id AND p.sku = fa.sku
+      LEFT JOIN product_health_scores phs ON phs.tenant_id = fa.tenant_id AND phs.sku = fa.sku
       ${where}
       ORDER BY
         CASE fa.action

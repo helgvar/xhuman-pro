@@ -26,29 +26,33 @@ function calculatePriceCut(sellPrice, erpCost, bestPrice) {
   if (!sellPrice || !erpCost || sellPrice <= erpCost) return null;
   if (!bestPrice || bestPrice <= 0 || sellPrice <= bestPrice) return null;
 
-  // MANTRA: HARD FLOOR MOL 15% (cfr. feedback_mantra_operativo).
-  // Floor = costo / (1 - 0.15) → margine_pct esattamente 15% sul target.
-  const MOL_FLOOR = 0.15;
-  const priceFloorByMol = erpCost / (1 - MOL_FLOOR);
-  // Vecchio floor per ricarico minimo (compatibilità storica)
+  // MANTRA: HARD FLOOR RICARICO 15% (cfr. feedback_ricarico_non_margine).
+  // RICARICO = (prezzo - costo) / COSTO × 100. Floor = costo × 1.15.
+  const MIN_RICARICO = 0.15;
+  const priceFloorByRicarico = erpCost * (1 + MIN_RICARICO);
+  // Vecchio floor per ricarico minimo (compatibilità storica per fasce)
   const minMarkup = sellPrice < 10 ? 0.18 : sellPrice < 30 ? 0.14 : 0.12;
   const priceFloorByMarkup = erpCost * (1 + minMarkup);
   // Floor = il più alto fra i due (più conservativo)
-  const floor = Math.max(priceFloorByMol, priceFloorByMarkup);
+  const floor = Math.max(priceFloorByRicarico, priceFloorByMarkup);
 
   // Target: match best price - 1%, but not below floor
   const target = Math.max(bestPrice * 0.99, floor);
   if (target >= sellPrice) return null; // Can't cut enough
   if (sellPrice - target < 0.10) return null; // Cut too small
+  // Se il target è >= bestPrice, non riusciamo a batter il competitor: no cut utile.
+  if (target > bestPrice) return null;
 
   const newMarginPct = ((target - erpCost) / target) * 100;
-  // HARD STOP: se per qualche ragione di arrotondamento siamo sotto 15%, reject
-  if (newMarginPct < 15) return null;
+  const newRicaricoPct = ((target - erpCost) / erpCost) * 100;
+  // HARD STOP: floor su RICARICO 15%
+  if (newRicaricoPct < 15) return null;
 
   const cutPct = ((sellPrice - target) / sellPrice) * 100;
   return {
     targetPrice: Math.round(target * 100) / 100,
     newMarginPct: Math.round(newMarginPct * 10) / 10,
+    newRicaricoPct: Math.round(newRicaricoPct * 10) / 10,
     cutPct: Math.round(cutPct * 10) / 10,
   };
 }
@@ -739,16 +743,25 @@ async function triageProducts(tenantId, config, snapshot, ruleSet = null) {
         const erpCost = parseFloat(p.erp_cost) || 0;
         const bestPrice = parseFloat(p.scraper_best_price) || 0;
         const pc = calculatePriceCut(sellPrice, erpCost, bestPrice);
-        actions.priceCut.push({
-          sku: p.sku, name: p.product_name, action: 'PRICE_CUT',
-          reason: `Converte (${totalOrders} ordini) ma incidenza ${productIncidence.toFixed(0)}%, pos ${position}`,
-          category: 'convertitore_costoso', cost: totalCost, revenue: totalRevenue,
-          clicks: totalClicks, orders: totalOrders, position,
-          currentPrice: pc ? sellPrice : null,
-          recommendedPrice: pc ? pc.targetPrice : null,
-          priceCutPct: pc ? pc.cutPct : null,
-          newMarginPct: pc ? pc.newMarginPct : null,
-        });
+        if (pc) {
+          actions.priceCut.push({
+            sku: p.sku, name: p.product_name, action: 'PRICE_CUT',
+            reason: `Converte (${totalOrders} ordini) ma incidenza ${productIncidence.toFixed(0)}%, pos ${position}`,
+            category: 'convertitore_costoso', cost: totalCost, revenue: totalRevenue,
+            clicks: totalClicks, orders: totalOrders, position,
+            currentPrice: sellPrice, recommendedPrice: pc.targetPrice,
+            priceCutPct: pc.cutPct, newMarginPct: pc.newMarginPct,
+          });
+        } else {
+          // Cut non applicabile (violerebbe floor ricarico 15% o best_comp sotto costo).
+          // NON mettere in PRICE_CUT, va in KEEP con reason chiara: non vogliamo mostrare
+          // in UI SKU classificati PRICE_CUT senza recommended_price (feedback utente 2/7/2026).
+          actions.keep.push({
+            sku: p.sku, name: p.product_name, action: 'KEEP',
+            reason: `Convertitore costoso (${totalOrders} ord, incidenza ${productIncidence.toFixed(0)}%, pos ${position}): cut non applicabile senza scendere sotto ricarico 15%`,
+            category: 'convertitore_costoso_no_cut', cost: totalCost, revenue: totalRevenue,
+          });
+        }
       } else {
         actions.keep.push({
           sku: p.sku, name: p.product_name, action: 'KEEP',
@@ -829,17 +842,24 @@ async function triageProducts(tenantId, config, snapshot, ruleSet = null) {
       const erpCost = parseFloat(p.erp_cost) || 0;
       const bestPrice = parseFloat(p.scraper_best_price) || 0;
       const pc = calculatePriceCut(sellPrice, erpCost, bestPrice);
-      actions.priceCut.push({
-        sku: p.sku, name: p.product_name, action: 'PRICE_CUT',
-        reason: `Potenziale (score=${stayScore}): ${stayReasons.join(', ')}. Pos ${position}, taglio prezzo per migliorare`,
-        category: 'potenziale_price_cut', cost: totalCost, clicks: totalClicks,
-        stayScore, position,
-        currentPrice: pc ? sellPrice : null,
-        recommendedPrice: pc ? pc.targetPrice : null,
-        priceCutPct: pc ? pc.cutPct : null,
-        newMarginPct: pc ? pc.newMarginPct : null,
-      });
-      stats.potenziali++;
+      if (pc) {
+        actions.priceCut.push({
+          sku: p.sku, name: p.product_name, action: 'PRICE_CUT',
+          reason: `Potenziale (score=${stayScore}): ${stayReasons.join(', ')}. Pos ${position}, taglio prezzo per migliorare`,
+          category: 'potenziale_price_cut', cost: totalCost, clicks: totalClicks,
+          stayScore, position,
+          currentPrice: sellPrice, recommendedPrice: pc.targetPrice,
+          priceCutPct: pc.cutPct, newMarginPct: pc.newMarginPct,
+        });
+        stats.potenziali++;
+      } else {
+        // Cut non applicabile (viola floor ricarico 15% o best_comp sotto costo) → monitor.
+        actions.monitor.push({
+          sku: p.sku, name: p.product_name, action: 'MONITOR',
+          reason: `Potenziale (score=${stayScore}): pos ${position} ma cut non applicabile senza scendere sotto ricarico 15%`,
+          category: 'potenziale_no_cut', cost: totalCost, clicks: totalClicks, stayScore,
+        });
+      }
     } else if (snapshot.overTarget) {
       // Score 2-3 ma incidenza globale sopra target → rimuovi
       actions.remove.push({

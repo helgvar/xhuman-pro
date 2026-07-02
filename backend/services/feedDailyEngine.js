@@ -429,6 +429,14 @@ async function detectKillers(tenantId) {
       AND COALESCE(ao.ord_30d, 0) = 0
       AND COALESCE(phs.tp_clicks_30d, 0) >= $2
       AND COALESCE(phs.tp_click_cost_30d, 0) >= $3
+      -- Regola cardinale [[feedback_killer_bulk_check_before]]:
+      -- MAI killer su brand protetti UNI/GAD/MYC (regola cliente 26/6/2026)
+      -- e mai su SKU con stock+MOL alto (safety net magazzino farmacia).
+      AND COALESCE(p.brand,'') NOT IN ('UNI','GAD','MYC')
+      AND NOT (
+        COALESCE(p.erp_stock, 0) >= 10
+        AND COALESCE(phs.scraper_position, 99) <= 3
+      )
     ORDER BY phs.tp_click_cost_30d DESC
   `, [tenantId, clickMin, costMinEur]);
 

@@ -53,10 +53,10 @@ function daysAgo(n) { const d = new Date(); d.setDate(d.getDate() - n); return f
 
 function DateRangeKpi() {
   const [preset, setPreset] = useState('7');
-  const [from, setFrom] = useState(daysAgo(7));
+  const [from, setFrom] = useState(daysAgo(6));
   const [to, setTo] = useState(formatDate(new Date()));
   const [compareEnabled, setCompareEnabled] = useState(false);
-  const [compareFrom, setCompareFrom] = useState(daysAgo(14));
+  const [compareFrom, setCompareFrom] = useState(daysAgo(13));
   const [compareTo, setCompareTo] = useState(daysAgo(7));
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -75,12 +75,16 @@ function DateRangeKpi() {
   const applyPreset = (days) => {
     setPreset(days);
     const newTo = formatDate(new Date());
-    const newFrom = daysAgo(parseInt(days));
+    // "Oggi" (days=1) → from=to=oggi. "7gg" → ultimi 7 giorni (from=6gg fa, to=oggi).
+    // Prima usava daysAgo(days) che dava 8 giorni per "7gg" e 2 giorni per "Oggi".
+    const newFrom = daysAgo(Math.max(0, parseInt(days) - 1));
     setFrom(newFrom);
     setTo(newTo);
     if (compareEnabled) {
-      setCompareTo(newFrom);
-      setCompareFrom(daysAgo(parseInt(days) * 2));
+      // Finestra confronto della stessa lunghezza, immediatamente precedente.
+      const len = parseInt(days);
+      setCompareTo(daysAgo(len));
+      setCompareFrom(daysAgo(len * 2 - 1));
     }
   };
 

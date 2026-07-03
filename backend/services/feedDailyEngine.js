@@ -399,7 +399,9 @@ async function detectKillers(tenantId) {
   //   - killer_cost_min_eur (default 2)
   const { rows: cfg } = await pool.query(
     `SELECT config_key, config_value FROM health_config
-     WHERE tenant_id = $1 AND config_key IN ('killer_click_min','killer_cost_min_eur')
+     WHERE tenant_id = $1
+       AND config_key IN ('killer_click_min','killer_cost_min_eur',
+                          'killer_protected_brands','killer_stock_safety_top_pos')
        AND (expires_at IS NULL OR expires_at > NOW())`,
     [tenantId]
   );

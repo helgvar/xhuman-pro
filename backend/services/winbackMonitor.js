@@ -91,9 +91,9 @@ async function runWinback() {
         INSERT INTO feed_actions (tenant_id, sku, action, action_reason, action_source,
           current_price, recommended_price, price_cut_pct, erp_cost, new_margin, new_margin_pct,
           status, expires_at, computed_at)
-        VALUES ($1, $2, 'PRICE_CUT', $3, 'manual_pepita', $4, $5,
-          ROUND((($4 - $5) / $4 * 100)::numeric, 2), $6,
-          ROUND(($5 - $6)::numeric, 2), ROUND((($5 - $6) / $5 * 100)::numeric, 2),
+        VALUES ($1, $2, 'PRICE_CUT', $3, 'manual_pepita', $4::numeric, $5::numeric,
+          ROUND((($4::numeric - $5::numeric) / $4::numeric * 100), 2), $6::numeric,
+          ROUND(($5::numeric - $6::numeric), 2), ROUND((($5::numeric - $6::numeric) / $5::numeric * 100), 2),
           'pending', NOW() + INTERVAL '21 days', NOW())
         ON CONFLICT (tenant_id, sku) DO UPDATE SET
           action = 'PRICE_CUT', action_source = 'manual_pepita',

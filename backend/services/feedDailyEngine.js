@@ -1541,8 +1541,18 @@ async function applyActions(tenantId, actions, config) {
     WHERE fa.tenant_id = $1 AND fa.action IN ('REMOVE', 'ADD', 'PRICE_CUT')
   `, [tenantId]);
 
-  // Clear old feed_actions
-  await pool.query(`DELETE FROM feed_actions WHERE tenant_id = $1`, [tenantId]);
+  // Clear old feed_actions — MA preserva le azioni MANUALI non scadute.
+  // Bug storico (Wave2-B 1/7 + pilot raise 2/7): il DELETE totale spazzava
+  // anche pepite/raise inseriti a mano, che sparivano al rerun successivo.
+  // Le sorgenti manuali sopravvivono; l'INSERT sotto usa ON CONFLICT DO
+  // NOTHING quindi la riga manuale vince sul ricalcolo engine.
+  await pool.query(`
+    DELETE FROM feed_actions
+    WHERE tenant_id = $1
+      AND (action_source IS NULL
+           OR action_source NOT IN ('manual_pepita','margin_harvest_pilot','manual_review')
+           OR expires_at < NOW())
+  `, [tenantId]);
 
   // Ordine = priorita' in caso di conflitto SKU (ON CONFLICT DO NOTHING tiene
   // il primo). REMOVE prima (decisione definitiva di uscita); ADD subito dopo

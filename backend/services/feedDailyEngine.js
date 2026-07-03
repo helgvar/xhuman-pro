@@ -437,7 +437,15 @@ async function detectKillers(tenantId) {
       AND p.is_civetta = true
       AND fk.id IS NULL
       AND COALESCE(ao.ord_30d, 0) = 0
-      AND COALESCE(phs.tp_clicks_30d, 0) >= $2
+      -- LA BIBBIA (feedback_bibbia_margine_first): soglia click DINAMICA sul
+      -- margine dello SKU, mai fissa. break-even = margine_eur / CPC (0.3294).
+      -- Kill solo dopo aver speso 1.5x il margine di UN ordine senza vendere:
+      -- SKU margine €1 -> kill da ~5 click; SKU margine €12 -> kill da ~55.
+      -- clickMin di config resta il pavimento minimo.
+      AND COALESCE(phs.tp_clicks_30d, 0) >= GREATEST(
+        $2::numeric,
+        CEIL(GREATEST(COALESCE(p.margin, p.sell_price - p.erp_cost), 0) / 0.3294 * 1.5)
+      )
       AND COALESCE(phs.tp_click_cost_30d, 0) >= $3
       -- Brand protetti PER-TENANT via health_config.killer_protected_brands
       -- ($4 array). Default vuoto: nessun brand escluso.
@@ -463,7 +471,7 @@ async function detectKillers(tenantId) {
         quarantine_until = NOW() + INTERVAL '30 days', is_active = true, detected_at = NOW()
     `, [
       tenantId, k.sku, k.sellers, k.global_demand, k.our_position,
-      `Bruciatore: ${k.clicks_30d} click 30g (€${parseFloat(k.cost_30d).toFixed(2)} spesi) e 0 vendite cross-tenant`
+      `Bruciatore: ${k.clicks_30d} click 30g (€${parseFloat(k.cost_30d).toFixed(2)} spesi) e 0 vendite cross-tenant. Margine €${parseFloat(k.margin_eur || 0).toFixed(2)} = break-even ${Math.ceil((parseFloat(k.margin_eur || 0)) / 0.3294)} click, superato 1.5x`
     ]);
     inserted++;
   }

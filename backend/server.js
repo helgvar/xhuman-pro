@@ -191,6 +191,11 @@ async function start() {
     const { startWinnerStockAlert } = require('./services/winnerStockAlert');
     startWinnerStockAlert();
 
+    // Winback Monitor: giornaliero 07:45 italia — SKU fuori CSV che vendono
+    // su altri canali rientrano (diretti se landing top10, con PC se serve)
+    const { startWinbackMonitor } = require('./services/winbackMonitor');
+    startWinbackMonitor();
+
     app.listen(PORT, '0.0.0.0', () => {
       console.log(`[xHUMANPRO] Backend running on http://0.0.0.0:${PORT}`);
     });

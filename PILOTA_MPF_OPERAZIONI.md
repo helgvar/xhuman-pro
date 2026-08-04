@@ -262,7 +262,17 @@ Ma il campione è il **numero di click**, non i giorni — e sotto soglia il sin
 
 **2) Hanno avuto il tempo di provarsi?** 50 no: rilasciati da meno di 7 giorni, non hanno finito il test (dottrina esilio 7gg + test 3gg). Condannarli è *churn*, non giudizio, e brucia la macchina di riattivazione che li aveva liberati — è esattamente ciò che l'alert stava segnalando. **Rimessi dentro** (`capo_correzione_0508_finestra_test`, €4,90/gg), si ri-valutano a finestra piena. I 186 rilasciati da 7-15gg restano tagliati: i loro click sono maturati tutti dentro il feed, il campione è valido.
 
-**Taglio finale: 1.122 SKU · 2.122 click/15gg · €46,67/gg.**
+**Taglio finale: 1.119 SKU · 2.118 click/15gg · €46,58/gg.**
+
+### ✅ PROVA DEL FUOCO — rerun del motore forzato, il taglio ha retto
+
+Non aspettato il giro delle 06: motore forzato a mano su MPF via `POST /api/onboarding/:tenantId/run` con `{"steps":["feed"]}` (dentro il container niente `curl` e `localhost` rifiuta: usare `wget` su `127.0.0.1:3001`).
+
+- **21:05:51 → 21:06:07 UTC** — engine completo: `REMOVE 356 · KEEP 680 · PRICE_CUT 72 · MONITOR 1.101 · ADD 0`, incidenza calcolata 8,9%, 96 killer.
+- **Dopo il rerun: `pulizia_capo_taglio_0508` = 1.122 righe intatte, €46,67/gg.** Il DELETE di pulizia ha toccato solo roba sua (`zero_click_demand` 3, `convertitore_costoso` 1). **Sopravvivenza dimostrata sul campo, non per lettura del codice.**
+- Cache stabile forzata alle 21:06:41 UTC: feed **23.759**, `tagliati_ancora_dentro = 0`.
+
+**Trappola nella trappola:** la verifica dei 50 rilasciati fatta via `azioni_touch_log` dava `rientrati = 0` — falso. Il log delle DELETE è **parziale** (la correzione da 93 righe ne aveva loggate 2). Verificato per **lista SKU** su `feed_stable_sku`: dei 53 rilasciati da <7gg, **46 sono nel CSV**, 4 restano fuori per motivi propri (filtro strict / stock), 3 erano stati liberati nell'ultima ora e sono finiti nel taglio dopo la correzione — tolti anche quelli. Regola: **dopo una DELETE si verifica per lista SKU, mai dal touch log.**
 
 **Blindatura nel codice (commit 8841772, NON ancora deployata):** `feedDailyEngine.js` conserva ora anche ogni `action_source LIKE 'capo\_%'`. La mano del capo non deve dipendere dal ricordarsi un prefisso. Deploy al prossimo momento senza cicli in volo (`docker cp` + `docker restart`); fino ad allora regge il prefisso `pulizia_`.
 

@@ -244,6 +244,10 @@ Il taglio era firmato `capo_taglio_click_zero_vendite`: fuori whitelist, senza p
 
 ⚠️ **Regola operativa nuova:** ogni `feed_actions` scritta a mano deve avere `action_source` che inizia per `pulizia_`, e va **ricontrollata dopo il primo rerun del motore** — mai dare per fatto un taglio appena scritto.
 
+**✅ USCITA DAL CSV CONFERMATA — cache MPF rigenerata 4/8 22:56 ITA:** feed **24.896 → 23.724 (−1.172)**, `tagliati_ancora_dentro = 0`. Restano nel CSV, tra i cliccati-senza-vendite, solo le tre classi volute: 135 brand protetti (€14,05/gg, veto del capo), 162 salvati dal filtro anti-rumore + pin (€12,78/gg), 13 che portano carrelli sani (€1,03/gg).
+
+**Blindatura nel codice (commit 8841772, NON ancora deployata):** `feedDailyEngine.js` conserva ora anche ogni `action_source LIKE 'capo\_%'`. La mano del capo non deve dipendere dal ricordarsi un prefisso. Deploy al prossimo momento senza cicli in volo (`docker cp` + `docker restart`); fino ad allora regge il prefisso `pulizia_`.
+
 ⚠️ **Da rivedere entro 7 giorni:** i 607 SKU delle classi F+G (€34,26/gg) **vendono in rete ma non su MPF**. Regola del capo: sono candidati **PC riposizionamento**, non morti. L'esilio è a 7 giorni proprio per questo: se il riposizionamento prezzo li rende competitivi, rientrano.
 
 ## Non fatto, in attesa di ordine

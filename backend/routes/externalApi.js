@@ -416,9 +416,10 @@ async function recalculateStableCache(tenantId) {
     // (l'unica verita' sulle vendite sono gli ordini reali Magento). Qui la priorita' e':
     //   1. brand protetti  -> non escono MAI dal feed per cap ("i brand lasciali stare")
     //   2. pin del capo    -> prima classe protetta
-    //   3. vendite reali Magento 90gg (ordini, poi fatturato)
-    //   4. stock fisico in farmacia (regola aurea: spingere il magazzino)
-    //   5. health_score come spareggio
+    //   3. rilasciati da <10gg -> esilio 7gg + test 3gg: chi e' in test NON si giudica
+    //   4. vendite reali Magento 90gg (ordini, poi fatturato)
+    //   5. stock fisico in farmacia (regola aurea: spingere il magazzino)
+    //   6. health_score come spareggio
     // Chi resta in coda e finisce sotto la soglia e' materia muta: ne' vende ne' clicca.
     const { rows: priorityRows } = await pool.query(`
       WITH ord90 AS (
@@ -431,12 +432,19 @@ async function recalculateStableCache(tenantId) {
           AND o.order_date >= NOW() - INTERVAL '90 days'
           AND o.order_status IN ('processing','pending','complete','ritiro_farmacia','Ritirato')
         GROUP BY 1
+      ),
+      in_test AS (
+        SELECT DISTINCT sku FROM feed_quarantine
+        WHERE tenant_id = $1 AND reactivated = true
+          AND reactivated_at > NOW() - INTERVAL '10 days'
       )
       SELECT ph.sku,
         (CASE WHEN is_brand_protected($1, ph.sku) THEN 1000000 ELSE 0 END +
          CASE WHEN EXISTS (SELECT 1 FROM capo_pins cp
                            WHERE cp.tenant_id = $1 AND cp.sku = ph.sku
                              AND cp.revoked_at IS NULL) THEN 500000 ELSE 0 END +
+         CASE WHEN EXISTS (SELECT 1 FROM in_test it
+                           WHERE it.sku = ph.sku) THEN 200000 ELSE 0 END +
          COALESCE(o90.ordini, 0) * 100 +
          COALESCE(o90.fatt, 0) * 0.1 +
          CASE WHEN COALESCE(p.erp_stock, 0) > 0 THEN 50 ELSE 0 END +

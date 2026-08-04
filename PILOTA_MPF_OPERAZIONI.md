@@ -416,3 +416,71 @@ Tagliare SKU per SKU è guerra di trincea: ne togli 350, ne entrano 900. **Il co
 **Il 95% della spesa residua la fanno prodotti con margine sufficiente a ripagare i click.** Non è spazzatura che brucia: è merce sana che non converte. Il problema è a valle del click — coerente col verdetto 4/8 sulla conversione dimezzata.
 
 Eccezione da chiudere: **11 SKU con margine ≤ 0** che consumano €2,04/gg — vendono in perdita e pagano pure i click.
+
+---
+
+## 5/8 — I 90 CHE VENDONO IN RETE: test 3 giorni, e la scoperta della spedizione
+
+**Ordine capo:** *"riposiziona i 91 esclusi per 3gg se non vendono stacchi"*.
+
+Sono i 90 SKU (91 al primo conteggio, uno era già rientrato) che stanotte erano nel taglio, hanno consumato click oggi, e **vendono in rete: €4.331,90 in 15 giorni** su altre farmacie. Su MPF, zero.
+
+### Il riposizionamento non aveva materia — e il perché è grosso
+
+Primo calcolo, sul prezzo prodotto: 81 su 90 hanno già **il prezzo più basso**. Il "taglio" per allinearsi al mercato sarebbe stato un **rialzo del 14,7%**.
+
+Sembrava assurdo. Poi il confronto con quello che TP mostra davvero:
+
+| SKU | prodotto | nostro prezzo | prezzo su TP | pos |
+|---|---|---|---|---|
+| 980247860 | XIPAG 20CPR | 22,74 | **28,64** | 13 |
+| 987309679 | PEGBIOMA 30BUST | 15,91 | **20,80** | 3 |
+| 906618994 | KILOCAL 20CPR | 10,29 | **16,19** | 17 |
+| 971676679 | FLEBINEC PLUS 14BUST | 13,49 | **19,72** | 10 |
+
+**+5,90 su ogni riga. È la spedizione**, e `total_price` la include: TP ordina le offerte sul totale, non sul prezzo prodotto.
+
+Rifatto il conto sul totale, sui 90:
+
+| | MPF | miglior concorrente esterno |
+|---|---|---|
+| prezzo prodotto | 15,46 | 14,24 |
+| spedizione | **5,90** | — |
+| **totale** | **21,36** | **16,94** |
+| posizione media | 6,7 | — |
+
+- volte che MPF ha il prezzo prodotto più basso: **15 su 90**
+- volte che MPF vince **sul totale**: **0 su 90**
+
+Per battere il mercato dovrebbe scendere a €11,00 di prezzo prodotto, ma il pavimento (costo + ricarico minimo di fascia) è €14,72. **89 su 90 non sono riposizionabili: il margine è già finito.** Il gap non è di prezzo, è di spedizione.
+
+### La spedizione in tutta la rete (scraper 48h)
+
+| farmacia | spedizione media | offerte gratis | volte prima |
+|---|---|---|---|
+| San Vito | 4,76 | 1.943 | 2.754 |
+| Procaccini | 4,76 | 608 | 2.951 |
+| Farmastelia | 4,80 | 548 | 2.500 |
+| Papa | 4,99 | 0 | 1.467 |
+| **MPF** | **5,82** | **256** | **906** |
+| SubitoFarma | 5,90 | 0 | 3.149 |
+| Ospedale / Farmainsieme | 6,81 | 20 / 108 | 93 / 155 |
+
+E i grandi concorrenti: 1000 Farmacie €3,47 (18.578 offerte gratis), Farma.it **€0,00 su tutte e 60.179**, Redcare €2,70, Top Farmacia €3,12.
+
+**MPF paga €5,82 di spedizione in un mercato che sta tra €0 e €4,80.** Su ogni singola offerta parte con 1-2 euro di svantaggio che nessun taglio prezzo può recuperare, perché il margine per quel taglio non c'è.
+
+Questa è una spiegazione candidata per la conversione dimezzata di MPF (verdetto 4/8: *"causa a valle del click"*): il cliente clicca sul prezzo prodotto, arriva sul sito e trova €5,90 di spedizione.
+
+### Cosa è stato fatto
+
+- 90 SKU tolti dal taglio, rientrati nel feed (85 nel CSV, 5 hanno stock 0 e restano fuori a norma)
+- `action='KEEP'`, `action_source='pulizia_test_riposiz_0508'`, **scadenza 7/8 21:57**
+- 1 solo riposizionamento prezzo possibile nel rispetto del floor, scritto come PRICE_CUT
+- verifica al terzo giorno: chi non ha venduto viene staccato (`pulizia_stacco_test_0508`)
+
+Costo del test: ~€38,54/gg × 3 = **~€116**.
+
+### Da decidere (non è materia di feed)
+
+La leva sulla spedizione vale su tutte le 19.750 offerte MPF, non sui 90 SKU. Portarla da €5,82 a €4,76 (il livello di San Vito e Procaccini, dentro la stessa rete) sposta ogni offerta di un euro sul totale — che è la grandezza su cui TP ordina. Non è una decisione del feed: è del cliente.

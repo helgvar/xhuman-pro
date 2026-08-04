@@ -179,7 +179,7 @@ Ordine: *"bisogna tagliare!! non possiamo spendere 200€ al giorno per 25 ordin
 | B. Pin del capo | 54 | 5,85 | 384 | 131 | intatto (ordini suoi) |
 | C. Porta carrelli sani | 258 | 39,90 | 10.751 | 2.320 | intatto (incidenza 5,6%: ripaga) |
 | D. Vende qui e ripaga | 18 | 1,34 | 485 | 141 | intatto |
-| E. Vende qui ma brucia | 2 | 1,27 | 67 | 11 | **TAGLIATO** |
+| E. Vende qui ma brucia | 2 | 1,27 | 67 | 11 | **NON tagliato** (hanno PRICE_CUT in coda: la cura è il prezzo) |
 | F. Vende in rete non qui, 5+ click | 76 | 16,68 | 0 | 0 | **TAGLIATO** |
 | G. Vende in rete non qui, <5 click | 531 | 17,58 | 0 | 0 | **TAGLIATO** |
 | H. Zero ovunque, 5+ click | 26 | 6,39 | 0 | 0 | **TAGLIATO** |
@@ -194,14 +194,27 @@ Dopo: sulle REMOVE firmate `capo_%`/`manual%` resta **un solo veto, il brand**, 
 - **894 bersagli → 887 REMOVE scritte** (esilio 7g). Le 7 mancanti sono PRICE_CUT `manual_pepita` già dispatched del capo (€0,24/gg totali): l'arbitro le protegge, corretto.
 - Zero veti scattati: nessun brand nel mucchio, nessun dato stantio.
 
-### Proiezione misurata sui click di OGGI (633 click / €208,51)
+### 🔴 CORREZIONE — 93 SKU rimessi dentro (il taglio era in parte sbagliato)
+Il capo ha contestato il criterio (*"vende 67€, ha sprecato 1,27 e lo stacchi?"*). Controllo a valle: **173 dei tagliati RIPAGAVANO il click 16-30 giorni fa** (€966 di margine per €130 di click, 7,4×). Segmentati per stock e volume click:
+
+| Segmento | SKU | €/gg | Margine prodotto 16-30gg | Decisione |
+|---|---|---|---|---|
+| Stock ok, **<15 click** in 15gg | 93 | 8,64 | **€487,73** | 🔙 **RIENTRANO** |
+| Stock ok, 15+ click, zero vendite | 13 | 12,74 | €95,82 | resta tagliato (verdetto solido) |
+| Stock ZERO (non può vendere) | 67 | 4,83 | €382,60 | resta tagliato (serve restock, non feed) |
+
+⭐ **L'errore: giudicare 15 giorni di zero vendite su 4 click.** Con ~4 click in 15gg e conversione ~5%, l'attesa matematica è 0,2 vendite: **zero è il risultato più probabile anche per un prodotto sano**. Il criterio "zero vendite 15gg" vale solo sopra una soglia di click che renda il verdetto significativo. Rinunciare a €8,64/gg di click per mettere a rischio €487/15gg (€32/gg) di margine è uno scambio pessimo. `capo_correzione_0508_rumore`, 93 DELETE.
+
+### Proiezione misurata sui click di OGGI (633 click / €208,51) — dopo la correzione
 | | SKU | Click oggi | Costo oggi |
 |---|---|---|---|
-| Tagliato stanotte (402 + 887) | 219 | 289 | **€95,20** |
-| Resta nel feed | 177 | 344 | €113,31 |
+| Tagliato stanotte (401 + 794) | 207 | 276 | **€90,91** |
+| Resta nel feed | 189 | 357 | €117,60 |
 
-**−46% del costo click MPF.** A fatturato invariato: incidenza 16,0% → **~8,7%**. Fatturato a rischio diretto: €67 su 15gg (classe E, 2 SKU).
+**−44% del costo click MPF.** A fatturato invariato: incidenza 16,0% → **~9,0%**. Fatturato locale a rischio diretto: **zero** — tutti i tagliati hanno 0 vendite su MPF in 15gg, e i lenti-ma-sani sono rientrati.
 Serie giornaliera MPF per il confronto: 4/8 €208 · 3/8 €280 · 2/8 €187 · 1/8 €212 · 31/7 €242 · 30/7 €218 · 29/7 €274 · 28/7 €287.
+
+**✅ USCITA DAL CSV CONFERMATA — cache MPF rigenerata 4/8 22:26:** tutti gli 887 fuori (`tagliati_ancora_dentro=0`). **Feed MPF 25.001 → 23.591 = −1.410 nella notte** (523 dal primo giro + 887 dal taglio di massa). TP li perde al prossimo refresh (ogni 4h da 00:00 ITA).
 
 ⚠️ **Da rivedere entro 7 giorni:** i 607 SKU delle classi F+G (€34,26/gg) **vendono in rete ma non su MPF**. Regola del capo: sono candidati **PC riposizionamento**, non morti. L'esilio è a 7 giorni proprio per questo: se il riposizionamento prezzo li rende competitivi, rientrano.
 

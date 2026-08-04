@@ -124,9 +124,52 @@ async function recalculateStableCache(tenantId) {
     [tenantId]
   );
   const filterEnabled = filterCfgRows.length > 0 && filterCfgRows[0].config_value === 'true';
+
+  // Filtro STRICT (direttiva 3/7/2026): nel CSV TP restano SOLO SKU vendibili
+  // (pos <= 10) o che vendono (store/seller/rete), più le eccezioni meritate
+  // (coorti fresche, azioni manuali, ADD engine, brand protetti).
+  // Vive QUI — a monte della cache — perché is_civetta è un mirror di Magento
+  // che productSync/civetta_sync sovrascrivono ogni ciclo: un flag locale non
+  // sopravvive, un filtro alla build sì.
+  const { rows: strictRows } = await pool.query(
+    `SELECT config_value FROM health_config WHERE tenant_id = $1 AND config_key = 'feed_filter_strict'`,
+    [tenantId]
+  );
+  const strictEnabled = strictRows.length > 0 && strictRows[0].config_value === 'true';
+  const { rows: brandRows } = await pool.query(
+    `SELECT config_value FROM health_config WHERE tenant_id = $1 AND config_key = 'killer_protected_brands'`,
+    [tenantId]
+  );
+  const protectedBrands = brandRows.length > 0
+    ? brandRows[0].config_value.split(',').map(b => b.trim().toUpperCase()).filter(Boolean)
+    : [];
+
+  // Posizione target DINAMICA per tenant (direttiva utente: mai hardcoded).
+  // Fallback tenant-wide = MAX(scraper_position) tra le regole prezzo attive;
+  // il per-prodotto usa la posizione della SUA regola (vedi strictFilter).
+  let tenantMaxPos = 10;
+  let strictPosMin = 0;
+  if (strictEnabled) {
+    const { rows: posRows } = await pool.query(
+      `SELECT MAX((rule_data->>'scraper_position')::int) AS max_pos
+       FROM price_rules
+       WHERE tenant_id = $1 AND (rule_data->>'scraper_position')::int > 0`,
+      [tenantId]
+    );
+    tenantMaxPos = posRows[0]?.max_pos || 10;
+    // Hack test (SubitoFarma 4/7): floor di valutazione posizione — regole
+    // grossista a target 5/6 valutate a 9 (GREATEST), il 12 diretto resta 12
+    const { rows: minRows } = await pool.query(
+      `SELECT config_value::int AS v FROM health_config
+       WHERE tenant_id = $1 AND config_key = 'strict_pos_target_min'`,
+      [tenantId]
+    );
+    strictPosMin = minRows[0]?.v || 0;
+  }
+
   // Pre-compute SKU con ordini reali 30g (per evitare EXISTS nested = 92s timeout).
   // Una sola scansione orders+order_items, poi JOIN nella query principale.
-  const ctePrefix = filterEnabled ? `
+  const ctePrefix = (filterEnabled || strictEnabled) ? `
     WITH skus_with_orders_30d AS (
       SELECT DISTINCT oi.sku
       FROM orders o JOIN order_items oi ON oi.order_id = o.id
@@ -157,9 +200,50 @@ async function recalculateStableCache(tenantId) {
           OR (COALESCE(p.supplier_stock, 0) >= 5
               AND COALESCE(p.margin_pct, 0) >= 14
               AND COALESCE(p.sell_price, 0) >= 8)
+          -- Brand protetti: la linea va tutta online, il filtro qualità non li tocca
+          OR is_brand_protected(p.tenant_id, p.sku)
+          -- PIN DEL CAPO: vince anche sul filtro qualità
+          OR EXISTS (SELECT 1 FROM capo_pins cp WHERE cp.tenant_id = p.tenant_id
+                       AND cp.sku = p.sku AND cp.revoked_at IS NULL)
         )` : '';
 
+  const strictFilter = strictEnabled ? `
+        AND (
+          EXISTS (SELECT 1 FROM product_health_scores sph
+                  WHERE sph.tenant_id = p.tenant_id AND sph.sku = p.sku
+                    AND sph.scraper_position <= GREATEST(COALESCE(
+                      NULLIF((SELECT (pr2.rule_data->>'scraper_position')::int
+                              FROM price_rules pr2
+                              WHERE pr2.tenant_id = p.tenant_id
+                                AND pr2.rule_id = p.price_rule_id), 0),
+                      $3::int), $4::int))
+          OR EXISTS (SELECT 1 FROM skus_with_orders_30d so WHERE so.sku = p.sku)
+          OR COALESCE(p.sales_30d_seller, 0) > 0
+          OR COALESCE(p.sales_30d_aggregated, 0) >= 2
+          OR EXISTS (SELECT 1 FROM activation_cohorts ac
+                     WHERE ac.tenant_id = p.tenant_id AND ac.sku = p.sku
+                       AND ac.activated_at >= NOW() - INTERVAL '14 days')
+          OR EXISTS (SELECT 1 FROM feed_actions fam
+                     WHERE fam.tenant_id = p.tenant_id AND fam.sku = p.sku
+                       AND fam.action_source IN ('manual_pepita','margin_harvest_pilot','manual_review','pareto_ai'))
+          OR fa.action = 'ADD'
+          OR (fa.action = 'PRICE_CUT' AND fa.recommended_price IS NOT NULL)
+          OR UPPER(COALESCE(p.brand, '')) = ANY($2::text[])
+          -- PIN DEL CAPO: vince anche sullo strict
+          OR EXISTS (SELECT 1 FROM capo_pins cp WHERE cp.tenant_id = p.tenant_id
+                       AND cp.sku = p.sku AND cp.revoked_at IS NULL)
+        )` : '';
+
+  // REGOLA DI BACKUP (ordine capo 11/7): finché lo scraper FB non riparte
+  // (pausa attiva), le attivazioni AI senza confronto competitor (ADD e
+  // coorti) valgono solo se il civetta di Farmabooster è d'accordo (=1).
+  // Il merito oggettivo (pos<=10 con dato reale, venduto seller) e i brand
+  // protetti restano sovrani: lì il confronto o la vendita c'è.
+  const scraperPausedBuild = await require('../services/scraperPause').isScraperOptimizationPaused();
+  const civettaBackup = scraperPausedBuild ? 'AND p.is_civetta = true' : '';
+
   // Build civetta=1 list (keep in feed)
+  const keepParams = strictEnabled ? [tenantId, protectedBrands, tenantMaxPos, strictPosMin] : [tenantId];
   const { rows: keepProducts } = await pool.query(`
     ${ctePrefix}
     SELECT p.sku
@@ -169,16 +253,151 @@ async function recalculateStableCache(tenantId) {
     WHERE p.tenant_id = $1
       AND (COALESCE(p.erp_stock, 0) + COALESCE(p.supplier_stock, 0)) > 0
       AND COALESCE(p.sell_price, 0) > 0   -- Skip SKU senza prezzo (sync sporco): non sprecare click TP
-      -- OBLIO cross-tenant: SKU burner globali esclusi da TUTTI i tenant
-      AND NOT EXISTS (SELECT 1 FROM cross_tenant_oblio o WHERE o.sku = p.sku AND o.status = 'active')
+      -- OBLIO cross-tenant: SKU burner globali esclusi da TUTTI i tenant.
+      -- ECCEZIONE stock safety net (9/7): il tenant con magazzino FISICO
+      -- lo tiene in vetrina — la regola aurea batte l'oblio di rete
+      AND (NOT EXISTS (SELECT 1 FROM cross_tenant_oblio o WHERE o.sku = p.sku AND o.status = 'active')
+           OR (COALESCE(p.erp_stock, 0) >= COALESCE((SELECT hc3.config_value::int FROM health_config hc3
+                 WHERE hc3.tenant_id = p.tenant_id AND hc3.config_key = 'stock_safety_net_min_units'), 5)
+               AND COALESCE(p.margin_pct, 0) >= 20)
+           OR is_brand_protected(p.tenant_id, p.sku))
       AND (
         (p.is_civetta = true AND (fa.action IS NULL OR fa.action NOT IN ('REMOVE')) AND fq.id IS NULL)
         OR
-        (fa.action = 'ADD' AND fq.id IS NULL)
-      )${qualityFilter}
-  `, [tenantId]);
+        -- REGOLA DI BACKUP (ordine capo 11/7, finché non riparte lo scraper):
+        -- senza confronto competitor, un'attivazione AI (ADD/coorte) vale SOLO
+        -- se Farmabooster è d'accordo (suo civetta=1). FB civetta=0 → fuori.
+        (fa.action = 'ADD' AND fq.id IS NULL ${civettaBackup})
+        OR
+        -- PC attivo = scommessa in corso: senza listing il taglio non lavora
+        (fa.action = 'PRICE_CUT' AND fa.recommended_price IS NOT NULL AND fq.id IS NULL)
+        OR
+        -- Coorti fresche (winback/push/pepite): il mirror Magento può stompare
+        -- is_civetta prima che Farmabooster applichi civettaai — la coorte
+        -- garantisce la membership CSV finché l'attivazione matura (14gg)
+        (fq.id IS NULL AND (fa.action IS NULL OR fa.action <> 'REMOVE')
+         AND EXISTS (SELECT 1 FROM activation_cohorts ac2
+                     WHERE ac2.tenant_id = p.tenant_id AND ac2.sku = p.sku
+                       AND ac2.activated_at >= NOW() - INTERVAL '14 days') ${civettaBackup})
+        OR
+        -- MERITO OGGETTIVO (fix circolo vizioso 10/7): is_civetta è l'ECO delle
+        -- nostre decisioni passate (CSV→FB→Magento→mirror). Un'uscita transitoria
+        -- spegneva il flag e il prodotto non rientrava MAI, anche in top10 con
+        -- vendite. Posizione in classifica o venduto 30g = dentro, eco o non eco.
+        (fq.id IS NULL AND (fa.action IS NULL OR fa.action <> 'REMOVE')
+         AND (COALESCE(p.sales_30d_seller, 0) > 0
+              OR EXISTS (SELECT 1 FROM product_health_scores sphm
+                         WHERE sphm.tenant_id = p.tenant_id AND sphm.sku = p.sku
+                           AND sphm.scraper_position <= 10)))
+        OR
+        -- PIN DEL CAPO (13/7: 'se ti dico attiva un prodotto, xHumanPro lo
+        -- recepisce e NON lo stacca più'): ordine esplicito, sempre in feed
+        -- finché non revocato — sopra ogni filtro, motore o quarantena
+        (EXISTS (SELECT 1 FROM capo_pins cp WHERE cp.tenant_id = p.tenant_id
+                   AND cp.sku = p.sku AND cp.revoked_at IS NULL))
+        OR
+        -- BRAND PROTETTI (dictat 10/7: 'Eucerin è protetto, va tutta online'):
+        -- la linea del cliente è SEMPRE esposta per intero — nessun filtro di
+        -- posizione, qualità o civetta può nasconderla. Restano sovrani solo
+        -- quarantene/REMOVE deliberati (che i trigger comunque vietano qui).
+        (fq.id IS NULL AND (fa.action IS NULL OR fa.action <> 'REMOVE')
+         AND is_brand_protected(p.tenant_id, p.sku))
+      )${qualityFilter}${strictFilter}
+  `, keepParams);
 
   let feedCodes = keepProducts.map(p => p.sku);
+
+  // 🐎 BRIGLIE LARGHE (ordine capo 12/7 sera, SubitoFarma 72h): finché il
+  // flag non scade, il feed = TUTTO il vivo (stock+prezzo+saleable) tranne
+  // l'OBLIO, più QUALUNQUE prodotto col nostro merchant in posizione <=N su
+  // TP (anche civetta FB=0). Config: health_config.briglie_larghe = N
+  // (posizione max), con expires_at. Alla scadenza si torna alle regole.
+  try {
+    const { rows: briglie } = await pool.query(
+      `SELECT config_value::int AS pos_max FROM health_config
+       WHERE tenant_id = $1 AND config_key = 'briglie_larghe'
+         AND config_value ~ '^[0-9]+$'
+         AND (expires_at IS NULL OR expires_at > NOW())`, [tenantId]);
+    if (briglie.length > 0) {
+      const posMax = briglie[0].pos_max;
+      const { rows: wide } = await pool.query(`
+        WITH mm AS (SELECT rx FROM (VALUES
+          ('SubitoFarma','subitofarma'), ('Farmacia San Vito','san vito'), ('MPF','personal farma'),
+          ('Papa','farmacia papa'), ('Farmacia Procaccini','procaccini'), ('Farmacri','farmacri'),
+          ('Farmainsieme','farmainsieme'), ('Farmacia Mandanici','mandanici'),
+          ('Farmacia Ospedale','ospedale'), ('Farmastelia','farmastelia')) v(tn, rx)
+          JOIN tenants t ON t.name = v.tn WHERE t.id = $1)
+        SELECT p.sku FROM products p
+        WHERE p.tenant_id = $1 AND p.saleable = true
+          AND (COALESCE(p.erp_stock, 0) + COALESCE(p.supplier_stock, 0)) > 0
+          AND COALESCE(p.sell_price, 0) > 0
+          AND (p.is_civetta = true
+               OR EXISTS (SELECT 1 FROM scraper_competitors sc, mm
+                          WHERE sc.product_code = p.sku AND sc.merchant ~* mm.rx
+                            AND sc.position BETWEEN 1 AND $2))
+          AND NOT EXISTS (SELECT 1 FROM cross_tenant_oblio o
+                          WHERE o.sku = p.sku AND o.status = 'active')`,
+        [tenantId, posMax]);
+      // UNIONE col feed normale: le briglie larghe AGGIUNGONO, mai tolgono
+      const wideSet = new Set(feedCodes);
+      for (const w of wide) wideSet.add(w.sku);
+      feedCodes = Array.from(wideSet);
+      console.log(`[FeedStable][T:${tenantId.slice(0, 8)}] 🐎 BRIGLIE LARGHE attive (pos<=${posMax}): feed aperto a ${feedCodes.length} prodotti (solo oblio escluso)`);
+    }
+  } catch (e) { console.error('[FeedStable] briglie larghe err:', e.message); }
+
+  // Isteresi (direttiva 4/7/2026): i dati scraper sono rumorosi e i CSV
+  // oscillavano di migliaia di SKU tra build (Procaccini 13,6k->9,8k in ore).
+  // Chi passa il filtro aggiorna last_pass in feed_membership; chi era membro
+  // e ora fallisce lo STRICT resta in grazia per feed_exit_grace_hours (72h
+  // default) purché passi i filtri BASE. Uscite immediate restano tali:
+  // killer/REMOVE/quarantena/oblio/stock 0/prezzo 0.
+  if (strictEnabled) {
+    try {
+      const { rows: graceCfg } = await pool.query(
+        `SELECT config_value::int AS h FROM health_config
+         WHERE tenant_id = $1 AND config_key = 'feed_exit_grace_hours'`, [tenantId]);
+      const graceHours = graceCfg.length > 0 ? graceCfg[0].h : 72;
+      for (let i = 0; i < feedCodes.length; i += 5000) {
+        await pool.query(`
+          INSERT INTO feed_membership (tenant_id, sku, last_pass)
+          SELECT $1, unnest($2::text[]), NOW()
+          ON CONFLICT (tenant_id, sku) DO UPDATE SET last_pass = NOW()
+          WHERE feed_membership.last_pass < NOW() - INTERVAL '4 hours'`,
+          [tenantId, feedCodes.slice(i, i + 5000)]);
+      }
+      if (graceHours > 0) {
+        const { rows: graceRows } = await pool.query(`
+          SELECT fm.sku
+          FROM feed_membership fm
+          JOIN products p ON p.tenant_id = fm.tenant_id AND p.sku = fm.sku
+          LEFT JOIN feed_actions fa ON fa.tenant_id = p.tenant_id AND fa.sku = p.sku
+          LEFT JOIN feed_quarantine fq ON fq.tenant_id = p.tenant_id AND fq.sku = p.sku AND fq.reactivated = false
+          WHERE fm.tenant_id = $1
+            AND fm.last_pass >= NOW() - ($2 || ' hours')::interval
+            AND NOT (fm.sku = ANY($3::text[]))
+            AND (COALESCE(p.erp_stock, 0) + COALESCE(p.supplier_stock, 0)) > 0
+            AND COALESCE(p.sell_price, 0) > 0
+            AND (fa.action IS NULL OR fa.action <> 'REMOVE')
+            AND fq.id IS NULL
+            AND (NOT EXISTS (SELECT 1 FROM cross_tenant_oblio o WHERE o.sku = p.sku AND o.status = 'active')
+                 OR (COALESCE(p.erp_stock, 0) >= COALESCE((SELECT hc3.config_value::int FROM health_config hc3
+                       WHERE hc3.tenant_id = p.tenant_id AND hc3.config_key = 'stock_safety_net_min_units'), 5)
+                     AND COALESCE(p.margin_pct, 0) >= 20))
+            AND NOT EXISTS (SELECT 1 FROM feed_killers fk WHERE fk.tenant_id = p.tenant_id AND fk.sku = p.sku AND fk.is_active)`,
+          [tenantId, graceHours, feedCodes]);
+        if (graceRows.length > 0) {
+          feedCodes = feedCodes.concat(graceRows.map(r => r.sku));
+          console.log(`[FeedStable][T:${tenantId.slice(0, 8)}] Isteresi: +${graceRows.length} in grazia (${graceHours}h)`);
+        }
+      }
+      await pool.query(
+        `DELETE FROM feed_membership WHERE tenant_id = $1 AND last_pass < NOW() - INTERVAL '30 days'`,
+        [tenantId]);
+    } catch (e) {
+      console.error('[FeedStable] isteresi err:', e.message);
+    }
+  }
 
   // Module 2: Feed Cap — limit max products with priority sorting
   const { rows: capCfg } = await pool.query(
@@ -192,13 +411,39 @@ async function recalculateStableCache(tenantId) {
 
   let cappedProducts = [];
   if (feedCapEnabled && feedCodes.length > feedCapMax) {
-    // Sort by priority: orders * 10 + revenue * 0.01 + health_score
+    // Ordinamento del cap (rev. 5/8, ordine capo "feed sotto i 20.000 senza tagliare vendite").
+    // La vecchia formula pesava tp_attributed_orders/revenue: dato VIETATO dalla dottrina
+    // (l'unica verita' sulle vendite sono gli ordini reali Magento). Qui la priorita' e':
+    //   1. brand protetti  -> non escono MAI dal feed per cap ("i brand lasciali stare")
+    //   2. pin del capo    -> prima classe protetta
+    //   3. vendite reali Magento 90gg (ordini, poi fatturato)
+    //   4. stock fisico in farmacia (regola aurea: spingere il magazzino)
+    //   5. health_score come spareggio
+    // Chi resta in coda e finisce sotto la soglia e' materia muta: ne' vende ne' clicca.
     const { rows: priorityRows } = await pool.query(`
+      WITH ord90 AS (
+        SELECT oi.sku,
+               COUNT(DISTINCT o.id) AS ordini,
+               SUM(oi.qty_ordered * oi.price) AS fatt
+        FROM order_items oi
+        JOIN orders o ON o.id = oi.order_id
+        WHERE oi.tenant_id = $1
+          AND o.order_date >= NOW() - INTERVAL '90 days'
+          AND o.order_status IN ('processing','pending','complete','ritiro_farmacia','Ritirato')
+        GROUP BY 1
+      )
       SELECT ph.sku,
-        (COALESCE(ph.tp_attributed_orders, 0) * 10 +
-         COALESCE(ph.tp_attributed_revenue, 0) * 0.01 +
+        (CASE WHEN is_brand_protected($1, ph.sku) THEN 1000000 ELSE 0 END +
+         CASE WHEN EXISTS (SELECT 1 FROM capo_pins cp
+                           WHERE cp.tenant_id = $1 AND cp.sku = ph.sku
+                             AND cp.revoked_at IS NULL) THEN 500000 ELSE 0 END +
+         COALESCE(o90.ordini, 0) * 100 +
+         COALESCE(o90.fatt, 0) * 0.1 +
+         CASE WHEN COALESCE(p.erp_stock, 0) > 0 THEN 50 ELSE 0 END +
          COALESCE(ph.health_score, 0)) AS priority_score
       FROM product_health_scores ph
+      LEFT JOIN ord90 o90 ON o90.sku = ph.sku
+      LEFT JOIN products p ON p.tenant_id = ph.tenant_id AND p.sku = ph.sku
       WHERE ph.tenant_id = $1 AND ph.sku = ANY($2)
     `, [tenantId, feedCodes]);
 
@@ -241,13 +486,86 @@ async function recalculateStableCache(tenantId) {
     WHERE fa.tenant_id = $1
       AND fa.recommended_price IS NOT NULL
       AND (fa.action = 'PRICE_CUT' OR fa.action = 'ADD')
+      -- VETO brand protetti (cintura oltre al trigger DB): i prezzi dei brand
+      -- strategia-cliente non escono MAI nel payload verso Farmabooster
+      AND NOT EXISTS (
+        SELECT 1 FROM products p2
+        JOIN health_config hc ON hc.tenant_id = p2.tenant_id
+          AND hc.config_key = 'killer_protected_brands'
+        WHERE p2.tenant_id = fa.tenant_id AND p2.sku = fa.sku
+          AND UPPER(COALESCE(p2.brand, '')) IN
+            (SELECT BTRIM(UPPER(x)) FROM unnest(STRING_TO_ARRAY(hc.config_value, ',')) x)
+      )
   `, [tenantId]);
 
   const priceCuts = priceCutRows.map(r => ({ code: r.code, newprice: String(Math.round(parseFloat(r.newprice) * 100) / 100) }));
 
   const updatedAt = new Date().toISOString();
   const entry = { feedCodes, removeCodes, priceCuts, updatedAt };
+
+  // 🪂 PARACADUTE FEED (capo 12/7: 'se continuiamo a troncare i feed di
+  // Trovaprezzi andiamo in bancarotta'): un rebuild non può RESTRINGERE il
+  // CSV oltre il 10% in un colpo. Se accade: si MANTIENE il feed precedente,
+  // allarme Telegram, e serve una decisione umana.
+  // Bypass deliberato (tagli voluti dal capo): health_config feed_drop_guard_off='1'
+  try {
+    const { rows: guardPrev } = await pool.query(
+      `SELECT jsonb_array_length(config_value::jsonb->'codes') n, config_value
+       FROM tenant_configs WHERE tenant_id = $1 AND config_key = 'stable_feed_codes'`, [tenantId]);
+    const prevN = guardPrev.length > 0 ? parseInt(guardPrev[0].n) : 0;
+    const { rows: guardOff } = await pool.query(
+      `SELECT 1 FROM health_config WHERE tenant_id = $1
+       AND config_key = 'feed_drop_guard_off' AND config_value = '1'`, [tenantId]);
+    if (guardOff.length === 0 && prevN > 1000 && feedCodes.length < prevN * 0.90) {
+      console.error(`[FeedStable][T:${tenantId.slice(0, 8)}] 🪂 PARACADUTE: build ${feedCodes.length} vs precedente ${prevN} (oltre -10%) — feed precedente MANTENUTO`);
+      try {
+        const { sendTelegram } = require('../services/telegramNotifier');
+        await sendTelegram(
+          `🪂 <b>PARACADUTE FEED</b>: la build voleva ridurre un CSV da ${prevN} a ${feedCodes.length} prodotti (oltre -10%). ` +
+          `Feed precedente MANTENUTO — verificare la causa prima di autorizzare (bypass: feed_drop_guard_off=1).`,
+          { key: `feed_guard_${tenantId}`, parseMode: 'HTML', throttleMs: 2 * 3600 * 1000 });
+      } catch {}
+      const prevCfg = JSON.parse(guardPrev[0].config_value);
+      const prevEntry = { feedCodes: prevCfg.codes || [], removeCodes: prevCfg.removeCodes || [], priceCuts, updatedAt };
+      stableCache.set(tenantId, prevEntry);
+      return prevEntry;
+    }
+  } catch (e) { console.error('[FeedStable] paracadute err:', e.message); }
+
   stableCache.set(tenantId, entry);
+
+  // Log entrata/uscita dal feed (direttiva 3/7/2026): diff del CSV vs build
+  // precedente. Questo è il feed VERO che va a TP — il trigger su is_civetta
+  // logga solo il mirror Magento, qui logghiamo la membership effettiva.
+  try {
+    const { rows: prevRows } = await pool.query(
+      `SELECT config_value FROM tenant_configs WHERE tenant_id = $1 AND config_key = 'stable_feed_codes'`,
+      [tenantId]
+    );
+    const prevCodes = prevRows.length > 0
+      ? (JSON.parse(prevRows[0].config_value).codes || []) : [];
+    const prevSet = new Set(prevCodes);
+    const newSet = new Set(feedCodes);
+    const entered = feedCodes.filter(s => !prevSet.has(s));
+    const exited = prevCodes.filter(s => !newSet.has(s));
+    for (const [list, dir] of [[entered, 'IN'], [exited, 'OUT']]) {
+      for (let i = 0; i < list.length; i += 1000) {
+        await pool.query(`
+          INSERT INTO feed_movements (tenant_id, sku, direction, reason, sell_price, ricarico_pct, erp_stock)
+          SELECT p.tenant_id, p.sku, $3, 'csv_build', p.sell_price,
+            CASE WHEN COALESCE(p.erp_cost, 0) > 0
+                 THEN ROUND(((p.sell_price - p.erp_cost) / p.erp_cost * 100)::numeric, 2) END,
+            p.erp_stock
+          FROM products p WHERE p.tenant_id = $1 AND p.sku = ANY($2)`,
+          [tenantId, list.slice(i, i + 1000), dir]);
+      }
+    }
+    if (entered.length || exited.length) {
+      console.log(`[FeedMovements][T:${tenantId.slice(0, 8)}] CSV diff: IN=${entered.length} OUT=${exited.length}`);
+    }
+  } catch (e) {
+    console.error('[FeedMovements] diff log error:', e.message);
+  }
 
   // Persist to DB
   await pool.query(
@@ -591,6 +909,24 @@ router.post('/feed/action-plan', async (req, res) => {
     console.error('[ExternalAPI] Action plan query error:', err.message);
     res.status(500).json({ error: 'Internal server error' });
   }
+});
+
+// POST /api/external/v1/scraper-updated
+// Webhook FB (11/7): il dev di Farmabooster ci notifica quando lo scraper ha
+// consegnato dati freschi → import immediato + riprezzo intraday. Reazione in
+// secondi invece del polling orario. Body opzionale: { file, timestamp, note }.
+router.post('/scraper-updated', async (req, res) => {
+  console.log('[ScraperWebhook] notifica FB:', JSON.stringify(req.body || {}).slice(0, 200));
+  res.json({ ok: true, received_at: new Date().toISOString() });
+  // fire-and-forget: l'import gira dopo la risposta (il webhook non attende)
+  setImmediate(() => {
+    try {
+      const { pollScraper } = require('../services/scraperPoller');
+      pollScraper().catch(e => console.error('[ScraperWebhook] poll err:', e.message));
+    } catch (e) {
+      console.error('[ScraperWebhook] err:', e.message);
+    }
+  });
 });
 
 // POST /api/external/v1/feed/acknowledge

@@ -331,3 +331,88 @@ Anche tagliando **ogni singolo SKU cliccato** — sani e brand compresi — il f
 | stock 0 (fuori dalle logiche per ordine) | 126 | 8,31 |
 
 Il primo blocco di spesa ora sono **i brand protetti: €39,23/gg, il 41% di tutto il costo click residuo**. Finché restano fermi, il costo TP di MPF non scende oltre.
+
+---
+
+## 5/8 — FEED SOTTO I 20.000: la leva era già in casa, spenta
+
+**Ordine capo:** *"i brand lasciali stare, taglia tutto quello che puoi, il feed deve scendere sotto i 20000 senza tagliare vendite"* + *"i tagli li devi trovare tra i burner"*.
+
+I burner si erano esauriti a ~450 SKU: tagliando SKU per SKU non si arriva sotto 20.000 senza toccare roba che vende. La strada era un'altra.
+
+### Il Feed Cap esisteva già — ed era spento
+
+`externalApi.js` Module 2: un tetto alla dimensione del feed applicato **in fase di export** verso Farmabooster. Su MPF: `feed_cap_enabled: false`, `feed_cap_max: 25000`. Mai acceso.
+
+Due difetti che lo rendevano inutilizzabile così com'era:
+
+1. **Ordinava con dati vietati.** `priority = tp_attributed_orders*10 + tp_attributed_revenue*0.01 + health_score`. Il TP-attributed è escluso dalla dottrina: l'unica verità sulle vendite sono gli ordini reali Magento. Su MPF solo 5.231 righe su 93.506 hanno tp_attributed valorizzato — il resto ordinava di fatto per solo `health_score`.
+2. **Non conosceva i brand protetti.** A 20.000, la vecchia formula lasciava fuori **30 brand protetti**. Contro l'ordine del capo.
+
+### Patch dell'ordinamento (margine-first)
+
+```
+1. brand protetti          +1.000.000   -> non escono MAI per cap
+2. pin del capo              +500.000   -> prima classe protetta
+3. ordini reali Magento 90gg    x100
+4. fatturato reale 90gg         x0,1
+5. stock fisico in farmacia       +50   -> regola aurea: spingere il magazzino
+6. health_score                        -> spareggio
+```
+
+Deploy: `node --check` OK, `docker cp`, grep verificato, restart, `/api/health` = ok.
+
+### Acceso a 19.500
+
+`feed_cap_max = 19500`, `feed_cap_enabled = true`, writer `capo_feedcap_0508`.
+
+```
+[FeedCap][T:d581c087] Cap 19500: 3918 products below threshold
+[FeedStable][T:d581c087] Saved: 19500 civetta=1, 10034 civetta=0, 45 price cuts
+```
+
+**Feed MPF: 25.001 → 23.418 (tagli) → 19.500.** Ordine eseguito.
+
+### Verifica: cosa è uscito col cap
+
+| controllo | esito |
+|---|---|
+| brand protetti fuori dal feed | **0** su 432 |
+| SKU usciti col cap che vendono su MPF 90gg | **0** |
+| fatturato MPF a rischio | **€0** |
+| click che consumavano i 3.918 (15gg) | **4** — €0,09/gg |
+
+I 15 SKU venditori usciti stanotte sono usciti tutti per i tagli espliciti (`pulizia_capo_taglio_0508`, `pulizia_burner_0508`), **nessuno per il cap**. Verificato SKU per SKU.
+
+### Cosa il cap NON fa
+
+Non abbatte la spesa domani: quei 3.918 erano già muti (€0,09/gg). Il cap serve a **ridurre la superficie di rotazione** — vedi sotto.
+
+### Perché €208 in un giorno se i bruciatori sono finiti: la rigenerazione
+
+Misura sui 7 giorni: **917 SKU mai cliccati nei 30 giorni precedenti sono entrati in rotazione**, €445,76 (€63,68/gg), **36 hanno venduto** (il 3,9%). Ogni nuovo entrante si prende ~1,5 click (~€0,49): sotto qualunque soglia individuale, invisibile a ogni motore che giudica SKU per SKU.
+
+Provenienza dei 917:
+
+| origine | SKU | €/gg |
+|---|---|---|
+| stock fisico in farmacia | 369 | 31,86 |
+| stock 0 ma vendono in rete | 433 | 26,02 |
+| coda morta mai venduta | 93 | 4,71 |
+| coda morta oltre 180gg | 22 | 1,08 |
+
+Tagliare SKU per SKU è guerra di trincea: ne togli 350, ne entrano 900. **Il costo non sta in un blocco di prodotti-spazzatura da rimuovere: sta nella dimensione del feed stesso**, perché ogni SKU dentro prima o poi si prende il suo assaggio di click.
+
+### Struttura del residuo (€95/gg) per fascia di margine unitario vero
+
+| fascia | SKU | €/gg |
+|---|---|---|
+| margine ZERO o negativo | 11 | 2,04 |
+| margine < 1 click (0,33) | 367 | 0,00 |
+| margine < 3 click (1,00) | 3.128 | 2,97 |
+| margine 1-3 € | 13.768 | 37,42 |
+| margine ≥ 3 € | 6.144 | 52,83 |
+
+**Il 95% della spesa residua la fanno prodotti con margine sufficiente a ripagare i click.** Non è spazzatura che brucia: è merce sana che non converte. Il problema è a valle del click — coerente col verdetto 4/8 sulla conversione dimezzata.
+
+Eccezione da chiudere: **11 SKU con margine ≤ 0** che consumano €2,04/gg — vendono in perdita e pagano pure i click.

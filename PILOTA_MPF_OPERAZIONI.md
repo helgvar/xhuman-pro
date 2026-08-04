@@ -214,7 +214,35 @@ Il capo ha contestato il criterio (*"vende 67€, ha sprecato 1,27 e lo stacchi?
 **−44% del costo click MPF.** A fatturato invariato: incidenza 16,0% → **~9,0%**. Fatturato locale a rischio diretto: **zero** — tutti i tagliati hanno 0 vendite su MPF in 15gg, e i lenti-ma-sani sono rientrati.
 Serie giornaliera MPF per il confronto: 4/8 €208 · 3/8 €280 · 2/8 €187 · 1/8 €212 · 31/7 €242 · 30/7 €218 · 29/7 €274 · 28/7 €287.
 
-**✅ USCITA DAL CSV CONFERMATA — cache MPF rigenerata 4/8 22:26:** tutti gli 887 fuori (`tagliati_ancora_dentro=0`). **Feed MPF 25.001 → 23.591 = −1.410 nella notte** (523 dal primo giro + 887 dal taglio di massa). TP li perde al prossimo refresh (ogni 4h da 00:00 ITA).
+**Uscita dal CSV alle 22:26 — poi ANNULLATA (vedi sotto).** Il feed era sceso 25.001 → 23.591 (−1.410), ma alle 22:44 la rigenerazione successiva ha rimesso dentro tutti gli 894.
+
+### 🪤 IL TAGLIO È EVAPORATO DOPO 7 SECONDI — causa e riparazione (4/8 22:50)
+
+`feedDailyEngine.js:1602` all'inizio di ogni ricalcolo cancella tutte le `feed_actions` del tenant tranne una whitelist ristretta **e i source che iniziano per `pulizia_`**:
+
+```sql
+DELETE FROM feed_actions WHERE tenant_id = $1
+  AND (action_source IS NULL
+       OR (action_source NOT IN ('manual_pepita','margin_harvest_pilot','manual_review',
+                                 'muro_scavalco','manual','capo_pin')
+           AND action_source NOT LIKE 'pulizia_%')
+       OR expires_at < NOW())
+```
+
+Il taglio era firmato `capo_taglio_click_zero_vendite`: fuori whitelist, senza prefisso. Scritto alle **20:20:18 UTC**, il motore è partito alle **20:20:25** (7 secondi dopo) e ha cancellato tutte e 894 le righe. Anche i 401 di `sessione_capo` sono spariti. Nessun errore, nessun alert: il CSV delle 22:44 aveva **894/894 tagliati di nuovo dentro** e la spesa click era ripartita.
+
+⭐ La firma dell'Arbitro (`xhp.writer='capo_%'`) **non protegge da questo**: governa i veti alla scrittura, non la DELETE del rerun. Era già successo il 14/7 (520 REMOVE della pulizia classe A spazzati) — il commento a riga 1607 lo dice, e la toppa di allora fu proprio il prefisso `pulizia_%`. Infatti `pulizia_classeA_14lug` (268), `pulizia_lima_costante` (137) e `pulizia_vetrina_piena` (82) sono ancora in piedi.
+
+**Riparazione — `pulizia_capo_taglio_0508`, 4/8 22:52:** taglio riscritto con lo stesso criterio già corretto (esclusi brand protetti, carrelli sani, pin, e chi ripagava il click 16-30gg fa con stock e <15 click), source col prefisso che sopravvive.
+
+| | SKU | Click 15gg | Costo |
+|---|---|---|---|
+| Bersagli | 1.178 | 2.354 | **€51,76/gg** |
+| Scritti | 1.172 | | €51,57/gg |
+
+6 respinti dall'arbitro (righe manuali protette). Il set è più grande dei 794 di prima perché ingloba anche i 401 di `sessione_capo`, spazzati dallo stesso rerun. L'INSERT del motore è `ON CONFLICT DO NOTHING` (riga 1593): ora le righe sopravvissute **vincono** sul ricalcolo.
+
+⚠️ **Regola operativa nuova:** ogni `feed_actions` scritta a mano deve avere `action_source` che inizia per `pulizia_`, e va **ricontrollata dopo il primo rerun del motore** — mai dare per fatto un taglio appena scritto.
 
 ⚠️ **Da rivedere entro 7 giorni:** i 607 SKU delle classi F+G (€34,26/gg) **vendono in rete ma non su MPF**. Regola del capo: sono candidati **PC riposizionamento**, non morti. L'esilio è a 7 giorni proprio per questo: se il riposizionamento prezzo li rende competitivi, rientrano.
 

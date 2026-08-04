@@ -36,8 +36,9 @@ function calculatePriceCut(sellPrice, erpCost, bestPrice) {
   // Floor = il più alto fra i due (più conservativo)
   const floor = Math.max(priceFloorByRicarico, priceFloorByMarkup);
 
-  // Target: match best price - 1%, but not below floor
-  const target = Math.max(bestPrice * 0.99, floor);
+  // Target: 1 CENT sotto il best, mai l'1% (direttiva 7/7: bestPrice*0.99
+  // regalava ~1% di prezzo a ogni vendita — stesso sorpasso, margine pieno)
+  const target = Math.max(bestPrice - 0.01, floor);
   if (target >= sellPrice) return null; // Can't cut enough
   if (sellPrice - target < 0.10) return null; // Cut too small
   // Se il target è >= bestPrice, non riusciamo a batter il competitor: no cut utile.
@@ -420,7 +421,7 @@ async function detectKillers(tenantId) {
       SELECT oi.sku, COUNT(DISTINCT o.id) as ord_30d
       FROM orders o JOIN order_items oi ON oi.order_id = o.id
       WHERE o.order_status NOT IN ('canceled','closed','pending_payment')
-        AND o.order_date >= NOW() - INTERVAL '30 days'
+        AND o.order_date >= NOW() - INTERVAL '15 days'
       GROUP BY oi.sku
     )
     SELECT p.sku, p.product_name,
@@ -439,15 +440,20 @@ async function detectKillers(tenantId) {
       AND p.is_civetta = true
       AND fk.id IS NULL
       AND COALESCE(ao.ord_30d, 0) = 0
-      -- LA BIBBIA (feedback_bibbia_margine_first): soglia click DINAMICA sul
-      -- margine dello SKU, mai fissa. break-even = margine_eur / CPC (0.3294).
-      -- Kill solo dopo aver speso 1.5x il margine di UN ordine senza vendere:
-      -- SKU margine €1 -> kill da ~5 click; SKU margine €12 -> kill da ~55.
+      -- LA BIBBIA (feedback_bibbia_margine_first) + MARGINE 100% (capo 24/7):
+      -- soglia click DINAMICA sul MARGINE UNITARIO VERO (non il listino p.margin:
+      -- il listino mente, il vero e' prezzo_vero - costo_vero del momento).
+      -- Kill quando il click ha BRUCIATO il 100% del margine di UN ordine:
+      -- break-even = margine_vero / CPC (0.3294), nessun moltiplicatore.
       -- clickMin di config resta il pavimento minimo.
       AND COALESCE(phs.tp_clicks_30d, 0) >= GREATEST(
         $2::numeric,
-        CEIL(GREATEST(COALESCE(p.margin, p.sell_price - p.erp_cost), 0) / 0.3294 * 1.5)
+        CEIL(GREATEST(margine_unitario_vero(p.tenant_id, p.sku), 0) / 0.3294)
       )
+      -- GUARDIA TEST (riattivazione mig 072): non ri-killare in finestra test 5gg.
+      AND NOT EXISTS (SELECT 1 FROM margin_block_tests m
+        WHERE m.tenant_id = p.tenant_id AND m.sku = p.sku
+          AND m.in_test AND m.test_ends_at > NOW())
       AND COALESCE(phs.tp_click_cost_30d, 0) >= $3
       -- Brand protetti PER-TENANT via health_config.killer_protected_brands
       -- ($4 array). Default vuoto: nessun brand escluso.
@@ -467,13 +473,13 @@ async function detectKillers(tenantId) {
   for (const k of killers) {
     await pool.query(`
       INSERT INTO feed_killers (tenant_id, sku, total_sellers, global_demand, avg_position, reason, quarantine_until)
-      VALUES ($1, $2, $3, $4, $5, $6, NOW() + INTERVAL '30 days')
+      VALUES ($1, $2, $3, $4, $5, $6, NOW() + INTERVAL '7 days')
       ON CONFLICT (tenant_id, sku) DO UPDATE SET
         total_sellers = $3, global_demand = $4, reason = $6,
-        quarantine_until = NOW() + INTERVAL '30 days', is_active = true, detected_at = NOW()
+        quarantine_until = NOW() + INTERVAL '7 days', is_active = true, detected_at = NOW()
     `, [
       tenantId, k.sku, k.sellers, k.global_demand, k.our_position,
-      `Bruciatore: ${k.clicks_30d} click 30g (€${parseFloat(k.cost_30d).toFixed(2)} spesi) e 0 vendite cross-tenant. Margine €${parseFloat(k.margin_eur || 0).toFixed(2)} = break-even ${Math.ceil((parseFloat(k.margin_eur || 0)) / 0.3294)} click, superato 1.5x`
+      `Bruciatore: ${k.clicks_30d} click 30g (€${parseFloat(k.cost_30d).toFixed(2)} spesi) e 0 vendite cross-tenant. Margine 100% bruciato dai click (break-even margine unitario vero / CPC superato).`
     ]);
     inserted++;
   }
@@ -486,6 +492,10 @@ async function detectKillers(tenantId) {
 
 async function triageProducts(tenantId, config, snapshot, ruleSet = null) {
   if (!snapshot) return { actions: {}, stats: {} };
+
+  // ⛔ PAUSA SCRAPER (ordine capo 11/7): con lo scraper a rotazione ridotta
+  // l'assenza di posizione non è colpa del prodotto — il blocco B0 è sospeso
+  const scraperPaused = await require('./scraperPause').isScraperOptimizationPaused();
 
   // Get product "conto corrente" aggregato su tutto il periodo TP attivo
   const { rows: products } = await pool.query(`
@@ -522,7 +532,7 @@ async function triageProducts(tenantId, config, snapshot, ruleSet = null) {
       JOIN order_items oi ON oi.order_id = o.id
       WHERE o.tenant_id = $1
         AND o.order_status NOT IN ('canceled','closed','pending_payment')
-        AND o.order_date >= NOW() - INTERVAL '30 days'
+        AND o.order_date >= NOW() - INTERVAL '15 days'
       GROUP BY oi.sku
     )
     SELECT pt.*,
@@ -814,7 +824,10 @@ async function triageProducts(tenantId, config, snapshot, ruleSet = null) {
     // dove sta nella SERP TP, non possiamo decidere se è competitivo. Lo
     // togliamo dal feed per non sprecare budget alla cieca. Eccezione:
     // se ha 0 click (es. SKU appena entrato) lo lasciamo girare.
-    if (!position && totalClicks >= 3) {
+    // ⛔ PAUSA SCRAPER (ordine capo 11/7): l'assenza di posizione NON è
+    // colpa del prodotto quando lo scraper consegna a rotazione ridotta
+    // (dump decimato dal 9/7: 2.058 REMOVE ingiusti). Blocco sospeso.
+    if (!position && totalClicks >= 3 && !scraperPaused) {
       actions.remove.push({
         sku: p.sku, name: p.product_name, action: 'REMOVE',
         reason: `Nessuna posizione scraper, ${totalClicks} click in ${daysClicked}gg → blocchiamo per evitare spreco`,
@@ -960,7 +973,7 @@ async function findPriceCutCandidates(tenantId, config, snapshot) {
               * (SELECT COUNT(DISTINCT o.id) FROM orders o JOIN order_items oi ON oi.order_id=o.id
                  WHERE o.tenant_id=p.tenant_id AND oi.sku=p.sku
                  AND o.order_status NOT IN ('canceled','closed','pending_payment')
-                 AND o.order_date >= NOW() - INTERVAL '30 days')
+                 AND o.order_date >= NOW() - INTERVAL '15 days')
               < COALESCE(phs.tp_click_cost_30d, 0) * 1.0
         )
       )
@@ -990,8 +1003,8 @@ async function findPriceCutCandidates(tenantId, config, snapshot) {
     else minMarginPct = 12;
 
     const floorPrice = erpCost * (1 + minMarginPct / 100);
-    // Target: match best price -1% (ma non sotto floor)
-    const targetPrice = Math.max(bestPrice * 0.99, floorPrice);
+    // Target: 1 CENT sotto il best (mai -1%: regalava margine), non sotto floor
+    const targetPrice = Math.max(bestPrice - 0.01, floorPrice);
 
     // Solo se il taglio è significativo (> 0.50€) e il target è sotto il prezzo attuale
     if (targetPrice >= sellPrice - 0.50) continue;
@@ -1127,6 +1140,23 @@ async function queryPepiteTier(tenantId, posMin, posMax, marginMin, salesMin, li
       AND fq.id IS NULL
       AND phs.scraper_position BETWEEN $4 AND $5
       AND (pr.rule_type IS NULL OR pr.rule_type != 'sconto')
+      -- DICTAT capo 23/7 (listino NON e' riferimento): il markup di listino
+      -- (margin_pct) puo' essere alto mentre il prodotto vende REALMENTE a costo
+      -- (bulk/special price Magento). Escludi chi, sul VENDUTO REALE (ordini
+      -- Magento) - costo_vero del momento, sta sotto il floor 12%: e' una pepita
+      -- FALSA (caso 023547060: listino 8,59 ma venduto 6,58 a costo 6,51).
+      AND NOT EXISTS (
+        SELECT 1 FROM orders o2
+          JOIN order_items oi2 ON oi2.order_id = o2.id
+        WHERE o2.tenant_id = p.tenant_id AND oi2.sku = p.sku
+          AND o2.order_status IN ('processing','pending','complete','ritiro_farmacia','Ritirato')
+          AND o2.order_date >= NOW() - INTERVAL '45 days'
+        GROUP BY oi2.sku
+        HAVING SUM(oi2.qty_ordered) >= 2
+          AND ( SUM(oi2.row_total_incl_tax) / NULLIF(SUM(oi2.qty_ordered),0)
+                - costo_vero(p.tenant_id, p.sku) )
+              / NULLIF( SUM(oi2.row_total_incl_tax) / NULLIF(SUM(oi2.qty_ordered),0), 0 ) < 0.12
+      )
     ORDER BY
       COALESCE(phs.seasonal_score, 70) DESC,
       p.sales_30d_aggregated DESC,
@@ -1198,8 +1228,13 @@ async function findPepite(tenantId, config, snapshot, removedCost) {
       AND phs.scraper_best_price > 0
       AND p.erp_cost > 0
       AND p.sell_price >= 5              -- soglia minima TP
-      -- ricarico post-cut (best_comp - 0.01) >= 15%
-      AND (phs.scraper_best_price - 0.01 - p.erp_cost) / p.erp_cost * 100 >= 15
+      -- ricarico post-cut (best_comp - 0.01) >= 15% sul COSTO REALE del momento
+      -- (dictat capo 23/7: listino NON e' riferimento). Magazzino fisico ->
+      -- erp_purchase_cost, non solo il min_cost grossista (erp_cost); uso il piu'
+      -- alto dei due come floor conservativo (stesso pattern di limaCostante).
+      AND (phs.scraper_best_price - 0.01
+           - GREATEST(p.erp_cost, CASE WHEN COALESCE(p.erp_stock,0) > 0 THEN COALESCE(p.erp_purchase_cost,0) ELSE 0 END))
+          / NULLIF(GREATEST(p.erp_cost, CASE WHEN COALESCE(p.erp_stock,0) > 0 THEN COALESCE(p.erp_purchase_cost,0) ELSE 0 END), 0) * 100 >= 15
       -- new_price sotto sell_price attuale (deve essere un cut vero)
       AND phs.scraper_best_price - 0.01 < p.sell_price
     ORDER BY
@@ -1353,7 +1388,7 @@ async function findStoreSellerPromotions(tenantId, config, snapshot, excludeSkus
             SELECT 1 FROM orders o JOIN order_items oi ON oi.order_id=o.id
             WHERE o.tenant_id=p.tenant_id AND oi.sku=p.sku
               AND o.order_status NOT IN ('canceled','closed','pending_payment')
-              AND o.order_date >= NOW() - INTERVAL '30 days'
+              AND o.order_date >= NOW() - INTERVAL '15 days'
           )
         )
         AND phs.scraper_best_price > 0
@@ -1556,13 +1591,132 @@ async function applyActions(tenantId, actions, config) {
   // anche pepite/raise inseriti a mano, che sparivano al rerun successivo.
   // Le sorgenti manuali sopravvivono; l'INSERT sotto usa ON CONFLICT DO
   // NOTHING quindi la riga manuale vince sul ricalcolo engine.
-  await pool.query(`
-    DELETE FROM feed_actions
-    WHERE tenant_id = $1
-      AND (action_source IS NULL
-           OR action_source NOT IN ('manual_pepita','margin_harvest_pilot','manual_review')
-           OR expires_at < NOW())
-  `, [tenantId]);
+  {
+    // ARBITRO (13/7): il motore si firma — la pulizia esce dal verbale col suo nome
+    const dClient = await pool.connect();
+    try {
+      await dClient.query('BEGIN');
+      await dClient.query(`SELECT set_config('xhp.writer', 'feed_daily_engine', true),
+        set_config('xhp.motivo', 'pulizia righe engine per ricalcolo giornaliero (manuali preservate)', true)`);
+      await dClient.query(`
+        DELETE FROM feed_actions
+        WHERE tenant_id = $1
+          AND (action_source IS NULL
+               OR (action_source NOT IN ('manual_pepita','margin_harvest_pilot','manual_review',
+                                         'muro_scavalco','manual','capo_pin')
+                   -- Le pulizie ordinate dal capo sopravvivono ai rerun (14/7:
+                   -- il rerun ha spazzato 520 REMOVE della pulizia classe A)
+                   AND action_source NOT LIKE 'pulizia_%'
+                   -- 4/8: stessa trappola sul taglio massivo ordinato dal capo,
+                   -- firmato 'capo_taglio_click_zero_vendite'. Scritto alle
+                   -- 20:20:18, spazzato alle 20:20:25 dal rerun; il CSV
+                   -- successivo aveva di nuovo dentro tutti gli 894 SKU e la
+                   -- spesa click era ripartita, in silenzio. La mano del capo
+                   -- non deve dipendere da un prefisso: ogni 'capo_%' resta.
+                   -- Il vincolo expires_at sotto continua a farle decadere.
+                   AND action_source NOT LIKE 'capo\_%' ESCAPE '\')
+               OR expires_at < NOW())
+      `, [tenantId]);
+      await dClient.query('COMMIT');
+    } catch (e) {
+      await dClient.query('ROLLBACK').catch(() => {});
+      throw e;
+    } finally { dClient.release(); }
+  }
+
+  // ORDINE CAPO 4/8 — il cap anti-strage (mig 064) ha un budget giornaliero
+  // per tenant: GREATEST(150, 1% del feed). Oltre quello ogni condanna cade in
+  // basket_veto_log e viene persa. Il budget va speso sui bruciatori veri, non
+  // sul rumore. Misurato il 4/8: 38.294 condanne tentate in 2h, di cui 27.675
+  // gia' condannate e riscritte. Tre correzioni prima di scrivere:
+  //
+  //  a) QUARANTENATI: non si riscrivono. externalApi costruisce removeCodes da
+  //     feed_quarantine UNION feed_actions — chi e' in quarantena e' gia' fuori
+  //     dal CSV, la riga REMOVE e' ridondante e mangiava tutto il cap (4.588 su
+  //     5.113 REMOVE in un ciclo osservato), lasciando fuori i bruciatori nuovi.
+  //  b) INERTI: 0 click = non spreca nulla, quindi non si tocca. Sono opzioni di
+  //     stagionalita' a costo zero (ordine capo 4/8: "fino a che non sprecano
+  //     click possono rimanere"). Vanno in MONITOR e restano nel feed. I killer
+  //     restano condannabili: li giudica il numero di seller, non i click.
+  //  c) ORDINE: i REMOVE superstiti scendono per costo click decrescente, cosi'
+  //     se il cap taglia, taglia la coda povera e non la testa che brucia.
+  //
+  // FINESTRA (4/8, seconda misura): a.clicks/a.cost sono il TOTALE del periodo
+  // zombie (88gg il 4/8), non la finestra recente. Sul totale storico quasi
+  // nessuno risulta inerte: primo giro "0 inerti" su 7 tenant mentre migliaia
+  // di SKU fermi da un mese mangiavano comunque il budget del cap.
+  //
+  // NON usare product_health_scores.tp_clicks_30d: misurato il 4/8 non e' una
+  // finestra a 30 giorni. Su SubitoFarma 16.259 SKU ce l'hanno > 0 mentre negli
+  // ultimi 30gg reali solo 8.625 hanno preso un click; su 3.000 campionati,
+  // 1.474 (49%) risultano attivi ma hanno ZERO click veri. Unica verita':
+  // zombie_clicks con la finestra scritta a mano.
+  //
+  //   inerte     = 0 click negli ultimi 15gg  (finestra "tenere DENTRO", 29/7)
+  //              E gia' dentro il CSV di oggi (vedi sotto)
+  //   priorita'  = costo click ultimi 30gg decrescente
+  //
+  // GUARDIA ANTI-CIRCOLO: chi e' gia' FUORI dal feed ha per forza 0 click, e
+  // senza questo vincolo si auto-assolverebbe rientrando a spendere. L'ordine
+  // del capo e' "possono rimanere", non "rientrano": il rientro lo governano i
+  // motori di riattivazione, non questo filtro. Quindi inerte solo se lo SKU e'
+  // nel CSV che sta uscendo adesso.
+  const removeGrezzi = actions.remove.length;
+  const nonQuar = actions.remove.filter(a => a.category !== 'quarantined');
+
+  const nelCsv = new Set();
+  {
+    const { rows: csvRows } = await pool.query(
+      `SELECT config_value FROM tenant_configs
+       WHERE tenant_id = $1 AND config_key = 'stable_feed_codes'`, [tenantId]);
+    try {
+      const codes = JSON.parse(csvRows[0]?.config_value || '{}')?.codes || [];
+      codes.forEach(c => nelCsv.add(String(c)));
+    } catch (e) {
+      console.log(`[FeedDaily][T:${tenantId.slice(0, 8)}] stable_feed_codes illeggibile (${e.message}): nessun inerte risparmiato in questo ciclo`);
+    }
+  }
+
+  const recente = new Map();
+  if (nonQuar.length > 0) {
+    const { rows: recRows } = await pool.query(`
+      SELECT product_code AS sku,
+             SUM(clicks) FILTER (WHERE fetch_date >= (NOW() AT TIME ZONE 'Europe/Rome')::date - 15) AS cl15,
+             SUM(clicks) AS cl30
+      FROM zombie_clicks
+      WHERE tenant_id = $1
+        AND fetch_date >= (NOW() AT TIME ZONE 'Europe/Rome')::date - 30
+        AND product_code = ANY($2::text[])
+      GROUP BY 1
+    `, [tenantId, nonQuar.map(a => a.sku)]);
+    recRows.forEach(r => recente.set(r.sku, {
+      cl15: parseInt(r.cl15) || 0,
+      cost30: (parseInt(r.cl30) || 0) * config.cpc,
+    }));
+  }
+  // Nessuna riga in zombie_clicks nella finestra = nessun click = inerte.
+  const cl15di = a => (recente.get(a.sku) || { cl15: 0 }).cl15;
+  const cost30di = a => (recente.get(a.sku) || { cost30: 0 }).cost30;
+
+  const eInerte = a => cl15di(a) === 0 && a.category !== 'killer' && nelCsv.has(String(a.sku));
+  const inerti = nonQuar.filter(eInerte);
+  const removeVeri = nonQuar
+    .filter(a => !eInerte(a))
+    .sort((x, y) => cost30di(y) - cost30di(x));
+
+  for (const a of inerti) {
+    actions.monitor.push({
+      ...a, action: 'MONITOR', category: 'inerte_stagionale',
+      reason: `0 click negli ultimi 15gg: non spreca budget, resta in feed per stagionalita' (ordine capo 4/8). Era: ${(a.reason || '').substring(0, 300)}`,
+    });
+  }
+  // Da qui in poi actions.remove = solo cio' che scriviamo davvero: log,
+  // quarantene, escalation e riepilogo devono vedere la stessa lista.
+  actions.remove = removeVeri;
+  const costoInTesta = removeVeri.slice(0, 200).reduce((s, a) => s + cost30di(a), 0);
+  console.log(`[FeedDaily][T:${tenantId.slice(0, 8)}] Cap-aware: ${removeGrezzi} REMOVE grezzi -> ${removeVeri.length} scritti (costo 30gg desc)` +
+    ` | ${removeGrezzi - nonQuar.length} quarantenati saltati (gia' fuori via feed_quarantine)` +
+    ` | ${inerti.length} inerti tenuti in feed | primi 200 = €${costoInTesta.toFixed(2)} di click 30gg`);
 
   // Ordine = priorita' in caso di conflitto SKU (ON CONFLICT DO NOTHING tiene
   // il primo). REMOVE prima (decisione definitiva di uscita); ADD subito dopo

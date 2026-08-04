@@ -246,6 +246,24 @@ Il taglio era firmato `capo_taglio_click_zero_vendite`: fuori whitelist, senza p
 
 **✅ USCITA DAL CSV CONFERMATA — cache MPF rigenerata 4/8 22:56 ITA:** feed **24.896 → 23.724 (−1.172)**, `tagliati_ancora_dentro = 0`. Restano nel CSV, tra i cliccati-senza-vendite, solo le tre classi volute: 135 brand protetti (€14,05/gg, veto del capo), 162 salvati dal filtro anti-rumore + pin (€12,78/gg), 13 che portano carrelli sani (€1,03/gg).
 
+### 🔬 Verifica del campione sul taglio v2 — coorte, e 50 rilasciati rimessi dentro
+
+L'alert `RICONDANNA MPF 18 SKU` ha spinto il controllo: **236 dei tagliati erano stati riattivati di recente**. Due domande, due risposte diverse.
+
+**1) Il campione del singolo regge?** No, per la stragrande maggioranza:
+
+| Fascia click 15gg | SKU | €/gg |
+|---|---|---|
+| 15+ (verdetto solido) | 16 | 9,16 |
+| 8-14 (borderline) | 23 | 5,07 |
+| **<8 (campione debole)** | **1.133** | **37,33** |
+
+Ma il campione è il **numero di click**, non i giorni — e sotto soglia il singolo non si giudica, **la coorte sì**: i 1.087 residui con <8 click a testa sommano **1.616 click** in 15 giorni. A conversione 5% l'attesa è **81 vendite**. Reali: **ZERO**. Dove ogni verdetto individuale sarebbe nullo, quello di gruppo è schiacciante — ed è il trattamento aggregato che la coda lunga richiede. La coorte è già ripulita da brand, carrelli, pin e da chi ripagava prima: si condanna il residuo, non il grezzo.
+
+**2) Hanno avuto il tempo di provarsi?** 50 no: rilasciati da meno di 7 giorni, non hanno finito il test (dottrina esilio 7gg + test 3gg). Condannarli è *churn*, non giudizio, e brucia la macchina di riattivazione che li aveva liberati — è esattamente ciò che l'alert stava segnalando. **Rimessi dentro** (`capo_correzione_0508_finestra_test`, €4,90/gg), si ri-valutano a finestra piena. I 186 rilasciati da 7-15gg restano tagliati: i loro click sono maturati tutti dentro il feed, il campione è valido.
+
+**Taglio finale: 1.122 SKU · 2.122 click/15gg · €46,67/gg.**
+
 **Blindatura nel codice (commit 8841772, NON ancora deployata):** `feedDailyEngine.js` conserva ora anche ogni `action_source LIKE 'capo\_%'`. La mano del capo non deve dipendere dal ricordarsi un prefisso. Deploy al prossimo momento senza cicli in volo (`docker cp` + `docker restart`); fino ad allora regge il prefisso `pulizia_`.
 
 ⚠️ **Da rivedere entro 7 giorni:** i 607 SKU delle classi F+G (€34,26/gg) **vendono in rete ma non su MPF**. Regola del capo: sono candidati **PC riposizionamento**, non morti. L'esilio è a 7 giorni proprio per questo: se il riposizionamento prezzo li rende competitivi, rientrano.

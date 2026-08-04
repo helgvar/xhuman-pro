@@ -1,0 +1,213 @@
+# PILOTA MPF — registro operazioni
+
+**Ordine del capo, 4/8/2026 sera:** *"ok inverti l'ordine, tutto quello che fai ora fino a mio nuovo ordine lo fai solo su MPF. salva tutte le operazioni che se funzionano le applichiamo altrove."*
+
+Ogni operazione qui è **per-tenant, accesa solo su MPF** (`d581c087-6b92-4050-b52a-5bd5c087553a`), con interruttore in `health_config`. Nessun altro tenant cambia comportamento: senza il flag, il codice è identico a prima. Estendere altrove = una INSERT. Spegnere = una DELETE.
+
+---
+
+## Baseline MPF prima dell'intervento (4/8/2026, 20:50 ITA)
+
+| Misura | Valore |
+|---|---|
+| Oggi | 633 click · €208,51 TP · €1.288,52 venduto · **16,2%** |
+| 15gg | 10.580 click · €3.485 TP · €29.552 venduto · 11,8% |
+| €/click | 2,79 (rete sana: 5,22–6,00) |
+| Cap condanne | **249/249 saturo**, 0 su prodotti nel feed |
+| Bruciatori bersaglio | 16 SKU · €251,66 costo · −€28,48 margine · €433 fatturato esposto |
+
+---
+
+## OP-1 — Il cap non si brucia più a vuoto
+`backend/db/migrations/088_cap_non_si_brucia_a_vuoto.sql` — applicata **4/8 20:47:04 ITA**
+
+**Difetto:** il budget giornaliero di condanne (`GREATEST(150, 1% del feed)`, mig 064) contava le righe scritte senza guardare se lo SKU fosse nel feed. MPF lo consumava al 100% in ri-condanne di prodotti già rimossi: 249 scritte, **0 sul feed**. I tagli veri non trovavano mai budget.
+
+**Cosa fa:** tabella-specchio `feed_stable_sku` del CSV che esce a TP (233.921 codici, 10 tenant), auto-mantenuta da un trigger su `tenant_configs` — nessun servizio Node da toccare. Dove il pilota è acceso, il budget si conta solo sugli SKU davvero nel feed; una condanna su uno SKU già fuori è un no-op tracciato in `basket_veto_log` con suffisso `:NOOP_GIA_FUORI`.
+
+**Soglia invariata** (150 o 1%): non allarga il permesso di condannare. Bypass `sessione_%` del capo intatto.
+
+- Accendere altrove: `INSERT INTO health_config (tenant_id, config_key, config_value) VALUES ('<uuid>','cap_solo_feed','1');`
+- Spegnere: `DELETE FROM health_config WHERE config_key='cap_solo_feed' AND tenant_id='<uuid>';`
+- **Effetto immediato misurato:** cap MPF da 249/249 a **0/249**.
+
+---
+
+## OP-2 — L2 non assolve più chi vende in perdita
+`backend/db/migrations/089_l2_richiede_ripago_pilota_mpf.sql` — applicata **4/8 20:47:09 ITA**
+
+**Difetto:** in `trg_veto_condanna_vendente_fn` l'ordine era (1) mano del capo, (2) **L2 `vende_su_tenant_15g` = veto incondizionato**, (3) L4 `vende_e_ripaga`. L'ordine del capo del 4/8 — *"chi vende e ripaga il click non si tocca"* — era entrato come **scudo in più**, non come **criterio**: chi vendeva senza ripagare non veniva mai giudicato. Un solo ordine comprava 15 giorni di immunità totale. Stessa falla nella clausola seller-15gg di `is_feed_protected` (mig 080), anch'essa binaria.
+
+Caso di scuola, `981647821` MENOPAUSA ACT 30CPR: un ordine da €30 il 26/7, poi 121 click e €39,86 di TP bruciati, **99 condanne respinte dalla guardia e 142 dal cap**.
+
+**Cosa fa:** nuova `vende_ma_brucia_margine(tenant, sku)` — criterio della Bibbia margine-first, `costo_click_15gg > 1,5 × margine_15gg`, con costo VERO (magazzino fisico → prezzo d'acquisto, altrimenti min-cost grossista, **mai il listino**). Dove il pilota è acceso, lo scudo L2 cade per questi. La caduta è tracciata in `azioni_touch_log` con `operazione='scudo_caduto'`.
+
+**Non tocca mai:** brand protetti, pin del capo, carrelli sani, e chi ha meno di 5 click in 15gg.
+
+**Escluso di proposito:** 53 SKU MPF sotto costo con 1-4 click (€1.596 di fatturato, margine −€180). Lì il difetto è il **prezzo**, non il feed: toglierli risparmierebbe €2,26/gg mettendo a rischio €1.596. Vietato da revenue-first — vanno riprezzati.
+
+- Parametri (default se assenti): `l2_ripago_k` = 1.5 · `l2_ripago_click_min` = 5
+- Accendere altrove: `INSERT INTO health_config (tenant_id, config_key, config_value) VALUES ('<uuid>','l2_richiede_ripago','1');`
+- Spegnere: `DELETE FROM health_config WHERE config_key='l2_richiede_ripago' AND tenant_id='<uuid>';`
+- **Effetto atteso:** 16 SKU perdono lo scudo = **€18,68/gg**, €433/15gg di fatturato esposto (in gran parte non-TP, quindi la perdita reale è minore).
+
+### I 16 bersagli
+
+| SKU | Nome | Click 15gg | Costo TP | Margine | Fatturato |
+|---|---|---|---|---|---|
+| 934424476 | DERMOVITAMINA FILM GEL 30ML | 215 | €70,82 | €3,70 | €11,20 |
+| 981647821 | MENOPAUSA ACT 30CPR | 121 | €39,86 | €9,08 | €30,44 |
+| 951044421 | SOLUZIONE SCHOUM ADVANCE 500ML | 67 | €22,07 | €2,32 | €37,40 |
+| 981212677 | SOMAT SKIN EX PANCIA/FIANCHI | 47 | €15,48 | −€3,72 | €74,88 |
+| 984599769 | ALTRAPELLE MEDICAL MICOSI PIEDI | 45 | €14,82 | €0,41 | €6,41 |
+| 904104193 | SIDERAL 20CPS | 43 | €14,16 | −€2,25 | €49,02 |
+| 982413940 | LIFT SPECIALIST B3 DARK SERUM | 42 | €13,83 | −€1,10 | €31,99 |
+| 982013726 | VENOPLANT 40BUST | 42 | €13,83 | €4,53 | €68,49 |
+| 971268634 | AUTOTEST VIH SCREENING HIV | 38 | €12,52 | −€22,24 | €23,76 |
+| 974109163 | CERAVE CREMA PIEDI RIGENER 88ML | 37 | €12,19 | −€0,17 | €7,65 |
+| 930252782 | IRILENS 0,4% GOCCE OCULARI 10ML | 16 | €5,27 | −€0,22 | €9,78 |
+| 037087032 | TROSYD DERMATITE SEB SH 120ML | 13 | €4,28 | −€12,54 | €11,18 |
+| 936065059 | DERMOVITAMINA CALM CR IDR 250ML | 13 | €4,28 | −€0,17 | €7,10 |
+| 984651240 | TRASPIREX CLASSIC 20ML | 10 | €3,29 | €0,20 | €5,26 |
+| 974879823 | ULIVIS ESTRATTO FOGLIE ULIVO 1L | 9 | €2,96 | €1,18 | €17,25 |
+| 989332895 | AVENE SOL FLUIDO A/ETA SPF50 | 6 | €1,98 | −€7,50 | €41,34 |
+
+---
+
+## ⚠️ LIMITE TROVATO DOPO L'APPLICAZIONE — lo scudo cade, ma i motori non li prendono
+
+Tolto lo scudo, resta la domanda: **quale motore li candida?** Verificato subito dopo l'applicazione.
+
+| Motore | Prende i 16? | Perché |
+|---|---|---|
+| limaCostante | **2** | `limaCostanteCron.js:53` → `AND COALESCE(p.erp_stock,0) = 0`. Guardia magazzino del capo (24/7): la lima tocca SOLO grossista. |
+| vetrina piena | **0** | `refresh_vetrina_piena()` simulata in BEGIN/ROLLBACK: MPF 358 → 379 righe, **nessuno dei 16**. La vetrina richiede zero ordini diretti; i 16 vendono, quindi sono esclusi per costruzione. |
+| killer | **0** | richiede zero vendite. |
+
+**Spaccatura dei 16 per stock:**
+
+| Tipo | SKU | Costo 15gg | €/gg |
+|---|---|---|---|
+| grossista (`erp_stock=0`) | 3 | €17,46 | **€1,16** |
+| magazzino fisico (`erp_stock>0`) | 13 | €234,20 | **€15,61** |
+
+**Conseguenza:** dei €18,68/gg di bersaglio, i motori esistenti ne raggiungono **~€1,16/gg**. Gli altri **€15,61/gg (83%)** sono magazzino fisico, che nessun motore può proporre — regola esplicita del capo: *"stock fisico si SPINGE, non si toglie"*.
+
+Non esiste oggi un motore per il caso **"vende + ha magazzino + il click costa più del margine"**. L'inversione L2 lo rende *giudicabile*, ma nessuno lo *giudica*.
+
+**Le tre vie possibili (decisione del capo, nessuna presa):**
+1. **Cap click per SKU sul magazzino** — non toglie dal feed, limita la spesa per SKU a `margine_eur/CPC`. Rispetta "mai togliere il magazzino": lo SKU resta, smette solo di bruciare oltre il suo margine.
+2. **Deroga lima mirata** — la lima prende anche `erp_stock>0` quando `vende_ma_brucia_margine()`. Sfora la guardia magazzino: **non applicata**.
+3. **Lasciarli** — €15,61/gg accettati come costo della presenza a magazzino.
+
+Via 1 è l'unica che non tocca nessuna regola del capo.
+
+---
+
+## Controprove eseguite prima di applicare
+
+| Verifica | Esito |
+|---|---|
+| Altri tenant col flag acceso | **0** |
+| Venditori sani MPF (>€200 in 15gg) ancora protetti | **11 su 11** |
+| Papa / Procaccini / Farmastelia / SubitoFarma: venditore campione protetto | **sì, tutti** |
+| `981647821` protetto dopo | **no** — scudo caduto, come voluto |
+| 363 venditori cliccati MPF (costo €1.317 / margine €1.985) | **intoccati, ripagano** |
+
+---
+
+## Misura
+
+Motori MPF girano **06:00 e 20:00** (REMOVE) e **01/05/16** (quarantena). Il giro delle 20 era già passato all'applicazione: prima misura reale **5/8 dopo le 06:15**.
+
+Cosa guardare:
+```sql
+-- scudi caduti e condanne passate
+SELECT operazione, COUNT(*) FROM azioni_touch_log
+WHERE tenant_id='d581c087-6b92-4050-b52a-5bd5c087553a'
+  AND touched_at >= '2026-08-04 18:47Z' GROUP BY 1;   -- colonna: touched_at, non created_at
+-- rumore ora respinto senza costare budget
+SELECT COUNT(*) FROM basket_veto_log WHERE target_table LIKE '%NOOP_GIA_FUORI%';
+-- i 16 sono usciti dal CSV?
+SELECT COUNT(*) FROM feed_stable_sku WHERE tenant_id='d581c087-6b92-4050-b52a-5bd5c087553a'
+  AND sku IN ('934424476','981647821','951044421','981212677','984599769','904104193',
+              '982413940','982013726','971268634','974109163','930252782','037087032',
+              '936065059','984651240','974879823','989332895');
+```
+
+**Criterio di successo (48h):** costo TP MPF giù ≥€18/gg, fatturato non sotto il −1,5% della media stesso-giorno-della-settimana, MOL non peggiore. Se il fatturato cala oltre, spegnere i due flag e ripartire dai numeri.
+
+**Se funziona, si estende** a Farmastelia (9,8%) per prima, poi Farmainsieme (7,0%). Papa, Procaccini, SubitoFarma sono già a 4-5%: lì il guadagno è marginale e il rischio no.
+
+---
+
+## OP-3 — Tagli diretti di sessione (ordine capo 5/8 notte)
+Ordine: *"981647821 sta facendo i buchi a terra... quali sono i tagli che stai facendo per abbassare il costo?"*
+
+**402 REMOVE scritte** (writer `sessione_capo_0508_bruciatori`, esilio 7g) = **€25,47/gg**:
+- 14 dei 16 bruciatori (€15,46/gg) — inclusi 981647821 e DERMOVITAMINA 934424476
+- 388 zero-conv totali (0 vendite locali+rete 15g, grossista, <5 click, non protetti, no carrelli) — €11,49/gg
+- Esclusi: `936065059` (pepita manuale del capo) e `981212677` (SOMAT: arbitro protegge PRICE_CUT manual_review in coda — cura giusta, ha €75 fatturato e margine negativo: riprezzo, non taglio)
+
+**✅ MISURATO 4/8 21:25:** stable cache rigenerata alle 21:25 — **tutti i bersagli REMOVE fuori dal CSV** (0/468 ancora dentro, tra dispatched e pending). **981647821 fuori dal feed.** Dimensione feed MPF pubblicato: **25.001 → 24.478 (−523)** al giro cache successivo (~22:20) — i tagli sono nel CSV che TP prenderà al prossimo refresh (ogni 4h da 00:00 ITA). Il monitor aveva segnato "1 SKU rilasciato tornato bloccato" su MPF: era il nostro stesso writer di sessione che ricondannava un rilasciato — mig 090 per progetto, non anomalia. Le guardie continuano a vetare i venditori che RIPAGANO (47 veti/ora): comportamento corretto post-090, cade lo scudo solo a chi brucia.
+
+## OP-4 — mig 090: TUTTI gli scudi cadono per chi brucia (5/8 notte)
+`backend/db/migrations/090_scudi_cadono_se_brucia_pilota_mpf.sql` — applicata
+
+**Difetto (ordine capo: "se il cap non lo ferma va corretto... ci saranno altri prodotti nella stessa condizione"):** la 089 aveva corretto UNO scudo, ma la catena ne aveva altri TRE, tutti binari:
+1. **L4 ripaga-30gg a incidenza** (mig 085): contraddice finestre-15gg e margine-first (chi vende sotto costo "ripaga" per incidenza). Fermava 904104193, 989332895.
+2. **L2-rete pos≤10** (mig 060/061): fermava proprio 981647821 (pos 1).
+3. **Carve-out STOCK e TOP10** in `is_feed_protected`: fermavano 934424476, 984599769, 984651240 (silenziosi, via basket guard → `basket_veto_log`).
+
+**Cosa fa:** principio unico dove `l2_richiede_ripago=1` — chi `vende_ma_brucia_margine()` perde OGNI scudo. Intoccabili restano solo le classi nominate dal capo: brand protetti, pin, carrelli sani, più la guardia freschezza dati (12h). Ogni caduta tracciata (`scudo_caduto` con lo scudo specifico).
+- Stesso interruttore della 089: nessun flag nuovo. Spegnere tutto: `DELETE FROM health_config WHERE config_key='l2_richiede_ripago';`
+
+## OP-5 — Lima PASS 1-bis "brucia-margine" (motore, 5/8 notte)
+`backend/services/limaCostanteCron.js` — nuovo passaggio dopo PASS 1.
+
+**Difetto:** nessun motore candidava i "vende ma brucia" — scudo caduto (089/090) restava a effetto zero senza mano umana: la lima esclude i venditori per costruzione, la vetrina richiede zero ordini, il killer zero vendite.
+
+**Cosa fa:** sui tenant col pilota acceso, candida REMOVE (esilio 7g) chi: nel CSV + `vende_su_tenant_15g` + `vende_ma_brucia_margine()`, ordinati per click, max 80/tenant/giorno. Writer motore `lima_brucia_margine`, source `pulizia_brucia_margine` (classe preservata `pulizia_%`): **il cap-anti-strage governa**, a differenza dei tagli di sessione. Gira alle 06:15 ITA.
+
+## OP-6 — mig 091 + taglio di massa "click senza vendite" (ordine capo 5/8)
+Ordine: *"bisogna tagliare!! non possiamo spendere 200€ al giorno per 25 ordini... annulla tutti i veti che hai sul taglio prodotti ad esclusione di quelli brand"*
+
+### Mappa MPF — tutto ciò che riceve click nel feed (15gg, 1.431 SKU, €2.048 = €136,55/gg)
+| Classe | SKU | €/gg | Fatturato 15gg | Margine 15gg | Esito |
+|---|---|---|---|---|---|
+| A. Brand protetto | 205 | 39,23 | 4.310 | 1.786 | **veto del capo, intatto** |
+| B. Pin del capo | 54 | 5,85 | 384 | 131 | intatto (ordini suoi) |
+| C. Porta carrelli sani | 258 | 39,90 | 10.751 | 2.320 | intatto (incidenza 5,6%: ripaga) |
+| D. Vende qui e ripaga | 18 | 1,34 | 485 | 141 | intatto |
+| E. Vende qui ma brucia | 2 | 1,27 | 67 | 11 | **TAGLIATO** |
+| F. Vende in rete non qui, 5+ click | 76 | 16,68 | 0 | 0 | **TAGLIATO** |
+| G. Vende in rete non qui, <5 click | 531 | 17,58 | 0 | 0 | **TAGLIATO** |
+| H. Zero ovunque, 5+ click | 26 | 6,39 | 0 | 0 | **TAGLIATO** |
+| I. Zero ovunque, coda lunga | 261 | 8,32 | 0 | 0 | **TAGLIATO** |
+
+### mig 091 `091_mano_capo_annulla_veti_tranne_brand.sql` — applicata
+Prima: `capo_%` scavalcava già guardia venditore (087) e ri-condanna (086), ma **non** `trg_veto_basket_fn` (is_feed_protected: carrelli, pin, stock, top10, seller, coorti) né `trg_cap_condanne_fn` (bypass solo `sessione_%`: un taglio di massa firmato capo si sarebbe fermato a ~250 righe).
+Dopo: sulle REMOVE firmate `capo_%`/`manual%` resta **un solo veto, il brand**, più la guardia freschezza dati 12h (legge del capo, non scudo di prodotto). Ogni scavalco a verbale (`override_veto`). I motori automatici non cambiano di una virgola.
+
+### Taglio eseguito (writer `capo_taglio_massivo_0508`, source `capo_taglio_click_zero_vendite`)
+- Criterio: nel CSV + click 15gg > 0 + **zero vendite locali 15gg** + non brand + non carrelli sani + non pin.
+- **894 bersagli → 887 REMOVE scritte** (esilio 7g). Le 7 mancanti sono PRICE_CUT `manual_pepita` già dispatched del capo (€0,24/gg totali): l'arbitro le protegge, corretto.
+- Zero veti scattati: nessun brand nel mucchio, nessun dato stantio.
+
+### Proiezione misurata sui click di OGGI (633 click / €208,51)
+| | SKU | Click oggi | Costo oggi |
+|---|---|---|---|
+| Tagliato stanotte (402 + 887) | 219 | 289 | **€95,20** |
+| Resta nel feed | 177 | 344 | €113,31 |
+
+**−46% del costo click MPF.** A fatturato invariato: incidenza 16,0% → **~8,7%**. Fatturato a rischio diretto: €67 su 15gg (classe E, 2 SKU).
+Serie giornaliera MPF per il confronto: 4/8 €208 · 3/8 €280 · 2/8 €187 · 1/8 €212 · 31/7 €242 · 30/7 €218 · 29/7 €274 · 28/7 €287.
+
+⚠️ **Da rivedere entro 7 giorni:** i 607 SKU delle classi F+G (€34,26/gg) **vendono in rete ma non su MPF**. Regola del capo: sono candidati **PC riposizionamento**, non morti. L'esilio è a 7 giorni proprio per questo: se il riposizionamento prezzo li rende competitivi, rientrano.
+
+## Non fatto, in attesa di ordine
+
+- Taglio pulito 3.721 SKU rete (€114/gg) — zero vendite locali e rete 15gg, stock 0, nel CSV, non protetti. Ora **sbloccato** su MPF dalla OP-1 (415 SKU / €11 gg).
+- Cap click per SKU sul magazzino fisico MPF (1.118 SKU, ~€62/gg) — sfora "mai togliere il magazzino", decisione del capo.
+- Riprezzare i 53 SKU sotto costo con pochi click (€1.596 di fatturato a margine −€180).
+- Riattivare GA4 (`ga4_channel_daily` vuota su tutta la rete): senza, la conversione del sito MPF resta non misurabile.

@@ -284,3 +284,50 @@ Non aspettato il giro delle 06: motore forzato a mano su MPF via `POST /api/onbo
 - Cap click per SKU sul magazzino fisico MPF (1.118 SKU, ~€62/gg) — sfora "mai togliere il magazzino", decisione del capo.
 - Riprezzare i 53 SKU sotto costo con pochi click (€1.596 di fatturato a margine −€180).
 - Riattivare GA4 (`ga4_channel_daily` vuota su tutta la rete): senza, la conversione del sito MPF resta non misurabile.
+
+---
+
+## 5/8 — Ordine capo: "feed sotto 20.000, tagli tra i burner, brand fermi, stock 0 fuori dalle logiche"
+
+### Rotta corretta in corsa
+Primo tentativo sbagliato: taglio di Pareto sulla **coda inerte** (8.607 SKU: zero click 90gg, zero vendite in tutta la rete, stock 0). Feed sceso a 15.157 — ma il capo ha fermato la mano: *"gli inerti li puoi anche lasciare se non portano click, i prodotti 0 stock eliminali dalle logiche, i tagli li devi trovare tra i burner"*. **Rollback completo** (`capo_rollback_pareto_0508`, 8.607 REMOVE cancellate). Ragione: quella coda **non costa un centesimo** — nessun click, nessuna spesa. Tagliarla accorcia un numero, non una bolletta.
+
+### Fotografia di Pareto su MPF (90gg)
+| Fascia | SKU | Fatturato |
+|---|---|---|
+| A — fa l'80% del fatturato | 1.174 | €123.076 |
+| B — 80→95% | 1.208 | €23.074 |
+| C — coda 5% | 1.083 | €7.700 |
+| **Totale che vende** | **3.465** | **€153.850** |
+
+### Il taglio vero: i burner (`pulizia_burner_0508`)
+Materia ammessa: **solo chi riceve click, ha stock fisico, non è brand**. Criterio margine-first: il margine vero di 90gg non copre il costo dei click.
+
+| Tipo | SKU | Click 90gg | €/gg | Fatt 90gg | Margine 90gg | Perdita/gg fermata |
+|---|---|---|---|---|---|---|
+| brucia_margine | 60 | 3.051 | 11,17 | €2.136 | €398 | 6,74 |
+| burner_puro | 289 | 742 | 2,72 | €0 | €0 | 2,72 |
+| **Totale** | **347** scritte (349 bersagli) | 3.793 | **13,89** | | | **9,46** |
+
+Esclusi per costruzione: brand protetti, stock 0, pin del capo, carrelli sani, rilasciati da meno di 7 giorni.
+
+### Perché il feed resta a 23.418 e non scende sotto 20.000
+Il conto non torna e va detto: **la massa del feed non è fatta di burner**.
+
+| Massa | SKU |
+|---|---|
+| riceve click (unica materia da burner) | ~1.400 |
+| muto da 90gg **con** stock fisico | 2.149 |
+| muto da 90gg **senza** stock (costo zero) | ~19.800 |
+
+Anche tagliando **ogni singolo SKU cliccato** — sani e brand compresi — il feed si fermerebbe intorno a **22.000**. Sotto 20.000 ci si arriva **solo** toccando la coda muta a stock 0, cioè esattamente ciò che l'ordine mette fuori dalle logiche. È una scelta di forma (feed corto) senza effetto sul costo: quella coda non genera click.
+
+### Dove sta il costo che resta (click 15gg dentro il feed, €95/gg)
+| Chi | SKU | €/gg |
+|---|---|---|
+| brand protetti (intoccabili per ordine) | 205 | **39,23** |
+| sani: ripagano | 150 | 25,20 |
+| residuo giustificato (30 carrelli sani, 51 pin del capo, 84 che ripagano su 90gg) | 169 | 22,52 |
+| stock 0 (fuori dalle logiche per ordine) | 126 | 8,31 |
+
+Il primo blocco di spesa ora sono **i brand protetti: €39,23/gg, il 41% di tutto il costo click residuo**. Finché restano fermi, il costo TP di MPF non scende oltre.

@@ -919,3 +919,93 @@ Il pilota è su MPF e ci resta. Ma il conto sotto-costo si fa anche altrove in l
 Su MPF ne restano 5 per scelta ragionata (i quasi-pari con volume e HYALUBRIX che il carrello ripaga). Sugli altri nove tenant non tocco nulla: **il pilota è MPF, l'ordine del 4/8 è quello, e questi numeri sono un dossier, non un'operazione.** Se il capo dà il via si applica lo stesso metodo — netto 90gg che include il margine proprio, non solo il costo del click.
 
 Da notare per SubitoFarma: sta sotto il floor del 15% per scelta del cliente e questo è noto e accettato. Vendere **sotto costo** è un'altra cosa e vale €2.000 in tre mesi.
+
+---
+
+## 5/8 — Il pilota esce da MPF: rumore tagliato su Papa e Farmastelia
+
+**Ordine del capo, 5/8 mattina:** *"ok allora io taglierei il rumore su papa e controllerei anche farmastelia"*.
+
+Fino a questa riga ogni operazione era MPF-only per l'ordine del 4/8. Da qui il perimetro si allarga a Papa e Farmastelia **per parola esplicita**, e solo sulla leva rumore.
+
+### Definizione di rumore, uguale sui due tenant
+
+SKU **dentro il CSV**, con **1-4 click negli ultimi 30 giorni** e **zero ordini reali Magento a 30 giorni** (whitelist `processing, pending, complete, ritiro_farmacia, Ritirato`, tutti i canali, non solo TP).
+
+Il join click-vendite è stato validato prima di condannare: stesso formato codice a 9 cifre da entrambi i lati, 808 SKU su 1.855 venduti hanno anche preso click (44%). Nessun artefatto di mismatch che avrebbe fatto sembrare morto tutto il catalogo.
+
+### Perché 1-4 click non è una condanna di merito
+
+| Click 30gg | SKU | Ne vende almeno uno | % |
+|---|---|---|---|
+| 1 | 1.079 | 267 | 24,7 |
+| 2-4 | 689 | 247 | 35,8 |
+| 5-14 | 253 | 129 | 51,0 |
+| 15-39 | 65 | 56 | 86,2 |
+| 40+ | 30 | 27 | 90,0 |
+
+Sopra i 15 click 9 su 10 vendono: lo zero lì è provato. A 1-4 click il prodotto non è stato testato abbastanza per dire che è morto. Il taglio è quindi **per costo aggregato**, non per merito del singolo — e va riaperto a rotazione, altrimenti è definitivo e cieco.
+
+### Filtri applicati (nessun taglio al buio)
+
+| Esito | Papa | Farmastelia |
+|---|---|---|
+| Brand protetti — SALVI | 77 SKU | 24 SKU |
+| Venduto 31-90gg **con stock fisico** — SALVI | 47 | 29 |
+| Venduto 31-90gg senza stock — tagliati | 273 | 354 |
+| Morti a 90gg — tagliati | 857 | 1.665 |
+
+I brand protetti di Papa sono `UNI, GAD, MYC` da `health_config`. **Farmastelia non ha nessuna lista configurata** — unico tenant della rete senza. Ho applicato la lista di rete `UNI, GAD, MYC, EUC` come scudo minimo, ma è una mia scelta prudenziale, non una configurazione: **va decisa dal capo**.
+
+Salvare chi ha stock fisico e ha venduto negli ultimi 90 giorni non è prudenza generica: è la regola aurea di spingere il magazzino della farmacia, dove il MOL è migliore.
+
+### Esecuzione
+
+Writer `capo_rumore_papa_0508` e `capo_rumore_fs_0508` (mig 091: la mano del capo scavalca cap e basket guard). `action_source` con prefisso `pulizia_` — senza, il rerun engine cancella tutto in pochi secondi.
+
+| Tenant | Feed prima | Feed dopo | REMOVE scritte | Rientrati dopo rerun | Risparmio teorico/gg |
+|---|---|---|---|---|---|
+| Papa | 24.939 | **23.894** | 1.047 | 11 | 18,94 |
+| Farmastelia | 26.738 | **24.725** | 2.015 | 2 | 34,02 |
+
+Su Papa 83 SKU e su Farmastelia 4 non sono stati toccati perché già `manual_pepita`: la guard `ON CONFLICT` li protegge. Sono pepite manuali su prodotti a 1-4 click e zero vendite — **non stanno funzionando**, ma sono mano umana e non le sovrascrivo di mia iniziativa.
+
+Entrambi verificati dopo rerun stable: le REMOVE sono sopravvissute.
+
+### Il fatto separato su Papa: il budget si spegne a fine mese
+
+Il 30/7 Papa ha fatto **18 click** e il 31/7 **zero righe**, mentre tutti gli altri tenant giravano normalmente. Non è un guasto: è il budget TP mensile finito.
+
+| Mese | Giorni attivi | Click | Costo TP |
+|---|---|---|---|
+| Maggio | 29 | 13.814 | 4.550,33 |
+| Giugno | 30 | 10.109 | 3.329,90 |
+| Luglio | 30 | 14.553 | **4.793,76** |
+| Agosto (5gg) | 5 | 2.120 | 698,33 |
+
+Tetto ~€4.800/mese, esaurito con un giorno e mezzo di anticipo. Ad agosto il ritmo è €139/giorno (proiezione €4.330), ma il 3/8 ha fatto 620 click (€204): a quel passo si rispegne verso il 27-28. **Perdere due giorni pieni di fatturato per non aver rinunciato a €20/giorno di rumore è il peggior cambio possibile.** Serve un pacing di fine mese, non uno spegnimento secco — regola in `REGOLE_LOOP_STANDARD.md` §2.5.
+
+### L'allarme Papa al 23,6% era falso
+
+Scartato con tre misure prima di toccare qualsiasi cosa:
+
+| Mercoledì | Ordini ≤10:45 | Revenue ≤10:45 |
+|---|---|---|
+| 22/7 | 5 | 217,27 |
+| 29/7 | 6 | 279,33 |
+| **5/8** | **5** | **193,73** |
+
+Papa fa in media solo il **22,4%** del fatturato prima delle 10:45 (range 4,4-44,7%). Con i click che si accumulano dal mattino e gli ordini che arrivano dopo, l'incidenza parziale è gonfia per costruzione. Nessun intervento sull'allarme.
+
+### Cosa misurare domani
+
+Non il risparmio teorico: i click TP si rigenerano per rotazione della coda, quindi €52,96/giorno sommati fra Papa e Farmastelia sono un tetto, non una previsione. Riga piena contro riga piena (cron 05:02), baseline 4/8:
+
+| Tenant | Click | Costo TP | Venduto | Incidenza |
+|---|---|---|---|---|
+| Papa | 466 | 153,50 | 2.525,34 | 6,1% |
+| Farmastelia | 626 | 206,20 | 2.513,19 | 8,2% |
+
+Farmastelia resta il tenant peggiore della rete: incidenza media **11,8%** su 10 giorni (8,2-14,6) contro il mandato del 7%.
+
+Le due domande valgono qui come su MPF: **il costo scende** e **il fatturato tiene**. Un taglio che abbassa il costo perdendo fatturato non è un risultato.

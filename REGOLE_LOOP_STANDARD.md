@@ -123,6 +123,35 @@ Se l'ultimo tocco agli ordini è entro ~2 minuti da adesso, il sync sta scrivend
 
 **Corollario sui cali**: mai diagnosticare un calo su due giorni di confronto. Servono 3-4 stesso-giorno-settimana. Il "calo MPF" nasceva dal mettere il mercoledì più forte del mese (22/7, €1.057) contro un parziale monco; su quattro mercoledì MPF era a −5,6% dalla media, dentro la variabilità.
 
+### 2.9 Il margine del carrello si misura, non si assume
+
+**Ordine del capo 5/8, dopo che gli avevo dato 171 tagli:** *"non ripagano nemmeno a livello carrello?"* — poi, quando ha visto da dove veniva il numero: *"cazzo devi scrivere queste logiche in memoria! niente più illazioni devi seguire i documenti."*
+
+Avevo usato **20% forfettario** come margine del resto del carrello. Quel 20% non stava in nessun documento: l'avevo scritto io mentre facevo la query. Misurato riga per riga sugli stessi ordini:
+
+| Tenant | Margine vero del carrello | La mia assunzione |
+|---|---|---|
+| MPF | 27,4% | 20% — troppo avara |
+| Farmastelia | 25,7% | 20% — troppo avara |
+| Papa | 14,7% | 20% — troppo generosa |
+
+**43 SKU su 171 ripagavano davvero** e li avevo condannati a torto (FS 27, MPF 9, Papa 7). Rimessi dentro in giornata con `pulizia_rientro_carr_0508`.
+
+Un forfait sbaglia in due direzioni contemporaneamente — su Papa condanna gli innocenti, su MPF assolve i colpevoli — e nel frattempo sembra prudenza. Fra tenant dello stesso gruppo il margine del carrello varia di 13 punti: nessuna percentuale unica può essere giusta.
+
+**Regola da codificare** — la formula, senza scorciatoie:
+
+```
+netto_30gg = margine_proprio                      (prezzo_vero − costo_vero) × pezzi
+           + SUM(riga_altra − costo_vero_altra)   margine VERO delle altre righe negli
+                                                  ordini che contengono lo SKU
+           − click × 0,3294
+```
+
+Il resto del carrello si calcola **riga per riga con l'`erp_cost` di ogni prodotto**. Se manca il costo di una riga, quella riga vale zero margine — non una stima.
+
+**E la regola che sta sopra a questa:** prima di scrivere un taglio di massa, rileggere il SQL cercando i numeri nudi. Le uniche costanti legittime perché documentate sono CPC 0,3294, i floor di ricarico 18/14/12%, MOL 15/20/21%, le finestre 15/30gg e la whitelist degli stati ordine. **Ogni altro numero o viene da una misura fatta in quella sessione, o è un'illazione.**
+
 ---
 
 ## 3. Da provare

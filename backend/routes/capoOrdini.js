@@ -8,13 +8,20 @@ const express = require('express');
 const router = express.Router();
 const { pool } = require('../db/pool');
 const { authMiddleware } = require('../middleware/auth');
+const { tenantMiddleware } = require('../middleware/tenant');
 
-router.use(authMiddleware);
+router.use(authMiddleware, tenantMiddleware);
 
 // GET /api/capo-ordini?tenant_id=<uuid>|rete — newest first.
 // Con tenant_id: righe del tenant + righe globali (tenant_id NULL).
+// Il tenant_id in query vale SOLO per il superadmin: un utente di tenant è
+// sempre inchiodato al proprio, altrimenti leggerebbe il libro giornale altrui.
 router.get('/', async (req, res) => {
-  const { tenant_id } = req.query;
+  const isSuper = req.user?.role === 'superadmin';
+  if (!isSuper && !req.tenantId) {
+    return res.status(403).json({ error: 'No tenant scope' });
+  }
+  const tenant_id = isSuper ? req.query.tenant_id : req.tenantId;
   try {
     let rows;
     if (tenant_id && tenant_id !== 'tutti') {

@@ -1189,3 +1189,21 @@ Source `pulizia_pepite_0508`.
 Applicate 169 REMOVE su 171 e 206 ADD su 208 — due per parte restano fuori, trattenute da guardie.
 
 **Da misurare domani (cron 05:02):** il taglio vale se il costo scende senza che i €193/giorno di fatturato a rischio si vedano davvero. Le pepite valgono se i 188 di Papa convertono entro i ~11 click che il loro margine regge.
+
+### Correzione in giornata — il carrello si misura
+
+Richiamo del capo: *"non ripagano nemmeno a livello carrello?"*
+
+Nel taglio dei 171 avevo usato **20% forfettario** sul resto del carrello. Numero mio, non di un documento. Margine vero misurato riga per riga sugli stessi ordini: **MPF 27,4%, Farmastelia 25,7%, Papa 14,7%**.
+
+Rifatto il conto per SKU col margine vero, **43 su 171 ripagavano** — condannati a torto:
+
+| Tenant | Rientrati | Netto 30gg | Margine carrello vero |
+|---|---|---|---|
+| Farmastelia | 27 | +62,71 | 98,88 |
+| MPF | 9 | +26,05 | 117,21 |
+| Papa | 7 | +5,12 | 14,45 |
+
+Rimessi in feed con `pulizia_rientro_carr_0508`, tutti e 43 verificati dentro dopo il rerun. Restano fuori 127.
+
+Regola scritta in `REGOLE_LOOP_STANDARD.md` §2.9 e in memoria: il margine del carrello si calcola riga per riga con l'`erp_cost` di ogni prodotto, mai con una percentuale.

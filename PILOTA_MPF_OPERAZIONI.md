@@ -726,3 +726,18 @@ I 279 dell'ondata 1 sono in vetrina da stanotte. Lo scraper ne ha già rivisti *
 **Posizione media 2,7. 227 su 231 in top10, il 98%.** La previsione era fatta contando i rivali esterni più economici **sul totale** (prezzo + spedizione): quel metodo ora ha una verifica sul campo, non è più una teoria. E vale anche al contrario — se sbagliassimo a confrontare sui prezzi base, questi prodotti sarebbero finiti in fondo alla SERP senza che ce ne accorgessimo.
 
 Restano da vedere le conversioni. La vetrina è quella giusta; se non vendono, il daily engine li toglie da solo — `pulizia_forza%` non è tra le sorgenti intoccabili, quindi i motori possono sovrascrivere l'ADD con un REMOVE quando bruciano. Valvola aperta, nessun forzato è immortale.
+
+### I 43 che restano fuori, e perché li lascio fuori
+
+Dei 1.019 forzati, 55 non entrano nel CSV. Scomposti: **43 fermati da `is_burner_rule`**, 7 con quarantena aperta ma fuori per altro, 5 senza quarantena.
+
+Ho riprovato il rilascio con il writer `capo_`, che è la porta che `veto_release_burner_rule` riconosce. Risultato: `UPDATE 43` e **zero rilasciati davvero**. Letti i due trigger, il motivo è strutturale:
+
+| veto | porta del writer | alternativa |
+|---|---|---|
+| `veto_release_burner_rule` | `capo_%` | `vende_e_ripaga()` |
+| `veto_release_incidenza_alta` | `sessione_%` | `vende_e_ripaga()` |
+
+Le due porte si escludono a vicenda — nessun writer inizia sia per `capo_` sia per `sessione_` — e l'unica strada che le apre entrambe è la stessa: **il prodotto deve vendere e ripagare il click**. Questi 43 sono burner condannati in passato, non vendono, e il sistema chiede una prova che non hanno.
+
+**Non scavalco.** Servirebbe una migrazione che allinei i due trigger, cioè aggirare due guardie indipendenti che stanno facendo esattamente il loro lavoro. Sono 43 SKU su 1.019, il 4%: il prezzo di lasciarli fuori è basso, il prezzo di aprire una scorciatoia nel sistema dei veti è alto e permanente. Se il pilota dimostra che il criterio del totale-con-spedizione batte la vecchia condanna, la migrazione la si fa allora, con il dato in mano e per scelta del capo — non di soppiatto stamattina.

@@ -65,20 +65,6 @@ Nessun SKU a 1-4 click merita una condanna individuale. Ma il blocco costa:
 4. Writer `capo_%` solo sotto ordine esplicito, sempre a verbale.
 5. Intoccabili: `capo_pin`, `muro_scavalco`, `manual`. **Non** `manual_pepita` — vedi 2.7.
 
-### 2.7 Nessuna finestra oltre i 30 giorni — mai
-
-**Ordine del capo 5/8, ripetuto:** *"i 90gg sono troppi come già ti ho detto 7659 volte."* Si giudica cosa vende e cosa no su **15 o 30 giorni**. Le finestre lunghe non sono prudenza: fanno sembrare vivo un prodotto morto da due mesi.
-
-Conseguenze già applicate:
-- Cade la salvaguardia *"venduto fra 31 e 90 giorni con stock fisico"* — era la finestra a 90gg travestita da regola aurea.
-- `crossTenantOblio.js` passa a 15gg su ordini e click.
-
-**Trappola: quando si stringe una finestra, ricontrollare ogni criterio di continuità che ci vive dentro.** In `crossTenantOblio.js` la finestra era già stata portata a 15 giorni ma la continuità era rimasta `COUNT(DISTINCT date_trunc('month', fetch_date)) >= 2`: due mesi distinti dentro 15 giorni esistono solo a cavallo del cambio mese, quindi **dal 16 di ogni mese il cron trovava zero candidati**. Non dà errore, dà zero righe — e "zero nuovi burner" sembra un risultato legittimo. Corretto a settimane distinte il 5/8.
-
-Lo stock fisico **non è un veto** sotto questa regola, è una nota di merito. Un prodotto di magazzino che prende click e non vende in 30 giorni non si sta girando pagando la vetrina: si taglia, e si guarda per primo se il fatturato cede.
-
-`manual_pepita` non protegge: pepita che ha preso click e non ha venduto in 30gg = ipotesi falsificata. Diverso da `capo_pin`, che è una decisione e resta.
-
 ### 2.3 Le guardie sono cieche sul margine
 
 `vende_e_ripaga()` confronta il **fatturato** col costo del click. `porta_carrelli_sani()` confronta il **margine del carrello** col costo del click. **Nessuna delle due guarda il margine del prodotto**: chi vende sottocosto supera ogni test, perché vende.
@@ -110,6 +96,32 @@ Papa il 30/7 ha fatto 18 click e il 31/7 zero, mentre tutta la rete girava: budg
 `zombie_clicks` è scritto due volte: il cron 05:02 scrive il **giorno prima completo**, il cron intraday scrive il giorno corrente **parziale**, e l'UPSERT finale cancella i parziali. Non esiste storia intraday.
 
 **Regola:** mai confrontare un parziale con una media giornaliera. Si confronta o quota-sulla-rete, o riga piena contro riga piena.
+
+### 2.7 Nessuna finestra oltre i 30 giorni — mai
+
+**Ordine del capo 5/8, ripetuto:** *"i 90gg sono troppi come già ti ho detto 7659 volte."* Si giudica cosa vende e cosa no su **15 o 30 giorni**. Le finestre lunghe non sono prudenza: fanno sembrare vivo un prodotto morto da due mesi.
+
+Conseguenze già applicate:
+- Cade la salvaguardia *"venduto fra 31 e 90 giorni con stock fisico"* — era la finestra a 90gg travestita da regola aurea.
+- `crossTenantOblio.js` passa a 15gg su ordini e click.
+
+**Trappola: quando si stringe una finestra, ricontrollare ogni criterio di continuità che ci vive dentro.** In `crossTenantOblio.js` la finestra era già stata portata a 15 giorni ma la continuità era rimasta `COUNT(DISTINCT date_trunc('month', fetch_date)) >= 2`: due mesi distinti dentro 15 giorni esistono solo a cavallo del cambio mese, quindi **dal 16 di ogni mese il cron trovava zero candidati**. Non dà errore, dà zero righe — e "zero nuovi burner" sembra un risultato legittimo. Corretto a settimane distinte il 5/8.
+
+Lo stock fisico **non è un veto** sotto questa regola, è una nota di merito. Un prodotto di magazzino che prende click e non vende in 30 giorni non si sta girando pagando la vetrina: si taglia, e si guarda per primo se il fatturato cede.
+
+`manual_pepita` non protegge: pepita che ha preso click e non ha venduto in 30gg = ipotesi falsificata. Diverso da `capo_pin`, che è una decisione e resta.
+
+### 2.8 Un parziale ha due orologi, non uno
+
+Il 5/8 ho dato al capo MPF a **10 ordini / €674,16**. Erano **14 / €800,21**: `MAX(orders.updated_at)` segnava 12:25:29, magentoSync stava scrivendo nell'istante della lettura. Ci avevo già costruito sopra una diagnosi ("MPF perde fatturato dopo il taglio"), poi caduta.
+
+**Regola da codificare** — ogni snapshot parziale dichiara **due** freschezze, non una:
+- click → `MAX(zombie_clicks.created_at)`
+- ordini → `MAX(orders.updated_at)`
+
+Se l'ultimo tocco agli ordini è entro ~2 minuti da adesso, il sync sta scrivendo: aspettare e rileggere prima di calcolare l'incidenza. Aspettare il fetch dei click e dare per buoni gli ordini è metà lavoro.
+
+**Corollario sui cali**: mai diagnosticare un calo su due giorni di confronto. Servono 3-4 stesso-giorno-settimana. Il "calo MPF" nasceva dal mettere il mercoledì più forte del mese (22/7, €1.057) contro un parziale monco; su quattro mercoledì MPF era a −5,6% dalla media, dentro la variabilità.
 
 ---
 
@@ -149,15 +161,3 @@ Le due domande restano separate: **il costo scende?** e **il fatturato tiene?** 
 ## Nota di metodo
 
 Finché queste regole vivono in un documento e non in una migrazione, il sistema non le applica: le applico io. Ogni riga della sezione 2 è debito — vale finché qualcuno la esegue a mano, e sparisce il giorno che smetto. La sezione 1 è l'unica che gira da sola.
-
-### 2.8 Un parziale ha due orologi, non uno
-
-Il 5/8 ho dato al capo MPF a **10 ordini / €674,16**. Erano **14 / €800,21**: `MAX(orders.updated_at)` segnava 12:25:29, magentoSync stava scrivendo nell'istante della lettura. Ci avevo già costruito sopra una diagnosi ("MPF perde fatturato dopo il taglio"), poi caduta.
-
-**Regola da codificare** — ogni snapshot parziale dichiara **due** freschezze, non una:
-- click → `MAX(zombie_clicks.created_at)`
-- ordini → `MAX(orders.updated_at)`
-
-Se l'ultimo tocco agli ordini è entro ~2 minuti da adesso, il sync sta scrivendo: aspettare e rileggere prima di calcolare l'incidenza. Aspettare il fetch dei click e dare per buoni gli ordini è metà lavoro.
-
-**Corollario sui cali**: mai diagnosticare un calo su due giorni di confronto. Servono 3-4 stesso-giorno-settimana. Il "calo MPF" nasceva dal mettere il mercoledì più forte del mese (22/7, €1.057) contro un parziale monco; su quattro mercoledì MPF era a −5,6% dalla media, dentro la variabilità.

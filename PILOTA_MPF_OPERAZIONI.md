@@ -853,3 +853,12 @@ Allargando a tutto ciò che nel CSV ha preso click in 15 giorni e **non ha vendu
 Diciotto euro al giorno su circa duecentocinquanta: **il 93% della spesa TP di MPF finisce ormai su prodotti che hanno venduto negli ultimi 30 giorni.** E quei diciotto euro sono per tre quarti coda lunga da uno o due click — dove "zero vendite" non è una condanna, è rumore statistico.
 
 Conclusione operativa: **la strada del taglio è finita.** Ogni euro in più che si toglie da qui in avanti si toglie a qualcuno che vende. Le leve che restano sono le due già misurate — il prezzo sui 3.893 recuperabili e la spedizione a 4,76 — più il riposizionamento dei 134 forzati caduti fuori. Nessuna delle tre è un taglio.
+
+**I 134 caduti fuori, guardati da vicino.** Stessa formula del prezzo (decimo totale esterno − spedizione − 1 centesimo, confronto col floor di fascia):
+
+| | SKU | taglio medio | margine dopo |
+|---|---|---|---|
+| recuperabili col prezzo | **41** | 0,70 | 4,15 |
+| irrecuperabili (floor sopra il prezzo che servirebbe) | 93 | 2,03 | 0,59 |
+
+Quarantuno tornano in vetrina con settanta centesimi tenendo €4,15 di margine — entrano nella campagna prezzo insieme agli altri 3.893. I novantatré no: il margine finisce prima della posizione. Sono forzature mie che il mercato ha scavalcato, e a fine misura escono — pulire il proprio lavoro conta quanto farlo.

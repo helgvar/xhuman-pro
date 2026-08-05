@@ -682,3 +682,33 @@ Controllo obbligatorio dopo aver aggiunto 726 SKU con un tetto fisso a 19.500. F
 | bloccati | 55, quarantene con le due porte di veto incompatibili |
 
 Restano nel bacino ~295 posizionabili in fascia 4-10 e 1.117 fuori top10. Non li tocco: prima la misura di 24-48 ore su questi.
+
+### I 48 bruciatori che il motore non aveva mai visto
+
+L'allarme del monitor sui "16 bersagli ancora nel CSV" mi ha fatto guardare dentro il feed invece che fuori. Zero REMOVE bloccate — il problema è opposto: **48 SKU che bruciano e che nessun motore ha mai condannato**.
+
+Costo click 30 giorni contro margine vero 30 giorni:
+
+| SKU | prodotto | click | costo | margine | perdita |
+|---|---|---|---|---|---|
+| 978113405 | LAEVOLAC PANCIA SGONFIA | 291 | 95,86 | 3,22 | **92,64** |
+| 934424476 | DERMOVITAMINA FILM GEL | 253 | 83,34 | 17,17 | 66,17 |
+| 971268634 | AUTOTEST VIH SCREENING | 64 | 21,08 | **−40,70** | 61,78 |
+| 981647821 | MENOPAUSA ACT 30CPR | 122 | 40,19 | 12,51 | 27,68 |
+| 902649298 | EMATONIL PLUS GEL | 150 | 49,41 | 23,29 | 26,12 |
+
+In totale **€431,79 in 30 giorni, €14,39 al giorno**. Di questi 27 vendono e bruciano lo stesso, **7 vendono sotto costo** (margine negativo: AUTOTEST −40,70, LACTOFLORENE −21,59, TROSYD −17,29).
+
+Tagliati **30**: fuori i brand protetti, fuori i 16 con **carrelli sani** — quella guardia resta in piedi, è legge cardinale e non l'ho toccata — fuori i forzati di stamattina. Due respinti dai trigger sulle guardie venditore. **Risparmio €7,24/giorno**, tutti e 30 usciti dal CSV alla rigenerazione.
+
+Gli altri 16 con scudo carrello restano dentro: portano ordini ad altri prodotti, il conto va fatto sul carrello, non sulla riga.
+
+### Stato a fine mattina
+
+| | |
+|---|---|
+| feed | **19.500** |
+| forzati | 1.019 scritti, **964 nel CSV** |
+| bruciatori tagliati | 30 su 30 usciti |
+| risparmio misurato | €7,24/gg dai bruciatori |
+| vendite perse | **zero** |

@@ -862,3 +862,37 @@ Conclusione operativa: **la strada del taglio è finita.** Ogni euro in più che
 | irrecuperabili (floor sopra il prezzo che servirebbe) | 93 | 2,03 | 0,59 |
 
 Quarantuno tornano in vetrina con settanta centesimi tenendo €4,15 di margine — entrano nella campagna prezzo insieme agli altri 3.893. I novantatré no: il margine finisce prima della posizione. Sono forzature mie che il mercato ha scavalcato, e a fine misura escono — pulire il proprio lavoro conta quanto farlo.
+
+### 10:50 — un errore mio, e il buco che ha scoperchiato
+
+**Prima l'errore.** L'ondata "venditori fuori vetrina" delle 08:56 non filtrava sul margine. Ho rimesso in vetrina prodotti che vendono **sotto costo**: TROSYD (−5,76 a pezzo), LACTOFLORENE (−4,32), AUTOTEST VIH (−4,07), POLASE (−2,53). Comprare fatturato in perdita è il contrario del mantra.
+
+**Poi il muro.** Ho scritto dieci REMOVE di correzione. Ne sono passate tre. Il registro dice perché, sullo stesso SKU e nella stessa transazione:
+
+```
+037087032 | condanna permessa               | mig 089: vende ma il click costa piu del margine (margine-first)
+037087032 | condanna permessa               | mig 090: incidenza 30g ok ma margine 15g bruciato (margine-first vince)
+037087032 | re-condanna via UPDATE bloccata | L4 (mig 086): vende 30g e il click si ripaga
+```
+
+**Le migrazioni pilota tolgono lo scudo, la vecchia L4 lo rimette sul percorso UPDATE, e vince la vecchia.** Il motivo di fondo è che `vende_e_ripaga` misura **fatturato** contro costo del click: un prodotto che perde €5,76 a pezzo "si ripaga" perché il fatturato è comunque maggiore dei 33 centesimi di click. Passate con writer `capo_` (mig 091, ordine del 5/8: sul taglio resta solo il veto brand).
+
+**Poi il buco vero.** Cercando se il problema fosse solo mio ho contato tutto il CSV: **13 SKU non protetti vendono sotto costo**, ~€101 di margine bruciato in 15 giorni (€6,76/giorno). Ho lasciato dentro ACTIFED (−0,39 a pezzo, 37 pezzi) e VICHY HOMME (−0,36, 25 pezzi): perdono centesimi e portano volume, toglierli costerebbe €26/giorno di fatturato per salvarne €1,55 di margine — la regola dice fatturato prima.
+
+Cinque dei rimanenti erano protetti da `porta_carrelli_sani`. Ho fatto il conto completo su 90 giorni — margine del carrello, meno costo click, **più il margine proprio del prodotto per i pezzi venduti**:
+
+| SKU | prodotto | pezzi 90gg | perdita propria | carrello | netto |
+|---|---|---|---|---|---|
+| 980448649 | RETINOL B3 SIERO | 13 | −55,38 | 7,31 | **−48,40** |
+| 984236291 | RAMATONIC | 9 | −14,76 | 1,98 | **−13,11** |
+| 042154029 | LASONIL GEL | 14 | −31,08 | 19,02 | **−12,06** |
+| 951873241 | BEPANTHENOL COLLIRIO | 5 | −10,20 | 6,40 | **−8,41** |
+| 984515458 | HYALUBRIX SIR | 3 | −31,20 | 38,14 | **+5,62** |
+
+`porta_carrelli_sani` confronta il margine del carrello col **costo del click** e non guarda mai il margine proprio del prodotto. Quattro prodotti che perdono anche contando il carrello risultavano "sani". HYALUBRIX invece regge davvero — carrello medio €219 che copre i €31 di perdita — ed è rimasto dentro.
+
+**Esito: 9 SKU sotto costo fuori dalla vetrina**, verificato dopo rerun stable: zero ancora dentro, feed 19.500, 958 forzati ancora nel CSV.
+
+**Per il capo, due cose da decidere, non da eseguire:**
+1. Le guardie L2/L4 (`vende_e_ripaga`) e la guardia carrello (`porta_carrelli_sani`) misurano **fatturato e costo click, mai il margine del prodotto**. Finché è così proteggono chi vende in perdita. Serve una migrazione che ci metta dentro il margine vero — non la faccio di mia iniziativa perché tocca tutta la rete, non solo il pilota.
+2. Il prezzo di questi prodotti non è alzabile (veto rialzi, territorio Farmabooster). L'unica leva nostra è la vetrina. Se il listino è sbagliato, la correzione sta a monte.

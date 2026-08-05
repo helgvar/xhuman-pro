@@ -484,3 +484,52 @@ Costo del test: ~€38,54/gg × 3 = **~€116**.
 ### Da decidere (non è materia di feed)
 
 La leva sulla spedizione vale su tutte le 19.750 offerte MPF, non sui 90 SKU. Portarla da €5,82 a €4,76 (il livello di San Vito e Procaccini, dentro la stessa rete) sposta ogni offerta di un euro sul totale — che è la grandezza su cui TP ordina. Non è una decisione del feed: è del cliente.
+
+---
+
+## 5/8 (notte) — Prima notte a 19.500: zero vendite perse, e l'allarme "ricondanne" è un falso positivo
+
+Il feed ha passato la notte a **19.500** (era 24.916). Prima verifica il mattino dopo, sui numeri e non sulle intenzioni.
+
+### Il taglio ha tolto vendite?
+
+Ordini MPF di ieri su SKU che oggi **non** sono nel CSV: 7 ordini, 9 righe, **€203,48**. A prima vista sembra il danno. Ma guardando SKU per SKU:
+
+| SKU | prodotto | fatturato | civetta | stock |
+|---|---|---|---|---|
+| 970489593 | COLILEN IBS 96OPR | 51,62 | **false** | 0 |
+| 951507817 | POLASE PLUS CARNITINA | 42,24 | **false** | 0 |
+| 022816122 | SOMATOLINE GEL 30BUST | 41,45 | **false** | 4 |
+| 987400330 | IRILENTI PLUS 360ML | 29,90 | **false** | 0 |
+| 920891759 | IDEAL SOLEIL DOPOSOLE | 15,88 | **false** | 0 |
+| 040313049 | TACHIPIRINA OROSOL | 13,38 | **false** | 19 |
+| 012745067 | TACHIPIRINA AD SUPP | 5,61 | **false** | 22 |
+| 982509693 | ORALB PROF SENS | 3,40 | **false** | 0 |
+
+**Tutti `is_civetta = false`: nessuno di questi è mai stato nel feed.** Non escono su Trovaprezzi né prima né dopo il taglio — quel fatturato arriva da altri canali. Sugli SKU con REMOVE attiva (i tagli del 5/8): **zero ordini, €0**.
+
+Il taglio da 24.916 a 19.500 non ha tolto una sola vendita.
+
+### L'allarme "MPF 22 SKU rilasciati sono tornati BLOCCATI"
+
+Si ripete a ogni ciclo dal 4/8. Classificati tutti i 148 rilasciati che non sono nel CSV:
+
+| Causa | SKU | È un problema? |
+|---|---|---|
+| stock 0 | 63 | no — TP li esclude comunque |
+| prezzo 0 | 12 | no — non esportabili |
+| `is_civetta=false` | 9 | no — mai stati eleggibili |
+| sotto costo | 2 | no — giusto che stiano fuori |
+| REMOVE `pulizia_burner_0508` | 32 | condanna legittima |
+| REMOVE `pulizia_capo_taglio_0508` | 9 | condanna legittima |
+| REMOVE `pulizia_vetrina_piena` | 3 | condanna legittima |
+| fuori per il cap | 18 | legittimo |
+
+**86 su 148 non sono condanne affatto**: sono SKU che la quarantena ha rilasciato ma che il feed non può esportare comunque. Il monitor conta "rilasciato e non nel CSV" e chiama tutto ricondanna.
+
+Il dato che conta: **rilasciati da meno di 7 giorni colpiti = 0**, su tutte e quattro le categorie. Il periodo di grazia regge, e la patch `in_test` sul cap (commit `873bdbe`) fa il suo lavoro — nessuno degli SKU in test viene spinto fuori.
+
+Due casi guardati a mano perché sembravano contraddittori:
+
+- **TROSYD DERMATITE SEB SH120ML** (`037087032`): rilasciato alle 04:01, ricondannato subito da `pulizia_brucia_margine`. Prezzo €5,59 contro un costo di €11,35 — **vende sotto costo di €5,76**. La condanna è corretta; è uno degli 11 SKU a margine ≤ 0 già segnalati. Il rilascio dalla quarantena non deve poter rimettere dentro un prodotto in perdita.
+- **POLASE ARANCIA 24BUST PROMO** (`987437249`): stock 24, prezzo €9,36, costo €7,61, margine sano. È fuori perché `is_civetta = false` — Farmabooster non lo marca civetta, quindi il feed non lo può prendere. Non era un killer né una quarantena: era una domanda mal posta.

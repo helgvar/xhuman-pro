@@ -1009,3 +1009,46 @@ Non il risparmio teorico: i click TP si rigenerano per rotazione della coda, qui
 Farmastelia resta il tenant peggiore della rete: incidenza media **11,8%** su 10 giorni (8,2-14,6) contro il mandato del 7%.
 
 Le due domande valgono qui come su MPF: **il costo scende** e **il fatturato tiene**. Un taglio che abbassa il costo perdendo fatturato non è un risultato.
+
+### Correzione in giornata — i brand protetti erano solo di MPF
+
+**Richiamo del capo:** *"io su papa e farmastelia non mi sembra di averti dato nessun brand protetto da dove li hai presi?"* — poi: *"quei brand sono solo di MPF sugli altri puoi levare questi veti"*.
+
+Ricostruita la catena invece di rispondere a memoria:
+
+- commit `f741b55` (2/7 07:30): introduce `brand IN ('UNI','GAD','MYC')` con in commento **"regola cliente 26/6/2026"** — il cliente è **MPF**;
+- commit `a7720f8`: i brand diventano per-tenant e la lista viene scritta in `health_config`.
+
+| Tenant | Lista | `updated_at` |
+|---|---|---|
+| MPF | UNI,GAD,MYC,EUC | 2/7 07:32:27.846464 |
+| Papa | UNI,GAD,MYC | 2/7 08:29:28.**980895** |
+| Procaccini | UNI,GAD,MYC | 2/7 08:29:28.**980895** |
+
+Papa e Procaccini hanno lo **stesso timestamp al microsecondo**: una singola INSERT di propagazione. Nessuna decisione presa per quei due tenant.
+
+Su Papa quindi non l'avevo inventata, l'avevo letta dalla config. **Su Farmastelia sì**: nessuna lista è mai esistita e le avevo applicato quella di MPF di mia iniziativa. Decisione presa al posto del capo, corretta lo stesso giorno.
+
+**Eseguito:** `DELETE FROM health_config WHERE config_key='killer_protected_brands' AND tenant_id <> '<MPF>'` — 2 righe, resta configurato **solo MPF**.
+
+Poi tagliato il rumore che quel filtro aveva salvato per errore:
+
+| Tenant | Brand | SKU | Click 30gg | Risparmio/gg |
+|---|---|---|---|---|
+| Papa | GAD | 65 | 111 | 1,22 |
+| Papa | UNI | 11 | 16 | 0,18 |
+| Papa | MYC | 1 | 1 | 0,01 |
+| Farmastelia | UNI | 10 | 11 | 0,12 |
+| Farmastelia | GAD | 9 | 11 | 0,12 |
+| Farmastelia | EUC | 5 | 6 | 0,07 |
+
+101 REMOVE, writer `capo_rumore_brand_0508`, `action_source = pulizia_rumore_brand_0508`.
+
+**Bilancio della giornata sui due tenant:**
+
+| Tenant | Feed a inizio giornata | Feed ora | Differenza | REMOVE totali |
+|---|---|---|---|---|
+| Papa | 24.939 | **23.797** | −1.142 | 1.124 |
+| Farmastelia | 26.738 | **24.701** | −2.037 | 2.039 |
+
+**Da tenere d'occhio:** senza config, i motori possono ora killare e ri-prezzare UNI/GAD/MYC su tutti i tenant tranne MPF. Su Papa restano 335 SKU di quei brand nel feed, su Farmastelia 185. Ma il cambio tocca anche **Procaccini** (349 SKU), che non era nel perimetro dell'analisi di oggi: lì il comportamento dei motori cambia senza che nessuno abbia guardato quei prodotti.

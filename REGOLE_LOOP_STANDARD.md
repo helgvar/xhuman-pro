@@ -59,7 +59,7 @@ Nessun SKU a 1-4 click merita una condanna individuale. Ma il blocco costa:
 | Farmastelia | 2.019 | 34,02 | 5/8 |
 
 **Regola da codificare** — filtri obbligatori prima di togliere un blocco di rumore:
-1. Brand protetti del tenant (`health_config.killer_protected_brands`) — **sempre fuori**.
+1. Brand protetti del tenant (`health_config.killer_protected_brands`) — **fuori solo dove il cliente li ha chiesti**. Dal 5/8 esiste **solo su MPF**: UNI/GAD/MYC/EUC erano finiti su Papa e Procaccini per propagazione (stesso `updated_at` al microsecondo), non per volontà di quei clienti. Non inventare uno scudo dove la config non c'è.
 2. Venduto fra 31 e 90 giorni **con stock fisico** (`erp_stock > 0`) — fuori: è magazzino della farmacia, va spinto (regola aurea).
 3. Ordini reali Magento a 30 giorni, whitelist stati — se ha venduto anche una volta, resta.
 4. `action_source` deve iniziare per `pulizia_` o il rerun engine la cancella.
@@ -113,8 +113,8 @@ Papa il 30/7 ha fatto 18 click e il 31/7 zero, mentre tutta la rete girava: budg
 | Tenant | Feed prima | Feed dopo | REMOVE | Risparmio teorico/gg |
 |---|---|---|---|---|
 | MPF | 20.394 | 19.500 | 894 + 9 sottocosto | ~25,47 |
-| Papa | 24.939 | 23.894 | 1.047 | 18,94 |
-| Farmastelia | 26.738 | 24.725 | 2.015 | 34,02 |
+| Papa | 24.939 | 23.797 | 1.124 | 20,35 |
+| Farmastelia | 26.738 | 24.701 | 2.039 | 34,33 |
 
 **Teorico, non reale**: i click TP si rigenerano per rotazione della coda. Il risparmio vero si legge sulla riga piena di domani (cron 05:02), non oggi.
 

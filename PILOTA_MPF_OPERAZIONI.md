@@ -712,3 +712,17 @@ Gli altri 16 con scudo carrello restano dentro: portano ordini ad altri prodotti
 | bruciatori tagliati | 30 su 30 usciti |
 | risparmio misurato | €7,24/gg dai bruciatori |
 | vendite perse | **zero** |
+
+### Lo scraper conferma il modello
+
+I 279 dell'ondata 1 sono in vetrina da stanotte. Lo scraper ne ha già rivisti **231**, e li trova dove il calcolo diceva:
+
+| posizione reale | SKU |
+|---|---|
+| podio (1-3) | **172** |
+| 4-10 | 55 |
+| fuori top10 | 4 |
+
+**Posizione media 2,7. 227 su 231 in top10, il 98%.** La previsione era fatta contando i rivali esterni più economici **sul totale** (prezzo + spedizione): quel metodo ora ha una verifica sul campo, non è più una teoria. E vale anche al contrario — se sbagliassimo a confrontare sui prezzi base, questi prodotti sarebbero finiti in fondo alla SERP senza che ce ne accorgessimo.
+
+Restano da vedere le conversioni. La vetrina è quella giusta; se non vendono, il daily engine li toglie da solo — `pulizia_forza%` non è tra le sorgenti intoccabili, quindi i motori possono sovrascrivere l'ADD con un REMOVE quando bruciano. Valvola aperta, nessun forzato è immortale.

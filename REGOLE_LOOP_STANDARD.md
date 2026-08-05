@@ -149,3 +149,15 @@ Le due domande restano separate: **il costo scende?** e **il fatturato tiene?** 
 ## Nota di metodo
 
 Finché queste regole vivono in un documento e non in una migrazione, il sistema non le applica: le applico io. Ogni riga della sezione 2 è debito — vale finché qualcuno la esegue a mano, e sparisce il giorno che smetto. La sezione 1 è l'unica che gira da sola.
+
+### 2.8 Un parziale ha due orologi, non uno
+
+Il 5/8 ho dato al capo MPF a **10 ordini / €674,16**. Erano **14 / €800,21**: `MAX(orders.updated_at)` segnava 12:25:29, magentoSync stava scrivendo nell'istante della lettura. Ci avevo già costruito sopra una diagnosi ("MPF perde fatturato dopo il taglio"), poi caduta.
+
+**Regola da codificare** — ogni snapshot parziale dichiara **due** freschezze, non una:
+- click → `MAX(zombie_clicks.created_at)`
+- ordini → `MAX(orders.updated_at)`
+
+Se l'ultimo tocco agli ordini è entro ~2 minuti da adesso, il sync sta scrivendo: aspettare e rileggere prima di calcolare l'incidenza. Aspettare il fetch dei click e dare per buoni gli ordini è metà lavoro.
+
+**Corollario sui cali**: mai diagnosticare un calo su due giorni di confronto. Servono 3-4 stesso-giorno-settimana. Il "calo MPF" nasceva dal mettere il mercoledì più forte del mese (22/7, €1.057) contro un parziale monco; su quattro mercoledì MPF era a −5,6% dalla media, dentro la variabilità.

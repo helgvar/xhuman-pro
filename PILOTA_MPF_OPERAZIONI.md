@@ -817,3 +817,39 @@ Non cambia una virgola delle decisioni sul feed — quelle restano sugli ordini 
 
 ### Resta aperto
 - **Credito Anthropic esaurito**: `aiAuditor audit failed: 400 — Your credit balance is too low`. L'audit AI è fermo su tutti i tenant da ieri.
+
+### 10:15 — dove sono finiti i forzati, e perché il machete non ha più niente da tagliare
+
+**Posizione reale dei 1.019 forzati** (scraper fresco 48h, rivali di rete esclusi, confronto sul totale con spedizione):
+
+| | SKU | posizione media |
+|---|---|---|
+| podio (1-3) | **371** | 2,0 |
+| top10 (4-10) | 195 | 7,2 |
+| fuori top10 | 134 | 20,2 |
+| non ancora scansionati | 319 | — |
+
+Dei 700 già rivisti dallo scraper, **566 sono in top10 — l'81%**, e più della metà sul podio. Il modello di posizionamento regge una seconda volta su un campione quattro volte più grande di ieri. I 134 finiti fuori erano top3 quando li ho forzati: il mercato si è mosso sotto. Li lascio dove sono fino a fine misura, poi o li si recupera col prezzo o escono.
+
+**Seconda passata burner, finestra 15 giorni, soglia onesta (≥15 click).** Dentro il CSV, esclusi brand, carrelli sani, pin e forzati:
+
+| tipo | SKU | click 15gg | €/giorno |
+|---|---|---|---|
+| vende ma brucia | 2 | 92 | 2,02 |
+| burner puro | 1 | 18 | 0,40 |
+
+**Tre prodotti. Due euro e quarantadue al giorno.** Il pozzo è secco.
+
+Allargando a tutto ciò che nel CSV ha preso click in 15 giorni e **non ha venduto nulla in 30**, protetti e portatori di carrello esclusi:
+
+| fascia click | SKU | click | €/giorno |
+|---|---|---|---|
+| 15+ | 4 | 85 | 1,87 |
+| 5-14 | 44 | 305 | 6,70 |
+| 2-4 | 98 | 255 | 5,60 |
+| 1 | 184 | 184 | 4,04 |
+| **totale** | **330** | **829** | **18,21** |
+
+Diciotto euro al giorno su circa duecentocinquanta: **il 93% della spesa TP di MPF finisce ormai su prodotti che hanno venduto negli ultimi 30 giorni.** E quei diciotto euro sono per tre quarti coda lunga da uno o due click — dove "zero vendite" non è una condanna, è rumore statistico.
+
+Conclusione operativa: **la strada del taglio è finita.** Ogni euro in più che si toglie da qui in avanti si toglie a qualcuno che vende. Le leve che restano sono le due già misurate — il prezzo sui 3.893 recuperabili e la spedizione a 4,76 — più il riposizionamento dei 134 forzati caduti fuori. Nessuna delle tre è un taglio.

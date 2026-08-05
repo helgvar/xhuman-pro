@@ -764,3 +764,56 @@ Mezzo euro di taglio medio per portare 3.893 prodotti in vetrina tenendo €3,09
 **10.889 prodotti passerebbero in top10 senza toccare un solo prezzo.** Un euro e sei centesimi di spedizione in meno vale, da solo, più di qualsiasi campagna di price cut che possiamo fare sul catalogo — e non costa un centesimo di margine sul prodotto.
 
 Non prometto che si trasformino in vendite: la vetrina è condizione necessaria, non sufficiente. Ma oggi quei 10.889 non sono nemmeno in gara, e il motivo non è il prezzo, è il corriere. **La leva è del cliente, non del feed.** Il numero è questo, la decisione è del capo.
+
+---
+
+## 5/8 ore 09:40 — prima lettura del giorno dopo, e un bug GA4 chiuso
+
+### Il ciclo notturno è passato sopra il feed e non l'ha disfatto
+
+Il motore giornaliero ha girato stanotte su tutta la rete. Su MPF il CSV è uscito a **19.500 civetta=1, 2 rimossi rispetto al giorno prima**: il tetto tiene e le forzature sono ancora dentro. I 1.019 SKU forzati (le tre ondate più i venditori) sono sopravvissuti a un secondo ciclo completo.
+
+### Il primo numero pulito arriva domani alle 05:02, non oggi
+
+Ho scoperto una cosa leggendo `zombie_clicks` che cambia come si misura:
+
+| fetch_date | scritto il | righe | click |
+|---|---|---|---|
+| 2026-08-03 | 04/08 05:02 | 488 | 849 |
+| 2026-08-04 | 05/08 05:02 | 457 | 754 |
+| 2026-08-05 | 05/08 08:37 | 41 | **52** |
+
+Il cron delle 05:02 scrive il giorno **precedente completo**; l'intraday delle 08:37 scrive il parziale di oggi. Confrontare i 52 click di stamattina con i 739/giorno della baseline è confrontare tre ore con ventiquattro. **Il 4/8 ha chiuso a 754 click / €248,37**, in linea con la media — giusto così: i tagli sono arrivati la sera del 4 e la mattina del 5, non hanno ancora avuto un giorno intero per farsi vedere. Il verdetto sul costo è la riga `fetch_date = 2026-08-05` che comparirà domani alle 05:02.
+
+### Il fatturato però parla già
+
+MPF prima delle 09:40, ultimi nove giorni:
+
+| giorno | ordini | venduto entro le 09:40 |
+|---|---|---|
+| 28/7 | 2 | 33,59 |
+| 29/7 | 6 | 359,44 |
+| 30/7 | 5 | 241,25 |
+| 31/7 | 4 | 232,58 |
+| 1/8 | 5 | 238,94 |
+| 2/8 | 2 | 48,61 |
+| 3/8 | 7 | 390,02 |
+| 4/8 | 3 | 181,03 |
+| **5/8** | **7** | **523,42** |
+
+Massimo dei nove giorni, +34% sul secondo giorno migliore, più del doppio della media. Non lo attribuisco al feed: un giorno non è una serie e la stessa mattina il fatturato può nascere da un'email, da una ricerca organica, da un cliente che torna. Lo registro perché è il verso giusto, e perché la legge dice fatturato su.
+
+Sui forzati, per ora: **1 click e €54,53 di venduto** contro 42 click e €433,97 del resto del feed. Con un solo click addosso, quei 54 euro non vengono da Trovaprezzi. Troppo presto: 41 SKU in tutto hanno preso click stamattina.
+
+### Bug GA4 trovato e corretto — l'attribuzione non aveva SKU
+
+`[GA4] Entity ID map: 0 products` e `[GA4] Key remap: 0 mapped to SKU, 724 unmapped` su ogni tenant che ha GA4 attivo. GA4 ha ricominciato a dare numeri (€66.470 di first-touch su SubitoFarma), ma **non erano agganciabili a nessun prodotto**.
+
+Causa: GA4 manda come `itemId` l'`entity_id` di Magento, non il minsan. La traduzione passa da `products.magento_entity_id`, che su MPF, Papa, Procaccini, San Vito, Farmastelia, SubitoFarma, Farmainsieme, Ospedale è **NULL su tutto il catalogo** (solo Mandanici 91.462 e Farmacri 69.401 ce l'hanno). Esisteva già la funzione di ripiego `buildEntityIdMapFromGA4` — costruisce la mappa dai *nomi* prodotto di GA4 e la persiste — scritta, testata, esportata e **mai chiamata da nessuna parte**. Codice morto dalla migrazione 008.
+
+Fix in `services/ga4Analytics.js`: se la mappa dal catalogo esce vuota, si costruisce da GA4 e si salva per i giri successivi. Deployato e riavviato alle 09:44, backend up.
+
+Non cambia una virgola delle decisioni sul feed — quelle restano sugli ordini reali Magento — ma restituisce l'attribuzione per prodotto, che serve per capire *dove* finiscono i click dopo il click.
+
+### Resta aperto
+- **Credito Anthropic esaurito**: `aiAuditor audit failed: 400 — Your credit balance is too low`. L'audit AI è fermo su tutti i tenant da ieri.

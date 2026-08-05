@@ -461,13 +461,21 @@ async function buildGA4Index(tenantId) {
   const propertyId = await googleApiService.getGA4PropertyId(tenantId);
 
   // Build entity_id → SKU map (from products.magento_entity_id)
-  const entityIdMap = await buildEntityIdMap(tenantId);
+  let entityIdMap = await buildEntityIdMap(tenantId);
   console.log(`[GA4] Entity ID map: ${Object.keys(entityIdMap).length} products`);
+
+  // Cold start: no entity_id in catalog → derive the map from GA4 item names
+  // and persist it, otherwise every GA4 itemId stays unmapped and the whole
+  // attribution is unusable at product level.
+  if (Object.keys(entityIdMap).length === 0) {
+    const fromGA4 = await buildEntityIdMapFromGA4(client, propertyId, tenantId);
+    if (Object.keys(fromGA4).length > 0) entityIdMap = fromGA4;
+  }
 
   // Run all queries in parallel — all 30 days for consistency
   const [tpPurchases, assistedSales, channelKpis, sourceMedium, firstTouchData] = await Promise.all([
-    queryTrovaprezziPurchases(client, propertyId, 30),
-    queryAssistedSales(client, propertyId, entityIdMap, 30),
+    queryTrovaprezziPurchases(client, propertyId, 15),
+    queryAssistedSales(client, propertyId, entityIdMap, 15),
     queryChannelKpis(client, propertyId, 30),
     querySourceMedium(client, propertyId, 30),
     queryFirstTouchAttribution(client, propertyId, 30),

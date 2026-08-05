@@ -608,3 +608,77 @@ Baseline MPF, 8 giorni prima del taglio:
 | 28/7 | 871 | 286,91 |
 
 **Media: 739 click/gg, €243,58/gg.** Il feed a 19.500 è in vigore da ieri sera: il dato del 5/8 è la prima misura pulita. Le due domande a cui rispondere domani sono separate — il costo scende sotto la media? e i 279 forzati portano ordini che prima non c'erano?
+
+---
+
+## 5 agosto, mattina — il taglio non ha tolto vendite, e il bacino vero era nascosto dietro un campo prezzo
+
+### Prima verifica sul campo, ore 08:48
+
+Il feed a 19.500 ha girato tutta la notte. Cosa dicono i numeri della prima mezza giornata:
+
+| | oggi 08:48 | media 8gg stessa fascia |
+|---|---|---|
+| fatturato MPF | **390,16** | 120,64 (max precedente 238,94) |
+| ordini | 5 | 2,5 |
+| click MPF | 52 | — |
+| MPF su totale rete | 14,8% | 14,2% ieri, range 11,9-17,5 |
+
+Il rapporto MPF/rete è ancora in media: **il taglio non ha spostato i click in proporzione**, e a mezza giornata è troppo presto per il verdetto sul costo. Il fatturato invece è tre volte la media della fascia oraria, ma su 5 ordini: lo registro, non lo attribuisco.
+
+**Dove sono finiti i 52 click**: 46 su prodotti già nel feed, 2 su tagliati, 1 su un forzato, 3 fuori feed. I 2 click sui tagliati sono ANSIOTEN e PURES ROLL, un click a testa, zero vendite: coda residua di TP che deve ancora rileggere il CSV, €0,66 in tutto.
+
+**Cinque prodotti hanno venduto stando fuori dal feed.** Due erano tagliati da noi ieri (ESI MULTICOMPLEX VIT C, DEFENCE SUN LATTE). Verificato uno per uno: **nessuno dei due ha preso un solo click TP oggi** — quelle vendite sono arrivate da un altro canale, non gliele ha tolte il feed. Degli altri tre, tutti stock 0 e prezzo nullo: TP non li esporterebbe comunque. L'unico con stock, ESI VIT C, ha **13 rivali sotto di lui sul totale**: fuori dalla top10, il taglio regge.
+
+Il conto della notte: **zero vendite perse per mano nostra.**
+
+### L'errore che nascondeva il bacino
+
+Ho misurato il bacino residuo da forzare e mi sono usciti **24 SKU**. Ieri erano 1.432. Un crollo del genere in una notte non è un dato, è un bug.
+
+Era il campo prezzo. `applied_price` è popolato **solo per chi sta già nel feed** — è il prezzo con il nostro PRICE_CUT sopra. Su 7.241 prodotti MPF con stock fisico, ce l'hanno in 358. Filtrare i candidati su `applied_price > 0` significa cercare chi è fuori dal feed **tra quelli che ci sono dentro**: il filtro cancellava esattamente la materia che doveva trovare.
+
+Il campo giusto è `exported_price`, quello che Farmabooster manda a Trovaprezzi: ce l'hanno **3.817** dei fuori-CSV con stock. Da qui in avanti, per qualsiasi valutazione su prodotti fuori dal feed, il prezzo è `COALESCE(applied_price, exported_price)`.
+
+Bacino vero, ricalcolato (floor di ricarico rispettato, margine ≥ €1,50):
+
+| posizione attesa sul totale | SKU | margine medio |
+|---|---|---|
+| 1° | 358 | 4,36 |
+| 2°-3° | 239 | 5,86 |
+| 4°-6° | 140 | 5,04 |
+| 7°-10° | 155 | 3,34 |
+
+### Ondata 3 — 590 sul podio
+
+Presi i primi tre posti sul totale: **590 SKU**, margine medio €4,86, €2.867 di margine complessivo, posizione attesa media 0,5 rivali sotto. **366 di loro avevano `is_civetta = false` da Farmabooster** — sei su dieci. Sono precisamente i prodotti che l'indicazione di FB teneva fuori e che l'ordine del 5/8 dice di forzare.
+
+116 quarantene riaperte per farli passare. In CSV: **549 su 590**.
+
+### I 136 venditori che stavano fuori dalla vetrina
+
+Poi ho fatto la domanda al contrario: chi ha **venduto su MPF negli ultimi 30 giorni** ed è fuori dal CSV? Con stock esportabile — fisico **o grossista** — sono **136**. Tutti dentro, tutti e 136 nel CSV.
+
+Sul primo giro ne avevo contati 3, perché filtravo su `erp_stock > 0`: la disponibilità grossista (`supplier_stock`) è esportabile su TP quanto quella fisica, e scartarla nascondeva 133 venditori. Sono ordini piccoli, spesso €2-4 a riga, ma è fatturato dimostrato.
+
+### Il cap non ha buttato fuori nessuno che vende
+
+Controllo obbligatorio dopo aver aggiunto 726 SKU con un tetto fisso a 19.500. Fuori dal CSV con un'azione attiva ci sono 358 SKU, di cui 29 hanno venduto in 30 giorni per €1.829,95. Scomposti:
+
+- **26 (€1.766) stock 0 sia in farmacia sia dal grossista** — TP non li accetta comunque, non è il cap che li esclude
+- 2 forzabili, 1 in quarantena → **entrati con l'ondata dei venditori**
+
+**Nessuno espulso dal cap.** La patch di priorità di ieri sta reggendo: i forzati pesano 300.000 e stanno sopra tutto tranne brand protetti e pin del capo.
+
+### Stato
+
+| | |
+|---|---|
+| feed | **19.500** (tetto rispettato) |
+| forzati totali | **1.019**, di cui **964 nel CSV** |
+| — ondata 1+2 (4-5/8) | 293 → 279 |
+| — ondata 3 (podio) | 590 → 549 |
+| — venditori fuori vetrina | 136 → 136 |
+| bloccati | 55, quarantene con le due porte di veto incompatibili |
+
+Restano nel bacino ~295 posizionabili in fascia 4-10 e 1.117 fuori top10. Non li tocco: prima la misura di 24-48 ore su questi.

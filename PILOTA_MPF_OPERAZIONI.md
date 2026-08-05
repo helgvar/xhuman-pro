@@ -741,3 +741,26 @@ Ho riprovato il rilascio con il writer `capo_`, che è la porta che `veto_releas
 Le due porte si escludono a vicenda — nessun writer inizia sia per `capo_` sia per `sessione_` — e l'unica strada che le apre entrambe è la stessa: **il prodotto deve vendere e ripagare il click**. Questi 43 sono burner condannati in passato, non vendono, e il sistema chiede una prova che non hanno.
 
 **Non scavalco.** Servirebbe una migrazione che allinei i due trigger, cioè aggirare due guardie indipendenti che stanno facendo esattamente il loro lavoro. Sono 43 SKU su 1.019, il 4%: il prezzo di lasciarli fuori è basso, il prezzo di aprire una scorciatoia nel sistema dei veti è alto e permanente. Se il pilota dimostra che il criterio del totale-con-spedizione batte la vecchia condanna, la migrazione la si fa allora, con il dato in mano e per scelta del capo — non di soppiatto stamattina.
+
+### Due leve misurate, nessuna delle due tirata
+
+Mentre TP non aggiornava i click (il fetch resta quello delle 08:37, il cron gira regolare ogni 4h — non è un guasto) ho misurato le due leve che restano, senza toccarle.
+
+**Leva 1 — il prezzo.** Dei prodotti fuori dal feed che stanno oltre il decimo posto, quanti rientrerebbero in top10 con un taglio che **resta sopra il floor di ricarico**? Il calcolo è: prezzo necessario = totale del decimo rivale esterno − la nostra spedizione − 1 centesimo.
+
+| | SKU | taglio medio | margine dopo |
+|---|---|---|---|
+| recuperabili col prezzo | **3.893** | 0,55 | **3,09** |
+| irrecuperabili (floor più alto del prezzo che servirebbe) | 14.173 | 1,78 | 0,44 |
+
+Mezzo euro di taglio medio per portare 3.893 prodotti in vetrina tenendo €3,09 di margine. Questo è il "civetta true **+ price_cut**" dell'ordine del 5/8, ed è la mossa dopo la misura — non insieme alla misura, o non si capisce più cosa ha funzionato.
+
+**Leva 2 — la spedizione.** Stessa identica formula, cambiando solo il nostro costo di spedizione da **5,82 a 4,76** (quello che pagano San Vito e Procaccini, stessa rete):
+
+| | con 5,82 | con 4,76 |
+|---|---|---|
+| SKU fuori top10 | 18.066 | **7.177** |
+
+**10.889 prodotti passerebbero in top10 senza toccare un solo prezzo.** Un euro e sei centesimi di spedizione in meno vale, da solo, più di qualsiasi campagna di price cut che possiamo fare sul catalogo — e non costa un centesimo di margine sul prodotto.
+
+Non prometto che si trasformino in vendite: la vetrina è condizione necessaria, non sufficiente. Ma oggi quei 10.889 non sono nemmeno in gara, e il motivo non è il prezzo, è il corriere. **La leva è del cliente, non del feed.** Il numero è questo, la decisione è del capo.

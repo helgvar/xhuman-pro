@@ -1175,8 +1175,13 @@ async function persistActions(tenantId, actions) {
     WHERE fa.tenant_id = $1 AND fa.action IN ('REMOVE', 'ADD', 'PRICE_CUT')
   `, [tenantId]);
 
-  // Clear and rewrite
-  await pool.query('DELETE FROM feed_actions WHERE tenant_id = $1', [tenantId]);
+  // Clear and rewrite — SOLO le righe del motore (arbitro 13/7, giornale n.19):
+  // le azioni manuali/di sessione (manual_pepita, manual, capo_pin) e gli
+  // scavalchi muro NON si toccano MAI in un rewrite di massa.
+  await pool.query(
+    `DELETE FROM feed_actions WHERE tenant_id = $1
+       AND COALESCE(action_source, 'engine') NOT IN ('manual_pepita', 'manual', 'capo_pin', 'muro_scavalco')`,
+    [tenantId]);
 
   const BATCH = 100;
   const COLS = 30;

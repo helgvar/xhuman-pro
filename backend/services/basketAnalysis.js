@@ -41,7 +41,7 @@ async function computeBasketMetrics(tenantId, opts = {}) {
       SELECT o.id AS order_id, o.grand_total_products AS cart_value
       FROM orders o
       WHERE o.tenant_id = $1
-        AND o.order_status IN ('complete','processing','Ritirato','ritiro_farmacia','ritiro_sede_tmp')
+        AND o.order_status NOT IN ('canceled','closed','pending_payment')
         AND o.order_date >= NOW() - ($2::int || ' days')::interval
     ),
     cart_items AS (

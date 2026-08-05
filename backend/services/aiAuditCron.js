@@ -13,6 +13,9 @@ const DIGEST_HOUR_UTC = 9;
 // Loop ottimizzazione AI ogni 6h: 00, 06, 12, 18 UTC (= 02, 08, 14, 20 italia).
 // Ogni slot: 1) audit globale di tutti i tenant attivi 2) auto-apply suggerimenti safe.
 const OPTIMIZATION_HOURS_UTC = [0, 6, 12, 18];
+// COSTO (ordine capo 29/7): un solo slot/gg gira su Opus-4-8 deep (analisi profonda),
+// gli altri 3 su Sonnet-4-5 medium (~1/6 del costo). 06 UTC = 08 italia = deep.
+const DEEP_HOUR_UTC = 6;
 
 async function sendDigest() {
   const { sendTelegram } = require('./telegramNotifier');
@@ -67,8 +70,8 @@ async function runAutoApply() {
  * Loop di ottimizzazione AI completo: audit di TUTTI i tenant attivi + auto-apply.
  * Gira ogni 6h. Forza l'audit anche se l'engine non ha appena girato.
  */
-async function runOptimizationLoop() {
-  console.log('[aiAuditCron] ===== Optimization loop START =====');
+async function runOptimizationLoop(profileName = 'loop') {
+  console.log(`[aiAuditCron] ===== Optimization loop START (profile=${profileName}) =====`);
   try {
     const { auditTenantRun } = require('./aiAuditor');
     const { rows: tenants } = await pool.query(
@@ -78,10 +81,10 @@ async function runOptimizationLoop() {
     let totalTokens = 0;
     for (const t of tenants) {
       try {
-        // Loop ogni 6h usa Opus + extended thinking (analisi profonda)
+        // profile: 'loop' (Sonnet medium, 3 slot/gg) o 'deep' (Opus, 1 slot/gg).
         // bypassThrottle perche' il loop e' temporizzato, non event-driven
         const r = await auditTenantRun(t.id, null, null, {
-          profile: 'deep',
+          profile: profileName,
           bypassThrottle: true,
         });
         if (r.ok) {
@@ -146,12 +149,12 @@ function start() {
     // Loop ottimizzazione AI ogni 6h (audit + auto-apply)
     if (OPTIMIZATION_HOURS_UTC.includes(h) && lastOptHour !== h) {
       lastOptHour = h;
-      await runOptimizationLoop();
+      await runOptimizationLoop(h === DEEP_HOUR_UTC ? 'deep' : 'loop');
     } else if (!OPTIMIZATION_HOURS_UTC.includes(h)) {
       lastOptHour = -1;
     }
   }, 60 * 1000);
-  console.log(`[aiAuditCron] Started — digest UTC ${DIGEST_HOUR_UTC}:00, optimization loop UTC ${OPTIMIZATION_HOURS_UTC.join(',')}:00 (ogni 6h)`);
+  console.log(`[aiAuditCron] Started — digest UTC ${DIGEST_HOUR_UTC}:00, optimization loop UTC ${OPTIMIZATION_HOURS_UTC.join(',')}:00 (deep Opus @${DEEP_HOUR_UTC}:00, resto Sonnet)`);
 }
 
 module.exports = { start, sendDigest, runAutoApply, runOptimizationLoop, purgeStalePending };

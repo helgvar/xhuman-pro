@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { authFetch } from '../utils/authFetch';
+import { authFetch } from '../utils/tokenManager';
 
 function api(path, opts = {}) {
   return authFetch(`/api${path}`, {
@@ -58,7 +58,7 @@ export default function Oblio() {
   }
 
   async function releaseSku(id) {
-    if (!confirm('Rilasciare manualmente questo SKU dall\\'OBLIO?')) return;
+    if (!confirm('Rilasciare manualmente questo SKU dall’OBLIO?')) return;
     await api(`/oblio/${id}/release`, { method: 'POST' });
     reload();
   }

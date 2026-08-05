@@ -74,7 +74,7 @@ async function computeWindow(tenantId, fromDate, toDate, shippingCost, cpc) {
       FROM orders o
       JOIN order_items oi ON oi.order_id = o.id
       WHERE o.tenant_id = $1
-        AND o.order_status IN ('complete','processing','Ritirato','ritiro_farmacia','ritiro_sede_tmp')
+        AND o.order_status NOT IN ('canceled','closed','pending_payment')
         AND o.order_date::date BETWEEN $2 AND $3
     ),
     order_totals AS (

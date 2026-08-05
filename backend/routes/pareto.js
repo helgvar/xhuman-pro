@@ -34,7 +34,7 @@ router.get('/products', requireRole('superadmin', 'admin', 'viewer'), async (req
                COUNT(DISTINCT o.id) AS n_orders
         FROM orders o
         JOIN order_items oi ON oi.order_id = o.id
-        WHERE o.order_status IN ('complete','processing')
+        WHERE o.order_status NOT IN ('canceled','closed','pending_payment')
           AND o.order_date >= NOW() - ($1::int || ' days')::interval
         GROUP BY oi.sku
         HAVING SUM(oi.row_total) > 0
@@ -113,7 +113,7 @@ router.get('/products', requireRole('superadmin', 'admin', 'viewer'), async (req
                ROUND(COALESCE(SUM(oi.row_total), 0)::numeric, 2) AS revenue_in_top
         FROM tenants t
         LEFT JOIN orders o ON o.tenant_id = t.id
-          AND o.order_status IN ('complete','processing')
+          AND o.order_status NOT IN ('canceled','closed','pending_payment')
           AND o.order_date >= NOW() - ($1::int || ' days')::interval
         LEFT JOIN order_items oi ON oi.order_id = o.id AND oi.sku = ANY($2)
         WHERE t.status = 'active'
@@ -140,7 +140,7 @@ router.get('/products', requireRole('superadmin', 'admin', 'viewer'), async (req
         COUNT(DISTINCT o.tenant_id) AS active_tenants
       FROM orders o
       JOIN order_items oi ON oi.order_id = o.id
-      WHERE o.order_status IN ('complete','processing')
+      WHERE o.order_status NOT IN ('canceled','closed','pending_payment')
         AND o.order_date >= NOW() - ($1::int || ' days')::interval
     `, [days]);
 

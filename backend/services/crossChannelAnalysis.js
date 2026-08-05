@@ -49,7 +49,7 @@ async function getCrossChannelData(tenantId, days = 30) {
       LEFT JOIN products p ON p.tenant_id = oi.tenant_id AND p.sku = oi.sku
       WHERE oi.tenant_id = $1
         AND o.order_date >= CURRENT_DATE - ($2::int || ' days')::interval
-        AND o.order_status IN ('complete','processing','pending','Ritirato','ritiro_farmacia','ritiro_sede_tmp')
+        AND o.order_status NOT IN ('canceled','closed','pending_payment')
       GROUP BY oi.sku
     ),
     tp_window AS (

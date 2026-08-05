@@ -225,6 +225,7 @@ const classLabels = {
   star: { label: 'Star', color: 'bg-yellow-100 text-yellow-800', icon: '\u2605' },
   cash_cow: { label: 'Cash Cow', color: 'bg-green-100 text-green-800', icon: '\u2713' },
   burner: { label: 'Burner', color: 'bg-red-100 text-red-800', icon: '\u2716' },
+  protected: { label: 'Protetto', color: 'bg-teal-100 text-teal-800', icon: '\u{1F6E1}' },
   opportunity: { label: 'Opportunit\u00e0', color: 'bg-blue-100 text-blue-800', icon: '\u2191' },
   question_mark: { label: '?', color: 'bg-gray-100 text-gray-600', icon: '?' },
 };

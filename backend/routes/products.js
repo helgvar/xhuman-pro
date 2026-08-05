@@ -303,4 +303,27 @@ router.get('/import/status', requireRole('superadmin', 'admin', 'viewer'), async
   }
 });
 
+// GET /api/products/:sku/history — storico costi (per grossista) + prezzo di vendita
+// SOLO VISUALIZZAZIONE (non usato da nessun loop). Import: costPriceHistorySync.
+router.get('/:sku/history', requireRole('superadmin', 'admin', 'viewer'), async (req, res) => {
+  try {
+    const tenantId = req.tenantId;
+    const sku = req.params.sku;
+    const cost = await pool.query(
+      `SELECT to_char(data,'YYYY-MM-DD') AS data, source, ROUND(costo::numeric, 4) AS costo
+         FROM product_cost_history WHERE tenant_id = $1 AND sku = $2 ORDER BY data, source`,
+      [tenantId, sku]
+    );
+    const price = await pool.query(
+      `SELECT to_char(data,'YYYY-MM-DD') AS data, ROUND(prezzo::numeric, 4) AS prezzo
+         FROM product_price_history WHERE tenant_id = $1 AND sku = $2 ORDER BY data`,
+      [tenantId, sku]
+    );
+    res.json({ sku, cost: cost.rows, price: price.rows });
+  } catch (err) {
+    console.error('[Products] History error:', err.message);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 module.exports = router;

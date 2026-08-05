@@ -48,7 +48,7 @@ async function identifyCandidates(tenantId, opts = {}) {
         SUM(COALESCE(oi.row_total_incl_tax, oi.row_total*1.1)) AS rev
       FROM orders o JOIN order_items oi ON oi.order_id=o.id
       WHERE o.tenant_id = $1 AND o.order_date::date >= CURRENT_DATE - $2::int
-        AND o.order_status IN ('complete','processing','Ritirato','ritiro_farmacia','ritiro_sede_tmp')
+        AND o.order_status NOT IN ('canceled','closed','pending_payment')
       GROUP BY 1
     ),
     snap AS (
@@ -159,7 +159,7 @@ async function createTest(tenantId, sku, opts = {}) {
     LEFT JOIN (SELECT COUNT(DISTINCT o.id) AS n_ord, SUM(COALESCE(oi.row_total_incl_tax, oi.row_total*1.1)) AS rev
                FROM orders o JOIN order_items oi ON oi.order_id=o.id
                WHERE o.tenant_id = $1 AND oi.sku = $2 AND o.order_date::date >= CURRENT_DATE - $3::int
-                 AND o.order_status IN ('complete','processing','Ritirato','ritiro_farmacia','ritiro_sede_tmp')) o ON true
+                 AND o.order_status NOT IN ('canceled','closed','pending_payment')) o ON true
   `, [tenantId, sku, baselineDays]);
 
   if ((base.clicks || 0) < MIN_BASELINE_CLICKS || (base.orders || 0) < MIN_BASELINE_ORDERS) {
@@ -241,7 +241,7 @@ async function evaluateOne(test) {
     LEFT JOIN (SELECT SUM(clicks) AS clicks FROM zombie_clicks WHERE tenant_id=$1 AND product_code=$2 AND fetch_date >= $3::timestamp) zc ON true
     LEFT JOIN (SELECT COUNT(DISTINCT o.id) AS n_ord, SUM(COALESCE(oi.row_total_incl_tax, oi.row_total*1.1)) AS rev FROM orders o JOIN order_items oi ON oi.order_id=o.id
                WHERE o.tenant_id=$1 AND oi.sku=$2 AND o.order_date >= $3::timestamp
-                 AND o.order_status IN ('complete','processing','Ritirato','ritiro_farmacia','ritiro_sede_tmp')) o ON true
+                 AND o.order_status NOT IN ('canceled','closed','pending_payment')) o ON true
   `, [test.tenant_id, test.sku, test.applied_at]);
 
   const expectedOrders = test.baseline_orders * normFactor;

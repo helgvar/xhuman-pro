@@ -13,7 +13,7 @@
  */
 
 class ApiQueue {
-  constructor({ maxConcurrent = 3, delayMs = 200, name = 'API', cbThreshold = 3, cbCooldownMs = 120000 } = {}) {
+  constructor({ maxConcurrent = 3, delayMs = 200, name = 'API', cbThreshold = 3, cbCooldownMs = 120000, cbHardResetMs = 30 * 60 * 1000 } = {}) {
     this.maxConcurrent = maxConcurrent;
     this.delayMs = delayMs;
     this.name = name;
@@ -25,6 +25,7 @@ class ApiQueue {
     this._cbFailures = 0;
     this._cbThreshold = cbThreshold;
     this._cbCooldownMs = cbCooldownMs;
+    this._cbHardResetMs = cbHardResetMs; // auto-reset hard se OPEN > N min (anti-zombie)
     this._cbOpenedAt = null;
 
     // Deduplication
@@ -32,6 +33,25 @@ class ApiQueue {
 
     // Stats
     this.stats = { completed: 0, failed: 0, rejected: 0, deduplicated: 0, totalMs: 0 };
+
+    // Watchdog: auto-reset hard del CB se resta OPEN troppo a lungo.
+    // Caso reale 5-8/6/2026: CB OPEN per 2 giorni, half-open continuava a fallire
+    // e nessuno riavviava. Con questo watchdog, ogni 5 min controlliamo e dopo
+    // 30 min di OPEN forziamo il reset (lascia che il prossimo tentativo riapra
+    // se Farmabooster e' davvero giu', ma se l'API e' risalita ripartiamo).
+    this._cbWatchdog = setInterval(() => this._cbHardResetIfStuck(), 5 * 60 * 1000);
+    if (this._cbWatchdog.unref) this._cbWatchdog.unref();
+  }
+
+  _cbHardResetIfStuck() {
+    if (this._cbState !== 'open' || !this._cbOpenedAt) return;
+    const openMs = Date.now() - this._cbOpenedAt;
+    if (openMs >= this._cbHardResetMs) {
+      console.warn(`[${this.name}] Circuit breaker HARD RESET dopo ${Math.round(openMs / 60000)}min OPEN (anti-zombie)`);
+      this._cbState = 'closed';
+      this._cbFailures = 0;
+      this._cbOpenedAt = null;
+    }
   }
 
   _cbAllows() {
@@ -76,6 +96,12 @@ class ApiQueue {
 
   isOpen() {
     return this._cbState === 'open';
+  }
+
+  // Per AlertMonitor: minuti da quando il CB e' OPEN (null se chiuso/half-open).
+  openSinceMinutes() {
+    if (this._cbState !== 'open' || !this._cbOpenedAt) return null;
+    return (Date.now() - this._cbOpenedAt) / 60000;
   }
 
   async enqueue(fn, dedupKey = null, timeoutMs = 60000, label = '') {
@@ -180,10 +206,12 @@ const farmaboosterQueue = new ApiQueue({
   cbCooldownMs: 3 * 60 * 1000, // 3 min cooldown
 });
 
-// Magento: max 3 concurrent, 300ms delay (each tenant has its own Magento)
+// Magento: 1 sola richiesta alla volta, 1500ms di pausa — COURTESY MASSIMA
+// (direttiva 8/7/2026: 'siamo troppo aggressivi, rallentiamo ancora').
+// ~0,6 req/s sostenute: i Magento dei tenant non devono accorgersi di noi.
 const magentoQueue = new ApiQueue({
-  maxConcurrent: 3,
-  delayMs: 300,
+  maxConcurrent: 1,
+  delayMs: 1500,
   name: 'Magento',
   cbThreshold: 5,
   cbCooldownMs: 60 * 1000,

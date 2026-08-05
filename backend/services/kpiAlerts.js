@@ -23,7 +23,7 @@ async function _kpiPerTenant() {
       FROM orders o
       JOIN order_items oi ON oi.order_id = o.id
       LEFT JOIN products p ON p.tenant_id=o.tenant_id AND p.sku=oi.sku
-      WHERE o.order_status IN ('complete','processing','Ritirato','ritiro_farmacia','ritiro_sede_tmp')
+      WHERE o.order_status NOT IN ('canceled','closed','pending_payment')
       GROUP BY o.tenant_id
     ),
     tp AS (
@@ -63,7 +63,7 @@ async function _baselinePerTenant() {
         SUM((COALESCE(oi.row_total_incl_tax, oi.row_total*1.1))
           - oi.qty_ordered * COALESCE(NULLIF(p.erp_cost, 0), p.erp_cost_imputed, 0)) AS marg
       FROM tenants t
-      JOIN orders o ON o.tenant_id = t.id AND o.order_status IN ('complete','processing','Ritirato','ritiro_farmacia','ritiro_sede_tmp')
+      JOIN orders o ON o.tenant_id = t.id AND o.order_status NOT IN ('canceled','closed','pending_payment')
         AND o.order_date::date BETWEEN CURRENT_DATE - 90 AND CURRENT_DATE - 8
       JOIN order_items oi ON oi.order_id = o.id
       LEFT JOIN products p ON p.tenant_id=o.tenant_id AND p.sku=oi.sku

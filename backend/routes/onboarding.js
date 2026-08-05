@@ -140,20 +140,23 @@ router.post('/:tenantId/run', async (req, res) => {
       }
     }
 
-    // ─── STEP 4: Civetta sync da Magento ─────────────
+    // ─── STEP 4: Audit civetta FB↔Magento ─────────────
+    // (11/7: la fonte del flag è il tag FB product_civetta scritto
+    // dall'import prodotti; qui solo audit immediato della pipe
+    // export FB→Magento del nuovo tenant — force bypassa il gate orario)
     if (!steps || steps.includes('civetta')) {
-      log('step', 'Sync civetta da Magento...');
+      log('step', 'Audit civetta FB vs Magento...');
       try {
         const hasMagento = configStatus.present.includes('magento_base_url') && configStatus.present.includes('magento_api_token');
         if (hasMagento) {
           const { syncCivettaFromMagento } = require('../services/farmaboosterProducts');
-          const count = await syncCivettaFromMagento(tenantId);
-          log('success', `Civetta sincronizzata: ${count} prodotti`);
+          const drift = await syncCivettaFromMagento(tenantId, { force: true });
+          log('success', `Audit civetta completato: deriva FB↔Magento ${drift} prodotti`);
         } else {
-          log('warn', 'Magento non configurato, skip civetta sync');
+          log('warn', 'Magento non configurato, skip audit civetta');
         }
       } catch (e) {
-        log('error', `Civetta sync fallita: ${e.message}`);
+        log('error', `Audit civetta fallito: ${e.message}`);
       }
     }
 

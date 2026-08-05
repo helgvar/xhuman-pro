@@ -20,10 +20,10 @@ const { decrypt } = require('./crypto');
 const { throttledBatchFetch, magentoQueue } = require('./apiQueue');
 
 // Rate limits
-const READ_BATCH_SIZE = 20;
-const READ_CONCURRENCY = 5;
+const READ_BATCH_SIZE = 12;   // courtesy 8/7: URL corti, meno inviso ai WAF
+const READ_CONCURRENCY = 1;  // courtesy 8/7
 const WRITE_CONCURRENCY = 2;
-const READ_DELAY = 300;
+const READ_DELAY = 1200;     // courtesy 8/7
 const WRITE_DELAY = 500;
 
 const OPTION_ID_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
@@ -443,4 +443,4 @@ async function execute(tenantId, { dryRun = false, confirm = false } = {}) {
   };
 }
 
-module.exports = { preview, execute, validatePriceSafety, batchFetchProducts, getCivettaMode, getCivettaaiOptionIds };
+module.exports = { preview, execute, validatePriceSafety, batchFetchProducts, getCivettaMode, getCivettaaiOptionIds, getMagentoConfig };

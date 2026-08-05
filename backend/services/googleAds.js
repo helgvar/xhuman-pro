@@ -155,9 +155,7 @@ async function fetchCampaigns(customer) {
       campaign.maximize_conversion_value.target_roas,
       campaign.target_roas.target_roas,
       campaign.target_cpa.target_cpa_micros,
-      campaign_budget.amount_micros,
-      campaign.start_date,
-      campaign.end_date
+      campaign_budget.amount_micros
     FROM campaign
     WHERE campaign.status != 'REMOVED'
       AND campaign.advertising_channel_type IN ('SHOPPING','PERFORMANCE_MAX','SEARCH')
@@ -272,27 +270,41 @@ async function upsertCampaignDaily(tenantId, customerId, rows) {
 }
 
 async function upsertProductDaily(tenantId, customerId, rows) {
-  let n = 0;
+  // Batch multi-row upsert: ~200k righe 1-a-1 = ~4min; a blocchi = pochi secondi.
+  const COLS = 10;
+  const CHUNK = 500; // 500*10 = 5000 params, sotto il limite pg (65535)
+  const valid = [];
   for (const r of rows) {
     const s = r.segments || {};
     const c = r.campaign || {};
     const m = r.metrics || {};
     if (!s.product_item_id || !c.id || !s.date) continue;
-    await pool.query(`
-      INSERT INTO google_ads_product_daily
-        (tenant_id, customer_id, campaign_id, offer_id, report_date,
-         impressions, clicks, cost_micros, conversions, conversion_value)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-      ON CONFLICT (tenant_id, customer_id, campaign_id, offer_id, report_date)
-      DO UPDATE SET impressions=EXCLUDED.impressions, clicks=EXCLUDED.clicks,
-        cost_micros=EXCLUDED.cost_micros, conversions=EXCLUDED.conversions,
-        conversion_value=EXCLUDED.conversion_value
-    `, [
+    valid.push([
       tenantId, customerId, String(c.id), String(s.product_item_id), s.date,
       Number(m.impressions || 0), Number(m.clicks || 0), microsToNumber(m.cost_micros),
       Number(m.conversions || 0), Number(m.conversions_value || 0),
     ]);
-    n++;
+  }
+  let n = 0;
+  for (let i = 0; i < valid.length; i += CHUNK) {
+    const slice = valid.slice(i, i + CHUNK);
+    const params = [];
+    const tuples = slice.map((row, j) => {
+      const base = j * COLS;
+      params.push(...row);
+      return `($${base + 1},$${base + 2},$${base + 3},$${base + 4},$${base + 5},$${base + 6},$${base + 7},$${base + 8},$${base + 9},$${base + 10})`;
+    });
+    await pool.query(`
+      INSERT INTO google_ads_product_daily
+        (tenant_id, customer_id, campaign_id, offer_id, report_date,
+         impressions, clicks, cost_micros, conversions, conversion_value)
+      VALUES ${tuples.join(',')}
+      ON CONFLICT (tenant_id, customer_id, campaign_id, offer_id, report_date)
+      DO UPDATE SET impressions=EXCLUDED.impressions, clicks=EXCLUDED.clicks,
+        cost_micros=EXCLUDED.cost_micros, conversions=EXCLUDED.conversions,
+        conversion_value=EXCLUDED.conversion_value
+    `, params);
+    n += slice.length;
   }
   return n;
 }
@@ -371,9 +383,51 @@ async function syncAllOperational(opts) {
   return results;
 }
 
+// Sincronizza SOLO i tenant che hanno google_ads_customer_id configurato
+// (non i "operational" generici: Farmacri è congelato lato feed ma ha Ads).
+// Read-only: pull dati Google Ads nel DB locale. NON tocca le campagne.
+async function syncAllConfigured({ days = 30 } = {}) {
+  const { rows: tenants } = await pool.query(`
+    SELECT DISTINCT t.id, t.name FROM tenants t
+    JOIN tenant_configs tc ON tc.tenant_id=t.id
+    WHERE tc.config_key='google_ads_customer_id'
+      AND COALESCE(tc.config_value,'') <> ''
+    ORDER BY t.name
+  `);
+  const results = [];
+  for (const t of tenants) {
+    try {
+      const r = await syncTenant(t.id, { days });
+      results.push({ tenant: t.name, ...r });
+      console.log(`[GoogleAdsCron] ${t.name}: ok (${r.product_rows || 0} righe)`);
+    } catch (e) {
+      results.push({ tenant: t.name, error: e.message });
+      console.error(`[GoogleAdsCron] ${t.name}: ${e.message}`);
+    }
+  }
+  return results;
+}
+
+const GADS_SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000;   // 1 volta al giorno
+const GADS_BOOT_DELAY_MS = 10 * 60 * 1000;           // 10 min post-restart (dopo magentoSync)
+
+function startGoogleAdsSyncCron() {
+  console.log(`[GoogleAdsCron] Started (first sync in ${GADS_BOOT_DELAY_MS/60000}min, then every 24h)`);
+  setTimeout(() => {
+    syncAllConfigured({ days: 30 })
+      .catch(e => console.error('[GoogleAdsCron] First-run error:', e.message));
+    setInterval(() => {
+      syncAllConfigured({ days: 30 })
+        .catch(e => console.error('[GoogleAdsCron] Run error:', e.message));
+    }, GADS_SYNC_INTERVAL_MS);
+  }, GADS_BOOT_DELAY_MS);
+}
+
 module.exports = {
   diagnoseConfig,
   testConnection,
   syncTenant,
   syncAllOperational,
+  syncAllConfigured,
+  startGoogleAdsSyncCron,
 };

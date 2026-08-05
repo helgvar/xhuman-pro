@@ -16,7 +16,7 @@ const { google } = require('googleapis');
 const { pool } = require('../db/pool');
 const { decrypt } = require('./crypto');
 
-const MAX_FILE_SIZE = 200 * 1024 * 1024; // 200MB per file
+const MAX_FILE_SIZE = 500 * 1024 * 1024; // 500MB (12/7: FB ha consegnato un results da 205MB — il tetto vecchio 200MB l'avrebbe scartato)
 const MAX_FILES_AGE_HOURS = 72;
 const BATCH_DOWNLOAD_SIZE = 2;
 const BATCH_DELAY_MS = 500;
@@ -86,9 +86,12 @@ async function listScraperFiles(drive, folderId) {
     pageToken = resp.data.nextPageToken;
   } while (pageToken);
 
-  // Filter only results.csv and walls.csv (exclude top_results.csv)
+  // results.csv/walls.csv = dettaglio competitor; top_results.csv = MAPPA dei
+  // listing visitati dallo scraper (~23k/passaggio). Scartarla ci rendeva ciechi
+  // sulla copertura reale (scoperto 11/7: FB scrappa tutto, noi vedevamo solo
+  // la fetta a rotazione dei results.csv)
   const scraperFiles = allFiles.filter(f =>
-    f.name === 'results.csv' || f.name === 'walls.csv'
+    f.name === 'results.csv' || f.name === 'walls.csv' || f.name === 'top_results.csv'
   );
 
   // Skip files > 200MB
@@ -104,12 +107,13 @@ async function listScraperFiles(drive, folderId) {
   // Only keep latest N files per type (they're sorted asc, so take from end)
   const resultFiles = validFiles.filter(f => f.name === 'results.csv').slice(-MAX_FILES_PER_TYPE);
   const wallFiles = validFiles.filter(f => f.name === 'walls.csv').slice(-MAX_FILES_PER_TYPE);
+  const topFiles = validFiles.filter(f => f.name === 'top_results.csv').slice(-MAX_FILES_PER_TYPE);
   // Return in chronological order (older first for correct merge)
-  const selected = [...resultFiles, ...wallFiles].sort((a, b) =>
+  const selected = [...resultFiles, ...wallFiles, ...topFiles].sort((a, b) =>
     new Date(a.createdTime) - new Date(b.createdTime)
   );
 
-  console.log(`[DriveScraper] Selected ${selected.length} files (${resultFiles.length} results + ${wallFiles.length} walls) from ${validFiles.length} total`);
+  console.log(`[DriveScraper] Selected ${selected.length} files (${resultFiles.length} results + ${wallFiles.length} walls + ${topFiles.length} top) from ${validFiles.length} total`);
   return selected;
 }
 
@@ -200,6 +204,55 @@ function parseCSV(content, fileName) {
 }
 
 /**
+ * Parse top_results.csv: la MAPPA dei listing TP visitati dallo scraper.
+ * Formato: code,url,name,API,timestamp (il nome può contenere virgole → regex).
+ * È la copertura REALE dello scrape (~23k listing/passaggio): senza di essa
+ * non si può distinguere "listing mai visto" da "dettaglio non ancora arrivato".
+ */
+function parseTopResults(content) {
+  const lines = content.split(/\r?\n/);
+  const rows = [];
+  for (const line of lines) {
+    const m = line.match(/^(\d+),([^,]*),(.*),API,([\d\-\s:.]+)\s*$/);
+    if (!m) continue;
+    rows.push({ code: m[1].trim(), url: m[2].trim(), name: m[3].trim(), scrapedAt: m[4].trim() });
+  }
+  return rows;
+}
+
+/**
+ * Upsert della mappa listing in scraper_listing_map (first_seen/last_seen).
+ * Retention: i listing spariti dallo scrape da >30g vengono rimossi.
+ */
+async function persistListingMap(rows) {
+  if (rows.length === 0) return 0;
+  const BATCH = 2000;
+  for (let i = 0; i < rows.length; i += BATCH) {
+    const batch = rows.slice(i, i + BATCH);
+    const vals = [];
+    const params = [];
+    batch.forEach((r, j) => {
+      const b = j * 4;
+      vals.push(`($${b + 1},$${b + 2},$${b + 3},$${b + 4}::timestamptz)`);
+      params.push(r.code, r.url, r.name, r.scrapedAt);
+    });
+    await pool.query(
+      `INSERT INTO scraper_listing_map (product_code, tp_url, tp_name, first_seen, last_seen)
+       SELECT v.code, v.url, v.name, v.ts, v.ts
+       FROM (VALUES ${vals.join(',')}) v(code, url, name, ts)
+       ON CONFLICT (product_code) DO UPDATE SET
+         tp_url = EXCLUDED.tp_url, tp_name = EXCLUDED.tp_name,
+         last_seen = GREATEST(scraper_listing_map.last_seen, EXCLUDED.last_seen)`,
+      params
+    );
+  }
+  await pool.query(
+    `DELETE FROM scraper_listing_map WHERE last_seen < NOW() - INTERVAL '90 days'`
+  );
+  return rows.length;
+}
+
+/**
  * Merge records into index (newer overwrites older)
  * index = { code: { merchant: record } }
  */
@@ -259,9 +312,13 @@ async function persistToDB(index) {
     saved += batch.length;
   }
 
-  // Clean up old records (> 48 hours)
+  // Retention 30 GIORNI (12/7, disco a 320GB — mandato capo: 'mantenere
+  // quanti più dati possibili e giocare con le statistiche'). Un mese di
+  // mercato = trend, bande, stagionalità. ATTENZIONE: ogni query che DECIDE
+  // prezzi/posizioni DEVE filtrare scraped_at (guardrail 48h) — la tabella
+  // non è "solo fresco".
   await pool.query(
-    `DELETE FROM scraper_competitors WHERE updated_at < NOW() - INTERVAL '48 hours'`
+    `DELETE FROM scraper_competitors WHERE updated_at < NOW() - INTERVAL '30 days'`
   );
 
   return saved;
@@ -325,6 +382,13 @@ async function importScraperData(tenantId, jobId = null) {
 
       for (const dl of downloads) {
         if (!dl) continue;
+        if (dl.file.name === 'top_results.csv') {
+          const rows = parseTopResults(dl.content);
+          const saved = await persistListingMap(rows);
+          filesProcessed++;
+          console.log(`[DriveScraper] Parsed ${dl.file.name} (${dl.file.createdTime}): ${saved} listing in mappa`);
+          continue;
+        }
         const records = parseCSV(dl.content, dl.file.name);
         mergeIntoIndex(index, records);
         filesProcessed++;

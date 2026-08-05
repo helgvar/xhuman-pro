@@ -70,7 +70,7 @@ async function checkKpiAnomaly(tenantId) {
              SUM(grand_total_products) rev
       FROM orders
       WHERE tenant_id = $1
-        AND order_status IN ('complete','processing','Ritirato','ritiro_farmacia','ritiro_sede_tmp')
+        AND order_status NOT IN ('canceled','closed','pending_payment')
         AND order_date::date >= CURRENT_DATE - 35
       GROUP BY 1
     ),

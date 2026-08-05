@@ -16,23 +16,23 @@ async function initDB() {
   const path = require('path');
   const migrationsDir = path.join(__dirname, 'migrations');
 
+  // Tracking migrazioni (fix 9/7/2026): senza questa tabella OGNI boot
+  // ri-eseguiva tutti i .sql — gli ALTER chiedono lock esclusivi e il boot
+  // si incastrava dietro le query lunghe (2 ingorghi il 9/7).
+  await pool.query(`CREATE TABLE IF NOT EXISTS schema_migrations (
+    filename TEXT PRIMARY KEY,
+    applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`);
+  const { rows: done } = await pool.query('SELECT filename FROM schema_migrations');
+  const doneSet = new Set(done.map(r => r.filename));
+
   // Run migrations in order
   const migrations = fs.readdirSync(migrationsDir).filter(f => f.endsWith('.sql')).sort();
+  const skipped = migrations.filter(f => doneSet.has(f)).length;
+  if (skipped > 0) console.log(`[DB] ${skipped} migrazioni già applicate, skip`);
 
   for (const file of migrations) {
-    const tableName = file === '001_initial.sql' ? 'tenants' :
-                      file === '002_orders.sql' ? 'orders' :
-                      file === '003_products.sql' ? 'products' : null;
-
-    if (tableName) {
-      const { rows } = await pool.query(
-        "SELECT EXISTS (SELECT FROM pg_tables WHERE tablename = $1)", [tableName]
-      );
-      if (rows[0].exists) {
-        console.log(`[DB] Migration ${file} already applied, skipping`);
-        continue;
-      }
-    }
+    if (doneSet.has(file)) continue;
 
     const sql = fs.readFileSync(path.join(migrationsDir, file), 'utf8');
     try {
@@ -45,6 +45,9 @@ async function initDB() {
         throw err;
       }
     }
+    await pool.query(
+      'INSERT INTO schema_migrations (filename) VALUES ($1) ON CONFLICT (filename) DO NOTHING',
+      [file]);
   }
 }
 

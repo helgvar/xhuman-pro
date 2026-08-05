@@ -87,13 +87,13 @@ async function collectKPI(tenantId) {
   const { rows: [k] } = await pool.query(`
     SELECT
       (SELECT COUNT(*) FROM orders WHERE tenant_id=$1 AND order_date::date = CURRENT_DATE - 1
-        AND order_status IN ('complete','processing','pending','Ritirato','ritiro_farmacia','ritiro_sede_tmp')) AS ord_yest,
+        AND order_status NOT IN ('canceled','closed','pending_payment')) AS ord_yest,
       (SELECT SUM(COALESCE(grand_total, grand_total_products)) FROM orders WHERE tenant_id=$1 AND order_date::date = CURRENT_DATE - 1
-        AND order_status IN ('complete','processing','pending','Ritirato','ritiro_farmacia','ritiro_sede_tmp')) AS rev_yest,
+        AND order_status NOT IN ('canceled','closed','pending_payment')) AS rev_yest,
       (SELECT SUM(COALESCE(grand_total, grand_total_products)) FROM orders WHERE tenant_id=$1 AND order_date > NOW() - INTERVAL '7 days'
-        AND order_status IN ('complete','processing','pending','Ritirato','ritiro_farmacia','ritiro_sede_tmp')) AS rev_7d,
+        AND order_status NOT IN ('canceled','closed','pending_payment')) AS rev_7d,
       (SELECT SUM(COALESCE(grand_total, grand_total_products)) FROM orders WHERE tenant_id=$1 AND order_date > NOW() - INTERVAL '30 days'
-        AND order_status IN ('complete','processing','pending','Ritirato','ritiro_farmacia','ritiro_sede_tmp')) AS rev_30d,
+        AND order_status NOT IN ('canceled','closed','pending_payment')) AS rev_30d,
       (SELECT SUM(clicks) FROM zombie_clicks WHERE tenant_id=$1 AND fetch_date = CURRENT_DATE - 1) AS tp_yest,
       (SELECT SUM(clicks) FROM zombie_clicks WHERE tenant_id=$1 AND fetch_date > CURRENT_DATE - 7) AS tp_7d,
       (SELECT SUM(clicks) FROM zombie_clicks WHERE tenant_id=$1 AND fetch_date > CURRENT_DATE - 30) AS tp_30d
@@ -108,7 +108,7 @@ async function collectKPI(tenantId) {
     LEFT JOIN products p ON p.tenant_id=oi.tenant_id AND p.sku=oi.sku
     WHERE oi.tenant_id=$1
       AND o.order_date > NOW() - INTERVAL '7 days'
-      AND o.order_status IN ('complete','processing','pending','Ritirato','ritiro_farmacia','ritiro_sede_tmp')
+      AND o.order_status NOT IN ('canceled','closed','pending_payment')
   `, [tenantId]);
 
   const { rows: burners } = await pool.query(`
@@ -138,7 +138,7 @@ async function collectKPI(tenantId) {
     FROM order_items oi JOIN orders o ON o.id=oi.order_id
     LEFT JOIN products p ON p.tenant_id=oi.tenant_id AND p.sku=oi.sku
     WHERE oi.tenant_id=$1 AND o.order_date > NOW() - INTERVAL '7 days'
-      AND o.order_status IN ('complete','processing','pending','Ritirato','ritiro_farmacia','ritiro_sede_tmp')
+      AND o.order_status NOT IN ('canceled','closed','pending_payment')
     GROUP BY oi.sku, oi.product_name
     HAVING SUM(COALESCE(oi.row_total_incl_tax, oi.row_total*1.10)) > 150
     ORDER BY mol_pct ASC NULLS LAST LIMIT 3

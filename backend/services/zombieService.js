@@ -398,7 +398,7 @@ class ZombieService {
 
   // ─── Main run for a tenant ───────────────────────────────
 
-  async runForTenant(tenantId, dateOverride) {
+  async runForTenant(tenantId, dateOverride, skipFtp = false) {
     const config = await this.getConfig(tenantId);
     if (!config.trovaprezzi_username || !config.trovaprezzi_password) {
       throw new Error('Trovaprezzi credentials not configured');
@@ -450,7 +450,9 @@ class ZombieService {
       await this.persistToDb(tenantId, parsed, fetchDate);
 
       let ftpUploaded = false;
-      if (this.hasFtpConfig()) {
+      // skipFtp (intra-day 26/7): i PARZIALI di oggi restano solo su DB — il file
+      // FTP che Farmabooster consuma e' SOLO quello giornaliero completo delle 00:05.
+      if (this.hasFtpConfig() && !skipFtp) {
         ftpUploaded = await this.uploadToFtp(tenantId, csvContent, dateStr);
       }
 

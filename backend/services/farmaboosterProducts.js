@@ -17,6 +17,13 @@ const { withJobLock } = require('./requestQueue');
 
 const DELAY_BETWEEN_SAVES_MS = 30; // 30ms between DB saves
 
+// Valori API fuori scala (es. markup con costi da centesimi) non devono
+// far esplodere l'INSERT: clamp entro la precisione della colonna
+function clampNum(v, max) {
+  if (!Number.isFinite(v)) return 0;
+  return Math.max(-max, Math.min(max, v));
+}
+
 /**
  * Save a single product to DB (upsert)
  */
@@ -55,9 +62,13 @@ async function saveProduct(tenantId, product, topsearchRuleIds = new Set()) {
        sales_30d_seller, sales_30d_aggregated,
        erp_stock, supplier_stock, unmanage_stock, saleable, export_status,
        is_civetta, is_topsearch, is_topkey,
-       brand, manufacturer, ean, scraper_position, price_rule_id, raw_data, updated_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,NOW())
+       brand, manufacturer, ean, scraper_position, price_rule_id, raw_data,
+       exported_price, erp_purchase_cost, supplier_min_cost, updated_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,NOW())
      ON CONFLICT (tenant_id, sku) DO UPDATE SET
+       exported_price = EXCLUDED.exported_price,
+       erp_purchase_cost = EXCLUDED.erp_purchase_cost,
+       supplier_min_cost = EXCLUDED.supplier_min_cost,
        product_name = EXCLUDED.product_name,
        category = EXCLUDED.category,
        reference_price = EXCLUDED.reference_price,
@@ -89,14 +100,18 @@ async function saveProduct(tenantId, product, topsearchRuleIds = new Set()) {
       sku,
       product.product_name || '',
       product.product_farmadati_category_descriptions || '',
-      parseFloat(product.product_reference_price || 0),
-      cost,       // erp_cost field stores the best available cost (min_cost)
-      price,
-      parseFloat(product.product_price_rule_final_markup || 0),
-      margin,
-      marginPct,
-      sales30seller,   // sales_30d_seller = vendite 30gg singolo seller
-      sales30global,   // sales_30d_aggregated = vendite 30gg globale tutti i tenant
+      clampNum(parseFloat(product.product_reference_price || 0), 9999999999),
+      clampNum(cost, 9999999999),       // erp_cost field stores the best available cost (min_cost)
+      clampNum(price, 9999999999),
+      // markup NUMERIC(8,4): costi da centesimi generano ricarichi >9999% e
+      // mandavano in overflow l'INSERT (intero sync tenant KO — Farmainsieme 4/7)
+      clampNum(parseFloat(product.product_price_rule_final_markup || 0), 9999.9),
+      clampNum(margin, 9999999999),
+      clampNum(marginPct, 999999),
+      // NUMERIC(10,2): erano gli unici campi SENZA clamp — l'overflow che
+      // uccideva il sync FI a metà (20k prodotti con costi stantii → sotto-costo 9/7)
+      clampNum(sales30seller, 99999999),
+      clampNum(sales30global, 99999999),
       parseInt(product.product_erp_stock || 0),
       parseInt(product.product_supplier_stock || 0),
       product.product_unmanage_stock === '1',
@@ -124,6 +139,14 @@ async function saveProduct(tenantId, product, topsearchRuleIds = new Set()) {
         topsearch: product.topsearch || '',
         civettaai: product.product_civettaai === '1' || product.product_civettaai === 1,
       }),
+      // Prezzo civetta esportato da FB verso TP: la misura vera di come sta
+      // andando un minsan dopo il PC (sell_price è solo il listino)
+      _priceExported > 0 ? clampNum(_priceExported, 9999999999) : null,
+      // Costi GREZZI separati (allarme sotto-costo 9/7): erp_purchase_cost =
+      // quanto la farmacia ha PAGATO (floor vero quando c'è stock fisico),
+      // supplier_min_cost = miglior grossista. erp_cost resta il min blended.
+      erpCost > 0 ? clampNum(erpCost, 99999999) : null,
+      supplierCost > 0 ? clampNum(supplierCost, 99999999) : null,
     ]
   );
 
@@ -271,9 +294,23 @@ async function importProducts(tenantId, jobId = null) {
       // Step 3: Save products to DB (sequential with delay)
       let totalImported = 0;
       let totalUpdated = 0;
+      // ISOLAMENTO PER-PRODOTTO (9/7): un prodotto con valori tossici NON deve
+      // più uccidere l'intero sync — FI è rimasto con 20k prodotti stantii dal
+      // 3/7 (costi morti → PC sotto costo). Si scarta, si logga, si continua.
+      let failedCount = 0;
+      const failSamples = [];
 
       for (let i = 0; i < productsData.length; i++) {
-        const isNew = await saveProduct(tenantId, productsData[i], topsearchRuleIds);
+        let isNew = false;
+        try {
+          isNew = await saveProduct(tenantId, productsData[i], topsearchRuleIds);
+        } catch (e) {
+          failedCount++;
+          if (failSamples.length < 5) {
+            failSamples.push(`${productsData[i].product_code || '?'}: ${e.message.slice(0, 60)}`);
+          }
+          continue;
+        }
         if (isNew) totalImported++;
         else totalUpdated++;
 
@@ -293,15 +330,19 @@ async function importProducts(tenantId, jobId = null) {
         }
       }
 
-      // Step 4: Sync civetta flag from Magento (source of truth)
-      console.log('[Products] Syncing civetta flag from Magento...');
-      updateProgress({ phase: 'civetta_sync', phase_label: 'Sync civetta da Magento...', pct: 96 });
+      if (failedCount > 0) {
+        console.log(`[Products] ⚠️ ${failedCount} prodotti SCARTATI (valori tossici, sync proseguito): ${failSamples.join(' | ')}`);
+      }
+
+      // Step 4: AUDIT deriva civetta FB↔Magento (11/7: la fonte del flag è il
+      // tag FB product_civetta scritto da saveProduct; Magento non sovrascrive
+      // più — qui solo sentinella giornaliera dell'export FB→Magento, 03 UTC)
+      updateProgress({ phase: 'civetta_sync', phase_label: 'Audit civetta FB↔Magento...', pct: 96 });
       let civettaSynced = 0;
       try {
         civettaSynced = await syncCivettaFromMagento(tenantId);
-        console.log(`[Products] Civetta synced: ${civettaSynced} products set to civetta=1`);
       } catch (civErr) {
-        console.error('[Products] Civetta sync error:', civErr.message);
+        console.error('[Products] Civetta audit error:', civErr.message);
       }
 
       // Complete
@@ -333,10 +374,25 @@ async function importProducts(tenantId, jobId = null) {
 }
 
 /**
- * Sync civetta flag from Magento (source of truth).
- * Farmabooster API may have stale civetta values — Magento's attribute is the real flag.
+ * AUDIT deriva civetta FB↔Magento (11/7/2026, ordine capo: "valutazione
+ * diretta da Farmabooster").
+ *
+ * La FONTE del flag is_civetta è il tag FB `product_civetta` scritto
+ * per-prodotto da saveProduct a ogni sync orario. Questa funzione NON
+ * sovrascrive più nulla: il vecchio override da Magento (l'"eco" a valle
+ * dell'export FB) rendeva il DB cieco sui civetta spenti da FB (es. stock-0:
+ * FB spegne il tag, l'attributo Magento resta 1 — 3.560 SKU su SF) e
+ * generava decine di migliaia di flip fantasma/giorno in feed_movements
+ * (28.623 movimenti in un giorno su SF: step 3 scriveva FB, step 4
+ * risovrascriveva Magento, ogni ora).
+ *
+ * Ora: 1 volta al giorno (sync delle 03 UTC) legge l'attributo Magento e
+ * misura la DERIVA verso il tag FB come sentinella dell'export FB→Magento.
+ * Esclusi stock-0/prezzo-0 (semantica nota). Alert Telegram se deriva >2%.
  */
-async function syncCivettaFromMagento(tenantId) {
+async function syncCivettaFromMagento(tenantId, { force = false } = {}) {
+  // Audit pesante (20-70 pagine Magento/tenant): solo col sync notturno
+  if (!force && new Date().getUTCHours() !== 3) return 0;
   const { decrypt } = require('./crypto');
   const { rows: creds } = await pool.query(
     `SELECT config_key, config_value FROM tenant_configs
@@ -395,8 +451,8 @@ async function syncCivettaFromMagento(tenantId) {
   // PageSize 1000 (vs 300) -> 70% meno pagine. Batch 3 paralleli con pause 500ms
   // per non saturare Magento (alcuni hanno 1-2 worker).
   const PAGE_SIZE = 1000;
-  const PARALLEL_BATCH = 3;
-  const BATCH_PAUSE_MS = 500;
+  const PARALLEL_BATCH = 1;      // courtesy 8/7: una pagina alla volta
+  const BATCH_PAUSE_MS = 1500;
   const civetta1Set = new Set();
   const baseUrlFilter = `${baseUrl}/rest/V1/products?searchCriteria[filterGroups][0][filters][0][field]=civetta&searchCriteria[filterGroups][0][filters][0][value]=${civettaOptionFor1}&searchCriteria[pageSize]=${PAGE_SIZE}&fields=items[sku],total_count`;
 
@@ -445,20 +501,38 @@ async function syncCivettaFromMagento(tenantId) {
     return 0;
   }
 
-  // Reset all to false, then set true for Magento civetta=1
-  await pool.query('UPDATE products SET is_civetta = false WHERE tenant_id = $1 AND is_civetta = true', [tenantId]);
+  // AUDIT-ONLY: nessuna scrittura. Confronto DB (tag FB) vs attributo Magento
+  // su prodotti vendibili (stock>0 e prezzo>0 — la divergenza sugli stock-0 è
+  // semantica nota: FB spegne il tag prima che Magento aggiorni l'attributo).
   const skuArray = Array.from(civetta1Set);
-  let updated = 0;
-  for (let i = 0; i < skuArray.length; i += 500) {
-    const batch = skuArray.slice(i, i + 500);
-    const { rowCount } = await pool.query(
-      'UPDATE products SET is_civetta = true WHERE tenant_id = $1 AND sku = ANY($2)',
-      [tenantId, batch]
-    );
-    updated += rowCount;
+  const { rows: [d] } = await pool.query(
+    `SELECT
+       COUNT(*) FILTER (WHERE p.is_civetta = true AND NOT (p.sku = ANY($2))) AS fb_si_mag_no,
+       COUNT(*) FILTER (WHERE p.is_civetta = false AND p.sku = ANY($2)) AS mag_si_fb_no
+     FROM products p
+     WHERE p.tenant_id = $1
+       AND (COALESCE(p.erp_stock,0) + COALESCE(p.supplier_stock,0)) > 0
+       AND COALESCE(p.sell_price,0) > 0`,
+    [tenantId, skuArray]
+  );
+  const fbSiMagNo = parseInt(d.fb_si_mag_no) || 0;
+  const magSiFbNo = parseInt(d.mag_si_fb_no) || 0;
+  const drift = fbSiMagNo + magSiFbNo;
+  const driftPct = civetta1Set.size > 0 ? (drift / civetta1Set.size) * 100 : 0;
+  console.log(`[Products] Civetta AUDIT (fonte=FB): Magento ${civetta1Set.size} | FB-si/Mag-no ${fbSiMagNo} | Mag-si/FB-no ${magSiFbNo} | deriva ${driftPct.toFixed(1)}%`);
+
+  if (driftPct > 2) {
+    try {
+      const { sendTelegram } = require('./telegramNotifier');
+      await sendTelegram(
+        `⚠️ <b>DERIVA CIVETTA FB↔Magento</b> tenant ${tenantId}\n` +
+        `Magento civetta=1: ${civetta1Set.size} | FB-si/Mag-no: ${fbSiMagNo} | Mag-si/FB-no: ${magSiFbNo} (${driftPct.toFixed(1)}%)\n` +
+        `Possibile export FB→Magento in ritardo o rotto — verificare pipe lato FB.`,
+        { key: `civetta_drift_${tenantId}`, parseMode: 'HTML', throttleMs: 24 * 3600 * 1000 });
+    } catch { /* telegram best-effort */ }
   }
 
-  return updated;
+  return drift;
 }
 
 module.exports = { importProducts, syncCivettaFromMagento };

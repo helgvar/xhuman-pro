@@ -101,7 +101,7 @@ async function getTenantMetrics(tenantId) {
       SELECT COUNT(*) AS n, COALESCE(SUM(grand_total_products), 0) AS rev
       FROM orders WHERE tenant_id=$1
         AND (order_date AT TIME ZONE 'Europe/Rome')::date = (SELECT yest FROM dates)
-        AND order_status NOT IN ('canceled','closed')
+        AND order_status NOT IN ('canceled','closed','pending_payment')
     ),
     clicks_7day_avg AS (
       SELECT AVG(daily_clicks) AS clicks
@@ -118,7 +118,7 @@ async function getTenantMetrics(tenantId) {
       SELECT COUNT(*) AS n
       FROM orders WHERE tenant_id=$1
         AND (order_date AT TIME ZONE 'Europe/Rome')::date = (SELECT today FROM dates)
-        AND order_status NOT IN ('canceled','closed')
+        AND order_status NOT IN ('canceled','closed','pending_payment')
     ),
     orders_dow_avg AS (
       -- Per confronto realistico durante la giornata: media ordini fino allo
@@ -134,7 +134,7 @@ async function getTenantMetrics(tenantId) {
           -- finestra "fino all'ora attuale del DOW di riferimento"
           AND EXTRACT(EPOCH FROM (order_date AT TIME ZONE 'Europe/Rome'))::bigint % 86400
               < EXTRACT(EPOCH FROM (NOW() AT TIME ZONE 'Europe/Rome'))::bigint % 86400
-          AND order_status NOT IN ('canceled','closed')
+          AND order_status NOT IN ('canceled','closed','pending_payment')
         GROUP BY (order_date AT TIME ZONE 'Europe/Rome')::date
       ) s
     )

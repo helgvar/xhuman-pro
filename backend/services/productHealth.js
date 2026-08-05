@@ -115,6 +115,15 @@ async function assembleProductData(tenantId, sellerName) {
       p.brand,
       p.manufacturer,
       p.updated_at as product_updated_at,
+      -- Protezioni: un brand/carrello protetto NON è mai burner (incidenza
+      -- alta VOLUTA dal cliente, si valuta col margine assoluto — regola capo)
+      is_brand_protected(p.tenant_id, p.sku) as is_brand_protected,
+      is_basket_protected(p.tenant_id, p.sku) as is_basket_protected,
+      EXISTS (SELECT 1 FROM capo_pins cp WHERE cp.tenant_id=p.tenant_id AND cp.sku=p.sku AND cp.revoked_at IS NULL) as is_pinned,
+      -- Margine VERO alla sorgente, calcolato LIVE (mig 066, ordine capo 16/7):
+      -- NON il products.margin pre-calcolato col MIN_COST grossista (stantio e falso)
+      margine_unitario_vero(p.tenant_id, p.sku) as margine_vero,
+      sorgente_vendita(p.tenant_id, p.sku) as sorgente_vendita,
 
       -- Zombie clicks (last 30 days aggregated)
       COALESCE(zc.total_clicks_30d, 0)::int as tp_clicks_30d,
@@ -181,8 +190,12 @@ async function assembleProductData(tenantId, sellerName) {
       SELECT
         COUNT(DISTINCT oi.order_id) as tp_orders,
         SUM(oi.row_total) as tp_revenue,
-        -- COGS realistico: erp_cost reale o fallback imputato (migration 024)
-        SUM(oi.qty_ordered * COALESCE(NULLIF(p.erp_cost, 0), p.erp_cost_imputed, 0)) as tp_cogs,
+        -- COGS col COSTO VERO della sorgente (mig 066, ordine capo 16/7):
+        -- magazzino farmacia -> erp_purchase_cost; grossista -> erp_cost MIN_COST.
+        -- Prima erp_cost secco -> margini negativi FINTI e burner classificati male.
+        SUM(oi.qty_ordered * (CASE WHEN COALESCE(p.erp_stock,0)>0
+              THEN COALESCE(NULLIF(p.erp_purchase_cost,0), NULLIF(p.erp_cost,0), p.erp_cost_imputed, 0)
+              ELSE COALESCE(NULLIF(p.erp_cost,0), NULLIF(p.erp_purchase_cost,0), p.erp_cost_imputed, 0) END)) as tp_cogs,
         AVG(order_item_count) as avg_items_per_order
       FROM order_items oi
       JOIN orders o ON o.id = oi.order_id AND o.tenant_id = $1
@@ -193,7 +206,7 @@ async function assembleProductData(tenantId, sellerName) {
       WHERE oi.tenant_id = $1
         AND oi.sku = p.sku
         AND o.order_date >= $3::date
-        AND o.order_status IN ('complete', 'processing')
+        AND o.order_status NOT IN ('canceled','closed','pending_payment')
     ) oa ON true
 
     WHERE p.tenant_id = $1
@@ -219,10 +232,13 @@ function percentileRank(value, sortedValues) {
  * Calculate Revenue Score (0-100)
  */
 function calcRevenueScore(product, catalogMarginValues) {
-  const marginContribution = product.sales_30d_seller * product.margin;
+  // Margine VERO alla sorgente (mig 066), non il products.margin pre-calcolato
+  // col MIN_COST grossista (ordine capo 16/7: il costo cambia durante il giorno)
+  const marg = parseFloat(product.margine_vero != null ? product.margine_vero : product.margin) || 0;
+  const marginContribution = product.sales_30d_seller * marg;
 
-  if (marginContribution <= 0 && product.margin > 0) return 5;
-  if (product.margin <= 0) return 0;
+  if (marginContribution <= 0 && marg > 0) return 5;
+  if (marg <= 0) return 0;
 
   return Math.min(100, percentileRank(marginContribution, catalogMarginValues));
 }
@@ -392,6 +408,18 @@ function classifyProduct(product, scores) {
   if (!isCivetta) {
     if (healthScore >= 50 && sales > 0) return 'opportunity';
     return 'question_mark';
+  }
+
+  // PROTETTI (brand tipo Unifarco/Gibaud, carrello, pin): MAI burner. La loro
+  // incidenza alta è deliberata (alta marginalità voluta dal cliente); si
+  // valutano col margine assoluto per ordine, non con l'incidenza (regola capo
+  // 15/7: "la lista burner MPF è fuorviante, piena di protetti"). Restano
+  // visibili come 'protected' così la dashboard non li confonde coi burner.
+  const isProtected = product.is_brand_protected || product.is_basket_protected || product.is_pinned;
+  if (isProtected) {
+    if (revenue > 0 && incidence <= 0.08 && healthScore >= 40) return 'star';
+    if (revenue > 0 || (parseFloat(product.sales_30d_seller) || 0) > 0) return 'cash_cow';
+    return 'protected';
   }
 
   // In feed: classify by performance
@@ -842,7 +870,7 @@ async function getGlobalPnl(tenantId) {
       COALESCE(SUM(grand_total), 0) as store_revenue
     FROM orders
     WHERE tenant_id = $1
-      AND order_status IN ('complete', 'processing')
+      AND order_status NOT IN ('canceled','closed','pending_payment')
       AND order_date >= NOW() - INTERVAL '30 days'
   `, [tenantId]);
 
@@ -986,7 +1014,7 @@ async function getWeeklyBreakdown(tenantId) {
       FROM orders o
       JOIN order_items oi ON oi.order_id = o.id AND oi.tenant_id = o.tenant_id
       WHERE o.tenant_id = $1
-        AND o.order_status IN ('complete', 'processing')
+        AND o.order_status NOT IN ('canceled','closed','pending_payment')
         AND o.order_date >= CURRENT_DATE - INTERVAL '4 weeks'
       GROUP BY date_trunc('week', o.order_date)
     )

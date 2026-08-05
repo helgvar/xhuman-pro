@@ -122,6 +122,8 @@ app.use('/api/google-ads', googleAdsRoutes);
 app.use('/api/logs', logsRoutes);
 app.use('/api/ai-audit', aiAuditRoutes);
 app.use('/api/oblio', require('./routes/oblio'));
+app.use('/api/capo-ordini', require('./routes/capoOrdini'));
+app.use('/api/arbitro', require('./routes/arbitro'));
 
 // Start server
 async function start() {
@@ -141,6 +143,11 @@ async function start() {
     const { startZombieCron } = require('./services/zombieCron');
     startZombieCron();
 
+    // ⚡ Zombie intra-day (idea capo 25/7): parziale click di OGGI ogni 2h in
+    // fascia 08:35-20:35 IT, solo DB (no FTP) — correzioni infragiornaliere.
+    const { startZombieIntradayCron } = require('./services/zombieIntradayCron');
+    startZombieIntradayCron();
+
     // Start product health enrichment cron (every 4h)
     const { startHealthCron } = require('./services/healthCron');
     startHealthCron();
@@ -158,6 +165,11 @@ async function start() {
     const { startSpendMonitorCron } = require('./services/spendMonitorCron');
     startSpendMonitorCron();
 
+    // Google Ads sync cron (1x/giorno, tenant con google_ads_customer_id).
+    // Read-only: pull dati Ads nel DB locale, NON tocca le campagne.
+    const { startGoogleAdsSyncCron } = require('./services/googleAds');
+    startGoogleAdsSyncCron();
+
     // Start stable cache cron (ogni 30 min, indipendente da healthCron).
     // healthCron step stable_cache era ULTIMO della pipeline: se uno step
     // precedente timeout-ava per un tenant, la cache di /feed/civetta e
@@ -168,6 +180,77 @@ async function start() {
     // AI audit cron: digest UTC 09:00 + auto-apply UTC 04:00, 16:00
     const { start: startAiAuditCron } = require('./services/aiAuditCron');
     startAiAuditCron();
+
+    // 🔔 Sirena di conformità (14/7): ogni mattina 07:00 IT ricontrolla che
+    // nessuna legge sia violata nello stato reale del DB — Telegram se sgarra
+    const { start: startConformityMonitor } = require('./services/conformityMonitor');
+    startConformityMonitor();
+
+    // ✂️ Lima costante (ordine permanente capo 15/7): ogni mattina 06:15 IT
+    // pochi burner cliccati zero-vendite fuori dal feed — poco ma costante
+    const { start: startLimaCostante } = require('./services/limaCostanteCron');
+    startLimaCostante();
+
+    // 🔁 Decadimento PC (requisito capo 16/7): ogni notte 05:30 IT stacca i
+    // price cut che consumano budget-click senza convertire (dieta + retest 21g,
+    // no sovrapposizione loop). Ripristina il gate low_click_no_conversion.
+    const { startPcDecayCron } = require('./services/pcDecayCron');
+    startPcDecayCron();
+
+    // 🔥 Loop burner incidenza>100% (ordine capo 17/7): ogni notte 05:45 IT
+    // stacca i burner fatturato-zero (spesa click 15g > fatturato, 0 diretto +
+    // 0 carrello), cap 80/tenant "poco-ma-costante", retest 21g. Stesso
+    // meccanismo dieta+arbitro del pcDecay. Freno anti-9/7 sui portatori.
+    const { startBurnerIncidenceCron } = require('./services/burnerIncidenceCron');
+    startBurnerIncidenceCron();
+
+    // 🔁 Riattivazione margine (ordine capo 24/7): UNICA autorita' di rilascio
+    // per la classe "margine 100% bruciato" (lima+burner+killer). Ogni mattina
+    // 05:00 IT, PRIMA di burner/lima: R1 vende-in-rete, R2 restock magazzino,
+    // R3 test 5gg ogni 20gg. Mig 071 (funzione DB reactivate_margin_blocks).
+    const { startMarginBlockReactivation } = require('./services/marginBlockReactivation');
+    startMarginBlockReactivation();
+
+    // 🔁 Loop coda lunga zero-conversione (ordine capo 29/7): taglia i micro-burner
+    // sotto la soglia killer per-SKU (1 click/15gg, 0 vendite rete 90gg, disponibili)
+    // e li ritesta 3gg ogni 7gg. Vende nel test -> promosso; no-sale -> ri-taglio.
+    // Mig 078 (funzione DB codalunga_retest_loop). Gira 03:20 UTC / 05:20 IT.
+    const { startCodaLungaLoop } = require('./services/codaLungaLoop');
+    startCodaLungaLoop();
+
+    // 🛡️ Guardiano PC (ordine capo 24/7): "ogni PC va confermato a ogni loop".
+    // Ogni 2h ricalcola costo_vero del momento su ogni PC attivo; se il costo è
+    // salito (tipico switch magazzino→grossista) e il margine sfonda il floor,
+    // rialza al floor-safe (se resta competitivo) o ritira il PC. Mig 073.
+    const { startPcGuardian } = require('./services/pcGuardianCron');
+    startPcGuardian();
+
+    // 🔬 Monitor supplementare TEST Pareto Positioning (ordine capo 24/7): ogni
+    // 30 min fotografa costo/PC/margine/posizione dei PC 'pareto_positioning' in
+    // pareto_test_snapshots + Telegram (heartbeat 3h, alert su anomalia costo). Mig 074.
+    const { startParetoTestMonitor } = require('./services/paretoTestMonitor');
+    startParetoTestMonitor();
+
+    // 🔥 Regola burner ufficiale (dictat capo 25/7, mig 075): blocco giornaliero
+    // dei prodotti che in 7gg hanno bruciato budget con incidenza >100%; rilascio
+    // SOLO se il seller ricomincia a vendere + incidenza <50% (veto DB). Monitor
+    // orario: se un loop tenta la riabilitazione, riblocca e avvisa.
+    const { startBurnerRule } = require('./services/burnerRuleCron');
+    startBurnerRule();
+
+    // 🛡️ Guardia Venditori (18/7, "perché non te ne sei accorto da solo?"):
+    // ogni mattina 07:10 IT visita i top seller — fantasmi TP, sopra-best
+    // (con PC auto floor-safe), stock-out. Sorveglia il fatturato MANCANTE,
+    // non solo il danno.
+    const { startSellerGuardCron } = require('./services/sellerGuardCron');
+    startSellerGuardCron();
+
+    // 🧭 Loop del Mantra (ordine capo 19/7): ogni mattina 07:50 IT lo stratega
+    // AI legge il quadro fresco e propone 3-5 soluzioni NUOVE (mai ripetute,
+    // memoria in mantra_soluzioni) per il mantra: fatturato SU + costi GIÙ.
+    // Propone su Telegram, non applica (auto-apply narrowing vietato).
+    const { startMantraLoop } = require('./services/mantraLoop');
+    startMantraLoop();
 
     // AI health monitor: ogni 4h verifica che l'AI Audit stia girando
     // (MAX(run_at) < 8h) e che applichi (no flood pending senza applied)
@@ -195,6 +278,122 @@ async function start() {
     // su altri canali rientrano (diretti se landing top10, con PC se serve)
     const { startWinbackMonitor } = require('./services/winbackMonitor');
     startWinbackMonitor();
+
+    // Applied Price Mirror: ogni 2h legge da Magento il prezzo REALE
+    // (special_price) degli SKU con azioni prezzo — sell_price è il listino
+    // FB e non vede i PC applicati
+    const { startAppliedPriceMirror } = require('./services/appliedPriceMirror');
+    startAppliedPriceMirror();
+
+    // Push Monitor "Spinta Luglio": scoreboard giornaliero 08:15 italia —
+    // mese corrente vs passo mese precedente per tenant (rev/ordini/spesa/incid)
+    const { startPushMonitor } = require('./services/pushMonitor');
+    startPushMonitor();
+
+    // SB Visible Sweep: ogni 4h attiva i Salva Bilancio in posizione visibile
+    // (top10, ricarico >= floor, stock) rimasti fuori dal CSV — in continuo,
+    // non a batch manuali. L'OUT lo gestiscono strict + isteresi + killer
+    const { startSbSweep } = require('./services/sbVisibleSweep');
+    startSbSweep();
+
+    // Sales Anomaly Monitor: ogni 2h — andamento vendite intraday vs stesso
+    // giorno/ora delle 3 settimane prec. + anomalie spesa/fatturato di ieri
+    // per i tenant operational (health_config sales_monitor='on')
+    const { startSalesAnomalyMonitor } = require('./services/salesAnomalyMonitor');
+    startSalesAnomalyMonitor();
+
+    // Position Log: snapshot giornaliero 09:45 delle posizioni dei venditori
+    // + alert sui cali (competitor aggressivi weekend) — direttiva 5/7
+    const { startPositionLog } = require('./services/positionLog');
+    startPositionLog();
+
+    // Cost Diet Monitor: giornaliero 10:10 — post-taglio dieta costi valuta
+    // ordini vs baseline pre-taglio (multi-evidenza) + efficacia taglio,
+    // avvisa su Telegram — direttiva 9/7
+    const { startCostDietMonitor } = require('./services/costDietMonitor');
+    startCostDietMonitor();
+
+    // Midnight Briefing: ogni notte 00:05 — piano di battaglia del giorno
+    // (consuntivo ieri, posizioni, guardie, scadenze, sorvegliati) — direttiva 9/7
+    const { startMidnightBriefing } = require('./services/midnightBriefing');
+    startMidnightBriefing();
+
+    // Scraper Poller: import orario della cartella scraper + riprezzo intraday
+    // su slice nuova (i file arrivano ogni ~5h, mai più 6h di ritardo) — 10/7
+    const { startScraperPoller } = require('./services/scraperPoller');
+    startScraperPoller();
+
+    // Battle Check: tabella operativa ogni ora 08-22 (cumulato vs pattern,
+    // ritmo ultima ora, applicazione PC) + allarme 2h sotto ritmo — 10/7
+    const { startHourlyBattleCheck } = require('./services/hourlyBattleCheck');
+    startHourlyBattleCheck();
+
+    // Pareto Positioner AI: 4x/giorno (06:10, 11:10, 14:10, 18:10) — Opus
+    // sceglie sul Pareto-set SB la posizione più alta raggiungibile in modo
+    // SANO (scala 1°-4°, banda d'oro, mai muri). Via libera capo 11/7.
+    const { startParetoPositioner } = require('./services/paretoPositioner');
+    startParetoPositioner();
+
+    // Feed Hygiene Cycle: 4x/giorno (06:00, 11:00, 14:00, 18:00) — amnistia
+    // completa + oblio + prezzi derivati + rebuild TOTALE, sincronizzato coi
+    // passaggi Trovaprezzi così Magento si aggiorna in tempo — direttiva 11/7
+    const { startFeedHygieneCycle } = require('./services/feedHygieneCycle');
+    startFeedHygieneCycle();
+
+    // Civetta Gap Monitor: ogni 3h — compara civetta FB vs civettaAI, recupera
+    // chi ha domanda e manda in ESPLORAZIONE i senza-evidenza (uovo-gallina
+    // dello scraper: mai esposti = mai scrappati = mai giudicabili) — 11/7
+    const { startCivettaGapMonitor } = require('./services/civettaGapMonitor');
+    startCivettaGapMonitor();
+
+    // 📱 Telegram Commander: canale mobile del capo (11/7) — il bot delle
+    // sirene ora ASCOLTA: domande dal telefono → agente AI con SQL read-only
+    const { startTelegramCommander } = require('./services/telegramCommander');
+    startTelegramCommander();
+
+    // 💾 Disk Monitor (11/7 sera: DB crashato con disco 100% durante ingest
+    // scraper): sorveglianza oraria, avviso >92%, critico >95%. Il capo
+    // aumenterà il disco; fino ad allora questa è la rete di sicurezza
+    const { startDiskMonitor } = require('./services/diskMonitor');
+    startDiskMonitor();
+
+    // 📦 Scraper Delivery Watch (ordine capo 11/7): check orario "lo scraper
+    // ha consegnato?" — conferma consegne piene, allarme su decimate o silenzio
+    const { startScraperDeliveryWatch } = require('./services/scraperDeliveryWatch');
+    startScraperDeliveryWatch();
+
+    // 🔍 Click Loss Monitor (idea capo 12/7): ogni giorno 08:40 — chi VENDE
+    // e ha smesso di ricevere click, con la DIAGNOSI del perché (fuori feed /
+    // senza prezzo / senza stock / prezzo salito / posizione persa / invisibile)
+    const { startClickLossMonitor } = require('./services/clickLossMonitor');
+    startClickLossMonitor();
+
+    // Price Jump Monitor: giornaliero 10:15 — le regole che seguono i
+    // competitor IN SU (scoperta tragica 26/6) vengono rilevate dal prezzo
+    // venduto e auto-corrette sui tenant con pipe prezzi. Direttiva 6/7
+    const { startPriceJumpMonitor } = require('./services/priceJumpMonitor');
+    startPriceJumpMonitor();
+
+    // AI Margin Calibrator (regola aurea posizionale 7/7): 2x/giorno l'AI
+    // pesa vicino-sotto/vicino-sopra e calibra i rialzi sugli altorotanti
+    // — massimo margine senza perdere appetibilità. Guardrail hard post-AI.
+    // SOSPESO 11/7 (regola aurea prezzi): i rialzi sono vietati — il
+    // calibratore produrrebbe solo tentativi vetati bruciando chiamate Opus.
+    // Riattivare SOLO su ordine esplicito del capo.
+    // const { startAiMarginCalibrator } = require('./services/aiMarginCalibrator');
+    // startAiMarginCalibrator();
+
+    // Position Economics (FONDAMENTALE 7/7): giornaliero 08:45 — per ogni
+    // altorotante calcola la banda di posizione più redditizia (margine/g
+    // dallo storico) e segnala i mal posizionati. Il calibrator la usa.
+    const { startPositionEconomics } = require('./services/positionEconomics');
+    startPositionEconomics();
+
+    // Demand Trends (Margin Intelligence, strato 1 — 7/7): giornaliero 08:50,
+    // rileva l'interesse in accelerazione (SKU e categoria) dai click di rete.
+    // Trend entrante = domanda che paga = margini più coraggiosi (calibrator)
+    const { startDemandTrends } = require('./services/demandTrends');
+    startDemandTrends();
 
     app.listen(PORT, '0.0.0.0', () => {
       console.log(`[xHUMANPRO] Backend running on http://0.0.0.0:${PORT}`);

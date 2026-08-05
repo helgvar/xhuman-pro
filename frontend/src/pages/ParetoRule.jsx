@@ -50,6 +50,48 @@ export default function ParetoRule() {
   });
   const visible = filtered.slice(0, limit);
 
+  function exportExcel() {
+    const rows = filtered; // tutti i prodotti Pareto che passano la ricerca, non solo i visibili
+    if (!rows.length) return;
+    const cols = [
+      ['#', p => p.rn],
+      ['SKU', p => p.sku],
+      ['Prodotto', p => p.product_name || ''],
+      ['Brand', p => p.brand || ''],
+      ['Fatturato', p => p.total_revenue],
+      ['Pezzi', p => p.total_qty],
+      ['N_tenant', p => p.n_tenants],
+      ['Prezzo_min', p => p.price_min],
+      ['Tenant_min', p => p.tenant_min || ''],
+      ['Prezzo_medio', p => p.price_avg],
+      ['Prezzo_max', p => p.price_max],
+      ['Tenant_max', p => p.tenant_max || ''],
+      ['Spread_pct', p => p.spread_pct],
+      ['Cum_pct', p => p.cum_pct],
+    ];
+    const esc = (v) => {
+      if (v == null) return '';
+      let s = String(v);
+      // Excel IT: separatore decimale = virgola
+      if (typeof v === 'number') s = s.replace('.', ',');
+      if (/[";\n]/.test(s)) s = '"' + s.replace(/"/g, '""') + '"';
+      return s;
+    };
+    const lines = [
+      cols.map(c => c[0]).join(';'),
+      ...rows.map(p => cols.map(c => esc(c[1](p))).join(';')),
+    ];
+    const blob = new Blob(['﻿' + lines.join('\r\n')], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `pareto_${days}g_${cumulativePct}pct_${rows.length}sku.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+
   return (
     <div className="space-y-6">
       <div className="flex items-start justify-between flex-wrap gap-4">
@@ -182,6 +224,17 @@ export default function ParetoRule() {
               <option value={5000}>tutti ({fmtNum(filtered.length)})</option>
             </select>
             <span className="text-xs text-gray-500">{visible.length} di {fmtNum(filtered.length)} visualizzati</span>
+            <button
+              onClick={exportExcel}
+              disabled={filtered.length === 0}
+              className="ml-auto inline-flex items-center gap-2 px-4 py-2 text-sm font-medium text-white bg-emerald-600 hover:bg-emerald-700 disabled:opacity-40 disabled:cursor-not-allowed rounded-md transition-colors"
+              title="Scarica tutti i prodotti Pareto (rispetta la ricerca) in CSV per Excel"
+            >
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+              </svg>
+              Esporta Excel ({fmtNum(filtered.length)})
+            </button>
           </div>
 
           {/* Table */}

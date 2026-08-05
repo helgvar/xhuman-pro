@@ -37,7 +37,7 @@ async function verifyTenant(tenantId, opts = {}) {
     WHERE tenant_id = $1
       AND status = 'applied'
       AND applied_at IS NOT NULL
-      AND applied_at >= NOW() - INTERVAL '60 days'
+      AND applied_at >= NOW() - INTERVAL '15 days'
       AND applied_at <= NOW() - INTERVAL '${PENDING_GRACE_DAYS} days'
       AND (verification_status IS NULL OR verification_status IN ('pending', 'deviating'))
   `, [tenantId]);
@@ -206,7 +206,7 @@ async function getRuleMetrics(tenantId, ruleId, from, to, cpc) {
              SUM(COALESCE(oi.row_total_incl_tax, oi.row_total*1.1)) AS rev
       FROM orders o JOIN order_items oi ON oi.order_id=o.id
       WHERE o.tenant_id=$1
-        AND o.order_status IN ('complete','processing','Ritirato','ritiro_farmacia','ritiro_sede_tmp')
+        AND o.order_status NOT IN ('canceled','closed','pending_payment')
         AND o.order_date >= $3::date AND o.order_date < $4::date
       GROUP BY 1
     )

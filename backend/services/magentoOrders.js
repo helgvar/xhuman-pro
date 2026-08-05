@@ -309,6 +309,13 @@ async function importOrders(tenantId, daysBack = 365, jobId = null) {
         hasMore = totalProcessed < totalCount && orders.length === PAGE_SIZE;
         page++;
 
+        // Courtesy verso il Magento del tenant (rafforzata 8/7/2026): pausa
+        // tra le pagine ordini — meglio un sync piu' lento che uno store
+        // inutilizzabile per i clienti durante le nostre chiamate
+        if (hasMore) {
+          await new Promise(r => setTimeout(r, 2500));
+        }
+
         // Update job progress
         if (jobId) {
           await pool.query(

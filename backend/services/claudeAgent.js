@@ -280,6 +280,8 @@ async function toolGetCompetitors(sku) {
     SELECT merchant, position, base_price, shipping_cost, total_price, reviews
     FROM scraper_competitors
     WHERE product_code = $1
+      -- guardrail freschezza (retention 7g): l'agente ragiona su prezzi recenti
+      AND scraped_at >= NOW() - INTERVAL '48 hours'
     ORDER BY position
     LIMIT 20
   `, [sku]);
@@ -379,8 +381,8 @@ async function executeActionNow(tenantId, sessionId, userId, input) {
 
       await pool.query(`
         INSERT INTO feed_quarantine (tenant_id, sku, reason, quarantine_level, quarantine_start, quarantine_end)
-        VALUES ($1, $2, $3, 1, NOW(), NOW() + INTERVAL '30 days')
-        ON CONFLICT (tenant_id, sku) DO UPDATE SET reason = $3, quarantine_start = NOW(), quarantine_end = NOW() + INTERVAL '30 days', reactivated = false
+        VALUES ($1, $2, $3, 1, NOW(), NOW() + INTERVAL '7 days')
+        ON CONFLICT (tenant_id, sku) DO UPDATE SET reason = $3, quarantine_start = NOW(), quarantine_end = NOW() + INTERVAL '7 days', reactivated = false
       `, [tenantId, sku, `agent:${input.reason}`]);
 
       results.push({ sku, action: 'REMOVE', success: true });

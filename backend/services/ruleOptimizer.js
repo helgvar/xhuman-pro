@@ -186,7 +186,7 @@ async function analyzeTenant(tenantId, opts = {}) {
       JOIN order_items oi ON oi.order_id = o.id
       LEFT JOIN products p ON p.tenant_id = o.tenant_id AND p.sku = oi.sku
       WHERE o.tenant_id = $1
-        AND o.order_status IN ('complete','processing','Ritirato','ritiro_farmacia','ritiro_sede_tmp')
+        AND o.order_status NOT IN ('canceled','closed','pending_payment')
         AND o.order_date::date >= CURRENT_DATE - 30
       GROUP BY o.id
     )
@@ -217,7 +217,7 @@ async function analyzeTenant(tenantId, opts = {}) {
       JOIN order_items oi ON oi.order_id = o.id
       LEFT JOIN products p ON p.tenant_id = o.tenant_id AND p.sku = oi.sku
       WHERE o.tenant_id = $1
-        AND o.order_status IN ('complete','processing','Ritirato','ritiro_farmacia','ritiro_sede_tmp')
+        AND o.order_status NOT IN ('canceled','closed','pending_payment')
         AND o.order_date::date BETWEEN CURRENT_DATE - 60 AND CURRENT_DATE - 31
       GROUP BY o.id
     )
@@ -292,7 +292,7 @@ async function analyzeTenant(tenantId, opts = {}) {
     ),
     ord AS (
       SELECT oi.sku FROM orders o JOIN order_items oi ON oi.order_id = o.id
-      WHERE o.tenant_id = $1 AND o.order_status IN ('complete','processing','Ritirato','ritiro_farmacia','ritiro_sede_tmp')
+      WHERE o.tenant_id = $1 AND o.order_status NOT IN ('canceled','closed','pending_payment')
         AND o.order_date::date >= CURRENT_DATE - 30 GROUP BY oi.sku
     )
     SELECT
@@ -329,7 +329,7 @@ async function analyzeTenant(tenantId, opts = {}) {
     ord AS (
       SELECT oi.sku, COUNT(DISTINCT o.id) AS ords, SUM(oi.row_total) AS rev
       FROM orders o JOIN order_items oi ON oi.order_id = o.id
-      WHERE o.tenant_id = $1 AND o.order_status IN ('complete','processing','Ritirato','ritiro_farmacia','ritiro_sede_tmp')
+      WHERE o.tenant_id = $1 AND o.order_status NOT IN ('canceled','closed','pending_payment')
         AND o.order_date::date >= CURRENT_DATE - 30
       GROUP BY 1
     ),
@@ -526,7 +526,7 @@ async function analyzeTenant(tenantId, opts = {}) {
          ),
          ord AS (
            SELECT DISTINCT oi.sku FROM orders o JOIN order_items oi ON oi.order_id=o.id
-           WHERE o.tenant_id=$1 AND o.order_status IN ('complete','processing','Ritirato','ritiro_farmacia','ritiro_sede_tmp')
+           WHERE o.tenant_id=$1 AND o.order_status NOT IN ('canceled','closed','pending_payment')
              AND o.order_date::date >= CURRENT_DATE - 60
          )
          SELECT p.sku, zc.clicks

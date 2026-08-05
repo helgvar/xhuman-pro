@@ -25,7 +25,7 @@
     FROM tenants t JOIN orders ord ON ord.tenant_id=t.id
     WHERE t.name = ANY($1::text[])
       AND ord.order_date >= CURRENT_DATE - ($2 || ' days')::interval
-      AND ord.order_status NOT IN ('canceled','closed')
+      AND ord.order_status NOT IN ('canceled','closed','pending_payment')
     GROUP BY t.name, day, dow
     ORDER BY day, t.name
   `, [[...TREATMENT, ...CONTROL], String(days)]);
@@ -74,7 +74,7 @@
       FROM tenants t JOIN orders ord ON ord.tenant_id=t.id
       WHERE t.name = ANY($2::text[])
         AND ord.order_date >= CURRENT_DATE - ($3 || ' days')::interval
-        AND ord.order_status NOT IN ('canceled','closed')
+        AND ord.order_status NOT IN ('canceled','closed','pending_payment')
       GROUP BY t.name
     )
     SELECT tenant, ord_pre, ord_post, ROUND(rev_pre::numeric, 0) AS rev_pre, ROUND(rev_post::numeric, 0) AS rev_post

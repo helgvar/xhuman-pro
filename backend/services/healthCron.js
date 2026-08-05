@@ -174,6 +174,21 @@ async function _runForAllTenantsInner() {
       console.log(`[HealthCron] Scraper import (global)...`);
       const scraperResult = await importScraperData(scraperTenant.id);
       console.log(`[HealthCron] Scraper: ${scraperResult.products} products, ${scraperResult.entries} entries`);
+
+      // RIPREZZO SU DATI FRESCHI (direttiva 7/7): le classifiche cambiano
+      // ogni 4-6h con lo scraper — a ogni import significativo riparte il
+      // ciclo: snapshot posizioni + price jump + governor (era 1x/giorno).
+      if (scraperResult && scraperResult.entries > 20000) {
+        console.log(`[HealthCron] Scraper fresco (${scraperResult.entries} righe) → riprezzo intraday`);
+        try {
+          const { runPositionLog } = require('./positionLog');
+          await runPositionLog();
+        } catch (e) { console.error('[HealthCron] positionLog post-scrape err:', e.message); }
+        try {
+          const { runPriceJumpMonitor } = require('./priceJumpMonitor');
+          await runPriceJumpMonitor();
+        } catch (e) { console.error('[HealthCron] priceJump post-scrape err:', e.message); }
+      }
     }
   } catch (scraperErr) {
     console.error(`[HealthCron] Scraper error:`, scraperErr.message);

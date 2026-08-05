@@ -10,6 +10,7 @@ import TenantSelector from './pages/TenantSelector';
 import Dashboard from './pages/Dashboard';
 
 import Products from './pages/Products';
+import StoricoCosti from './pages/StoricoCosti';
 import Orders from './pages/Orders';
 import AdminTenants from './pages/AdminTenants';
 import AdminUsers from './pages/AdminUsers';
@@ -24,9 +25,12 @@ import RuleOptimizer from './pages/RuleOptimizer';
 import CrossChannel from './pages/CrossChannel';
 import Shopping from './pages/Shopping';
 import GoogleAdsSetup from './pages/GoogleAdsSetup';
+import GoogleAdsAnalytics from './pages/GoogleAdsAnalytics';
 import Logs from './pages/Logs';
 import AiAudit from './pages/AiAudit';
 import Oblio from './pages/Oblio';
+import GiornaleCapo from './pages/GiornaleCapo';
+import Arbitro from './pages/Arbitro';
 
 export default function App() {
   const { loading, needsTenantSelection } = useAuth();
@@ -61,6 +65,7 @@ export default function App() {
                 <Route path="/" element={<Dashboard />} />
                 <Route path="/orders" element={<Orders />} />
 <Route path="/products" element={<Products />} />
+                <Route path="/storico-costi" element={<StoricoCosti />} />
                 <Route path="/trovaprezzi" element={<Trovaprezzi />} />
                 <Route path="/statistiche" element={<Statistiche />} />
                 <Route path="/optimization" element={<FeedOptimizer />} />
@@ -74,6 +79,15 @@ export default function App() {
                 } />
                 <Route path="/oblio" element={
                   <ProtectedRoute roles={['superadmin', 'admin', 'viewer']}><Oblio /></ProtectedRoute>
+                } />
+                <Route path="/giornale" element={
+                  <ProtectedRoute roles={['superadmin', 'admin', 'viewer']}><GiornaleCapo /></ProtectedRoute>
+                } />
+                <Route path="/arbitro" element={
+                  <ProtectedRoute roles={['superadmin', 'admin', 'viewer']}><Arbitro /></ProtectedRoute>
+                } />
+                <Route path="/google-ads" element={
+                  <ProtectedRoute roles={['superadmin', 'admin', 'viewer']}><GoogleAdsAnalytics /></ProtectedRoute>
                 } />
                 <Route path="/admin/google-ads" element={<GoogleAdsSetup />} />
                 <Route path="/logs" element={

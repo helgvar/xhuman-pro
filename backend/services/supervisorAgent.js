@@ -118,7 +118,7 @@ async function toolGetKpiTrend(tenantId, days) {
     store AS (
       SELECT order_date::date d, COUNT(*) ords, SUM(grand_total_products) rev
       FROM orders
-      WHERE tenant_id = $1 AND order_status IN ('complete','processing') AND order_date::date >= CURRENT_DATE - $2::int
+      WHERE tenant_id = $1 AND order_status NOT IN ('canceled','closed','pending_payment') AND order_date::date >= CURRENT_DATE - $2::int
       GROUP BY 1
     ),
     cfg AS (SELECT COALESCE(MAX(config_value)::numeric, 0.27) cpc FROM health_config WHERE tenant_id=$1 AND config_key='avg_tp_cpc')
@@ -171,7 +171,7 @@ async function toolGetTopBurners(tenantId, days, limit) {
     ord AS (
       SELECT oi.sku, COUNT(DISTINCT o.id) ords
       FROM orders o JOIN order_items oi ON oi.order_id = o.id
-      WHERE o.tenant_id = $1 AND o.order_status IN ('complete','processing')
+      WHERE o.tenant_id = $1 AND o.order_status NOT IN ('canceled','closed','pending_payment')
         AND o.order_date::date >= CURRENT_DATE - $2::int
       GROUP BY 1
     ),

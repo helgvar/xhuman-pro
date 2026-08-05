@@ -1120,3 +1120,72 @@ Corretto a `date_trunc('week') >= 2` (settimane distinte), deployato e riavviato
 Solo 21 SKU rientrati dopo il rerun (Papa 13, Farmastelia 7, MPF 1): protetti da altre guardie, lasciati stare.
 
 **Da sistemare, emerso dagli alert al riavvio:** `Mandanici/ZombieCron` fermo da 16,4 giorni e `Farmastelia/MCSync` **mai** eseguito. Le 56 REMOVE su Mandanici poggiano quindi su click reali ma vecchi di due settimane.
+
+---
+
+## 5/8/2026 — Giro generale Papa / Farmastelia / MPF
+
+**Ordine del capo:** *"ok fatti un giro generale per scovare altro da tagliare su papa, farmastelia, e MPF senza perdere fatturato e scova nuove pepite."*
+
+### Il conto che nessun motore fa
+
+Il vincolo *"senza perdere fatturato"* impone di guardare i **venditori**, non i morti — quelli erano già stati tagliati in mattinata. Un venditore si condanna solo se il click costa più di quello che porta, e "quello che porta" include il resto del carrello:
+
+```
+netto 30gg = margine_proprio + 20% × (carrello − fatturato_proprio) − click × 0,3294
+```
+
+Base IVA `row_total_incl_tax`, stesso piano di `erp_cost`. Costo vero = `erp_purchase_cost` se stock fisico.
+
+**Il carrello ha salvato i sottocosto.** 76 SKU vendono sotto costo su tre tenant, e col solo margine proprio sarebbero tutti da tagliare (−€1.141 in 30gg). Ma trascinano €5.436 di altri prodotti negli stessi ordini: MPF €2.423, Papa €2.724, Farmastelia €289. Col carrello dentro, MPF e Papa tornano positivi. Tagliarli in blocco sarebbe costato margine, non risparmiato.
+
+### Tagliato — 171 SKU che vendono e non ripagano
+
+| Tenant | SKU | Click 30gg | Risparmio/gg | Fatturato a rischio/gg | Margine perso/gg |
+|---|---|---|---|---|---|
+| Farmastelia | 78 | 1.577 | 17,32 | 82,80 | 7,30 |
+| MPF | 37 | 1.397 | 15,34 | 40,01 | 4,52 |
+| Papa | 56 | 1.834 | 20,14 | 70,29 | 6,89 |
+| **Totale** | **171** | **4.808** | **52,80** | **193,10** | **18,71** |
+
+Netto **+€34,09/giorno**. Il fatturato a rischio è €193/giorno ma sotto ci sono €18,71/giorno di margine: sono prodotti che fanno cassa senza fare soldi.
+
+Source `pulizia_non_ripaga_0508`. Esclusi brand protetti MPF, `capo_pin`/`muro_scavalco`/`manual`.
+
+### NON tagliato — 9 SKU che il capo deve vedere
+
+Fatturato vero (>€150/30gg) e margine **negativo** anche col carrello dentro:
+
+| Tenant | SKU | Fatturato/gg | Margine/gg | Click/gg |
+|---|---|---|---|---|
+| Farmastelia | 2 | 25,49 | −5,30 | 1,34 |
+| MPF | 3 | 36,97 | −1,64 | 0,87 |
+| Papa | 4 | 44,17 | −2,16 | 1,97 |
+
+€106,63/giorno di fatturato che brucia €13,28/giorno. È la stessa forma della domanda dei 176 SKU di rete: tagliarli rispetta il mantra sul MOL e lo tradisce sul fatturato. Non decido io.
+
+### Pepite — 208 ADD
+
+Fuori dal feed, vendono comunque in 30gg, hanno merce, e il margine regge il click (`click_sostenibili = margine / 0,3294`). Doppio floor: margine assoluto ≥ €1,50 **e** ricarico di fascia (18/14/12%).
+
+| Tenant | Pepite | Fatturato 30gg | Margine 30gg | Margine/pezzo | Click sostenibili | Magazzino | Già top10 |
+|---|---|---|---|---|---|---|---|
+| Papa | 188 | 5.270,48 | 1.018,80 | 3,60 | 10,9 | 1 | 1 |
+| MPF | 10 | 374,62 | 76,67 | 2,35 | 7,1 | 9 | 8 |
+| Farmastelia | 10 | 271,56 | 42,31 | 3,22 | 9,8 | 0 | 3 |
+
+Papa è l'unico bacino vero: 188 prodotti che vendono senza vetrina, €1.019 di margine in 30 giorni. Su MPF e Farmastelia il pozzo è secco — dieci pepite a testa, e nove delle dieci MPF sono già in top10.
+
+Source `pulizia_pepite_0508`.
+
+### Stato feed dopo il rerun
+
+| Tenant | Prima | Dopo | Delta |
+|---|---|---|---|
+| Papa | 23.509 | **23.641** | +132 (le pepite pesano più del taglio) |
+| Farmastelia | 24.371 | **24.290** | −81 |
+| MPF | 19.500 | 19.500 | invariato |
+
+Applicate 169 REMOVE su 171 e 206 ADD su 208 — due per parte restano fuori, trattenute da guardie.
+
+**Da misurare domani (cron 05:02):** il taglio vale se il costo scende senza che i €193/giorno di fatturato a rischio si vedano davvero. Le pepite valgono se i 188 di Papa convertono entro i ~11 click che il loro margine regge.

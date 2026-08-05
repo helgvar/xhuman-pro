@@ -8,6 +8,8 @@ const SYNC_INTERVAL_MS = 60 * 60 * 1000;      // 1 hour (era 6h; prezzi e stock_
 const STAGGER_DELAY_MS = 60 * 1000;           // 60s delay between tenants (protegge FB server)
 
 let syncRunning = false;
+let syncRunningSince = null;
+const LOCK_MAX_AGE_MS = 90 * 60 * 1000; // 90min: oltre questo, il lock e' considerato zombie
 
 /**
  * Sync products for all active tenants with Farmabooster configured.
@@ -15,11 +17,16 @@ let syncRunning = false;
  */
 async function syncAllProducts() {
   if (syncRunning) {
-    console.log('[ProductSync] Previous sync still running, skipping');
-    return;
+    const ageMs = syncRunningSince ? Date.now() - syncRunningSince : 0;
+    if (ageMs < LOCK_MAX_AGE_MS) {
+      console.log(`[ProductSync] Previous sync still running (${Math.round(ageMs / 60000)}min), skipping`);
+      return;
+    }
+    console.warn(`[ProductSync] Lock zombie da ${Math.round(ageMs / 60000)}min, forzato reset (anti-stuck)`);
   }
 
   syncRunning = true;
+  syncRunningSince = Date.now();
 
   try {
     const { rows: tenants } = await pool.query(
@@ -69,6 +76,7 @@ async function syncAllProducts() {
     console.error('[ProductSync] Global sync error:', err.message);
   } finally {
     syncRunning = false;
+    syncRunningSince = null;
   }
 }
 

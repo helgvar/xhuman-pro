@@ -637,10 +637,10 @@ router.get('/dashboard', requireRole('superadmin', 'admin', 'viewer'), async (re
       ),
       orders30 AS (
         SELECT COUNT(DISTINCT o.id) AS total_orders,
-               COALESCE(SUM(o.grand_total_products), 0) AS total_revenue
+               COALESCE(SUM(o.grand_total), 0) AS total_revenue
         FROM orders o
         JOIN active_days a ON a.d = o.order_date::date
-        WHERE o.tenant_id = $1 AND o.order_status NOT IN ('canceled','closed','pending_payment')
+        WHERE o.tenant_id = $1 AND o.order_status IN ('pending','processing','complete','ritiro_farmacia','Ritirato','ritiro_sede_tmp')
       )
       SELECT clicks30.total_clicks,
              clicks30.active_days,
@@ -985,9 +985,9 @@ async function getDailyTrend(tenantId, days, ga4StartDate) {
       FROM zombie_clicks WHERE tenant_id = $1 GROUP BY 1
     ),
     orders_d AS (
-      SELECT order_date::date d, COUNT(*) o, SUM(grand_total_products) r
+      SELECT (order_date AT TIME ZONE 'Europe/Rome')::date d, COUNT(*) o, SUM(grand_total) r
       FROM orders
-      WHERE tenant_id = $1 AND order_status NOT IN ('canceled','closed','pending_payment')
+      WHERE tenant_id = $1 AND order_status IN ('pending','processing','complete','ritiro_farmacia','Ritirato','ritiro_sede_tmp')
       GROUP BY 1
     ),
     cfg AS (SELECT COALESCE(MAX(config_value)::numeric, 0.27) cpc FROM health_config WHERE tenant_id=$1 AND config_key='avg_tp_cpc')
@@ -1833,6 +1833,25 @@ router.get('/export/:type', requireRole('superadmin', 'admin'), async (req, res)
   } catch (err) {
     console.error('[Optimization] Export error:', err.message);
     res.status(500).json({ error: err.message });
+  }
+});
+
+// Forza rigenerazione immediata del feed CSV del tenant (direttiva 4/7/2026):
+// non aspetta il giro 30min della stableCacheCron. Utile per spingere subito
+// una correzione verso FB/TP in caso di problemi.
+router.post('/feed-rebuild', requireRole('superadmin', 'admin'), async (req, res) => {
+  try {
+    const { recalculateStableCache } = require('./externalApi');
+    const entry = await recalculateStableCache(req.tenantId);
+    res.json({
+      ok: true,
+      civetta: entry.feedCodes.length,
+      remove: entry.removeCodes.length,
+      priceCuts: entry.priceCuts.length,
+      updatedAt: entry.updatedAt,
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
   }
 });
 

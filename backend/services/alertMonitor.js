@@ -19,6 +19,9 @@
 
 const { pool } = require('../db/pool');
 const { decrypt } = require('./crypto');
+const { farmaboosterQueue } = require('./apiQueue');
+
+const CB_OPEN_ALERT_THRESHOLD_MIN = 30;  // alert se CB Farmabooster OPEN >30min
 
 const CHECK_INTERVAL_MS = 60 * 60 * 1000;           // 60 min
 const ALERT_THROTTLE_MS = 4 * 60 * 60 * 1000;        // 4h per coppia tenant+loop
@@ -100,7 +103,13 @@ async function getFreshnessByTenant() {
       (SELECT jsonb_array_length((config_value::jsonb)->'products')
        FROM tenant_configs WHERE tenant_id=t.id AND config_key='stable_price_cuts'
        AND config_value IS NOT NULL AND config_value::jsonb ? 'products') AS pc_in_cache,
-      (SELECT config_value FROM tenant_configs WHERE tenant_id=t.id AND config_key='xhumanpro_magento_mode') AS magento_mode
+      (SELECT config_value FROM tenant_configs WHERE tenant_id=t.id AND config_key='xhumanpro_magento_mode') AS magento_mode,
+      -- Budget TP esaurito (account live ma 0 click → report TP vuoto, alert ZombieCron va silenziato)
+      EXISTS (
+        SELECT 1 FROM health_config
+        WHERE tenant_id=t.id AND config_key='tp_budget_exhausted'
+          AND config_value='1' AND (expires_at IS NULL OR expires_at > NOW())
+      ) AS tp_budget_exhausted
     FROM tenants t
     WHERE t.status = 'active'
     ORDER BY t.name
@@ -137,15 +146,32 @@ async function checkAll() {
     });
   }
 
+  // Circuit Breaker Farmabooster API: se OPEN piu' di 30min, ProductSync/MagentoSync
+  // sono bloccati per tutti i tenant. Vista pregressa del 6-8/6/2026: il CB si era
+  // aperto e nessuno l'aveva resettato per 2 giorni. Restart o intervento manuale richiesto.
+  const cbOpenMin = farmaboosterQueue.openSinceMinutes();
+  if (cbOpenMin !== null && cbOpenMin > CB_OPEN_ALERT_THRESHOLD_MIN) {
+    issues.push({
+      tenantId: null, tenant: 'GLOBALE', loop: 'FarmaboosterCB',
+      label: 'Farmabooster API Circuit Breaker OPEN',
+      hoursAgo: cbOpenMin / 60, threshold: CB_OPEN_ALERT_THRESHOLD_MIN / 60,
+      details: `ProductSync e MagentoSync bloccati su tutti i tenant. Riavvia backend o ripristina Farmabooster API.`,
+    });
+  }
+
   for (const t of tenants) {
     const isOperational = t.magento_mode === 'operational';
     const checks = [
       { loop: 'OrderSync',    last: t.last_order,   threshold: THRESHOLDS_HOURS.orders,        label: 'OrderSync' },
-      { loop: 'ZombieCron',   last: t.last_tp,      threshold: THRESHOLDS_HOURS.zombieClicks,  label: 'TP click' },
+    ];
+    if (!t.tp_budget_exhausted) {
+      checks.push({ loop: 'ZombieCron', last: t.last_tp, threshold: THRESHOLDS_HOURS.zombieClicks, label: 'TP click' });
+    }
+    checks.push(
       { loop: 'HealthCron',   last: t.last_health,  threshold: THRESHOLDS_HOURS.healthScores,  label: 'HealthCron' },
       { loop: 'ProductSync',  last: t.last_product, threshold: THRESHOLDS_HOURS.productSync,   label: 'ProductSync' },
       { loop: 'MCSync',       last: t.last_mc,      threshold: THRESHOLDS_HOURS.mcSync,        label: 'Merchant Center sync' },
-    ];
+    );
     if (isOperational) {
       checks.push({ loop: 'MagentoSync', last: t.last_magento_sync, threshold: THRESHOLDS_HOURS.magentoSync, label: 'Magento sync (civettaai)' });
     }

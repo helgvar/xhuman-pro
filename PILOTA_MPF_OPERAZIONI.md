@@ -574,3 +574,37 @@ Due ostacoli trovati per strada:
 Venditori 30gg ancora fuori dal feed: 211, ma **147 hanno stock 0** — non esportabili in nessun caso. Quelli con magazzino fisico ancora fuori sono 64.
 
 Restano 1.192 posizionabili senza prova di vendita (mai venduti né qui né in rete). Sono la seconda ondata, dopo aver misurato 24-48h questa — gradualità, non a botto.
+
+### Scaglione 2: i primi in classifica che nessuno aveva mai messo in vetrina
+
+Restavano 1.013 SKU posizionabili con stock fisico e ricarico ≥15% che **non hanno mai venduto** — né su MPF né in rete, in 90 giorni. Segmentati per posizione attesa sul totale:
+
+| Posizione attesa | SKU | margine medio | click che il margine ripaga |
+|---|---|---|---|
+| **primo sul totale** | 96 | 8,03 | 24 |
+| podio (2-3) | 395 | 6,14 | 18 |
+| 4-6 | 277 | 4,78 | 14 |
+| 7-10 | 245 | 3,71 | 11 |
+
+Di questi ne ho presi **53**: solo i primi in classifica, con margine ≥ €3 e ricarico ≤ 300% (sopra quella soglia il costo è sporco, non è una pepita — PUMILENE VAPO risultava a €0,61 di costo contro €41,99 di prezzo).
+
+Tra loro la linea BAKEL: **€131,39 di margine** su THE ONE CASE&REFILL, €66,85 su cinque referenze, tutte primo o secondo posto sul totale, con stock in farmacia. Mai state nel feed. Un prodotto con €131 di margine regge 398 click prima di bruciarlo: il budget click per SKU li ferma da soli se non convertono.
+
+Totale forzati: **293**, di cui **279 nel CSV**. Feed sempre a 19.500.
+
+### La misura, per non raccontarsela
+
+Baseline MPF, 8 giorni prima del taglio:
+
+| giorno | click | costo |
+|---|---|---|
+| 4/8 | 754 | 248,37 |
+| 3/8 | 849 | 279,66 |
+| 2/8 | 569 | 187,43 |
+| 1/8 | 643 | 211,80 |
+| 31/7 | 736 | 242,44 |
+| 30/7 | 661 | 217,73 |
+| 29/7 | 833 | 274,39 |
+| 28/7 | 871 | 286,91 |
+
+**Media: 739 click/gg, €243,58/gg.** Il feed a 19.500 è in vigore da ieri sera: il dato del 5/8 è la prima misura pulita. Le due domande a cui rispondere domani sono separate — il costo scende sotto la media? e i 279 forzati portano ordini che prima non c'erano?

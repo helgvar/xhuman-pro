@@ -417,9 +417,13 @@ async function recalculateStableCache(tenantId) {
     //   1. brand protetti  -> non escono MAI dal feed per cap ("i brand lasciali stare")
     //   2. pin del capo    -> prima classe protetta
     //   3. rilasciati da <10gg -> esilio 7gg + test 3gg: chi e' in test NON si giudica
-    //   4. vendite reali Magento 90gg (ordini, poi fatturato)
-    //   5. stock fisico in farmacia (regola aurea: spingere il magazzino)
-    //   6. health_score come spareggio
+    //   4. ADD deliberato (mano nostra: 'il feed lo decidi tu') -> non si autoespelle
+    //   5. vendite reali Magento 90gg (ordini, poi fatturato)
+    //   6. vendite di RETE 30gg: prova di domanda su un altro tenant, vale meno
+    //      del venduto locale ma piu' di uno score. Senza questo il cap buttava
+    //      fuori proprio gli SKU appena forzati dentro perche' "non vendono qui"
+    //   7. stock fisico in farmacia (regola aurea: spingere il magazzino)
+    //   8. health_score come spareggio
     // Chi resta in coda e finisce sotto la soglia e' materia muta: ne' vende ne' clicca.
     const { rows: priorityRows } = await pool.query(`
       WITH ord90 AS (
@@ -437,20 +441,39 @@ async function recalculateStableCache(tenantId) {
         SELECT DISTINCT sku FROM feed_quarantine
         WHERE tenant_id = $1 AND reactivated = true
           AND reactivated_at > NOW() - INTERVAL '10 days'
+      ),
+      rete30 AS (
+        SELECT oi.sku, SUM(oi.qty_ordered * oi.price) AS fatt
+        FROM order_items oi
+        JOIN orders o ON o.id = oi.order_id
+        WHERE oi.tenant_id <> $1
+          AND oi.sku = ANY($2)
+          AND o.order_date >= NOW() - INTERVAL '30 days'
+          AND o.order_status IN ('processing','pending','complete','ritiro_farmacia','Ritirato')
+        GROUP BY 1
+      ),
+      forzati AS (
+        SELECT sku FROM feed_actions
+        WHERE tenant_id = $1 AND action = 'ADD'
+          AND (action_source LIKE 'pulizia_%' OR action_source LIKE 'capo_%')
       )
       SELECT ph.sku,
         (CASE WHEN is_brand_protected($1, ph.sku) THEN 1000000 ELSE 0 END +
          CASE WHEN EXISTS (SELECT 1 FROM capo_pins cp
                            WHERE cp.tenant_id = $1 AND cp.sku = ph.sku
                              AND cp.revoked_at IS NULL) THEN 500000 ELSE 0 END +
+         CASE WHEN EXISTS (SELECT 1 FROM forzati fz
+                           WHERE fz.sku = ph.sku) THEN 300000 ELSE 0 END +
          CASE WHEN EXISTS (SELECT 1 FROM in_test it
                            WHERE it.sku = ph.sku) THEN 200000 ELSE 0 END +
          COALESCE(o90.ordini, 0) * 100 +
          COALESCE(o90.fatt, 0) * 0.1 +
+         COALESCE(r30.fatt, 0) * 0.05 +
          CASE WHEN COALESCE(p.erp_stock, 0) > 0 THEN 50 ELSE 0 END +
          COALESCE(ph.health_score, 0)) AS priority_score
       FROM product_health_scores ph
       LEFT JOIN ord90 o90 ON o90.sku = ph.sku
+      LEFT JOIN rete30 r30 ON r30.sku = ph.sku
       LEFT JOIN products p ON p.tenant_id = ph.tenant_id AND p.sku = ph.sku
       WHERE ph.tenant_id = $1 AND ph.sku = ANY($2)
     `, [tenantId, feedCodes]);

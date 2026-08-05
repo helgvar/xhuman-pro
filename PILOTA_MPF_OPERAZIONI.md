@@ -533,3 +533,44 @@ Due casi guardati a mano perché sembravano contraddittori:
 
 - **TROSYD DERMATITE SEB SH120ML** (`037087032`): rilasciato alle 04:01, ricondannato subito da `pulizia_brucia_margine`. Prezzo €5,59 contro un costo di €11,35 — **vende sotto costo di €5,76**. La condanna è corretta; è uno degli 11 SKU a margine ≤ 0 già segnalati. Il rilascio dalla quarantena non deve poter rimettere dentro un prodotto in perdita.
 - **POLASE ARANCIA 24BUST PROMO** (`987437249`): stock 24, prezzo €9,36, costo €7,61, margine sano. È fuori perché `is_civetta = false` — Farmabooster non lo marca civetta, quindi il feed non lo può prendere. Non era un killer né una quarantena: era una domanda mal posta.
+
+---
+
+## 5/8 — "Il civetta di Farmabooster è un'indicazione. Il feed lo decidi tu."
+
+Ordine del capo, che ribalta un'assunzione che stavo usando come muro:
+
+> *"quello che Farmabooster salva come civetta true o false è solo un'indicazione per te. Il feed lo decidi tu mandando a Farmabooster civetta true e price_cut. Se ci sono prodotti che vendono bene e sono posizionabili sei tu che li devi forzare con il tuo civetta."*
+
+Stamattina avevo archiviato POLASE come "fuori perché `is_civetta=false`, non è un bug". Sbagliato: `is_civetta` è l'eco delle nostre decisioni passate, non un verdetto. Il canale per forzare esiste già (`feed_actions.action='ADD'` → `/feed/civetta` con `civetta=1`) ed era aperto: la pausa scraper è a 0 e il dato è fresco (1,5 milioni di righe nelle ultime 48h).
+
+### Il bacino, misurato sul totale e non sul prezzo prodotto
+
+Fuori dal feed, con stock **fisico** e prezzo valido: **4.094 SKU**. Di questi, posizionabili nei primi 10 **sul totale** (prezzo + spedizione, la grandezza su cui TP ordina) e con ricarico ≥ 15%: **1.432**.
+
+| | SKU | fatturato rete 30gg |
+|---|---|---|
+| mai venduti in rete, FB dice civetta | 1.049 | — |
+| mai venduti in rete, FB dice NO | 187 | — |
+| **vendono in rete**, FB dice civetta | 177 | 8.750 |
+| **vendono in rete**, FB dice NO | 19 | 713 |
+
+### Ondata 1: 240 forzati, quelli con la prova in mano
+
+Criteri, tutti insieme: fuori dal feed, stock fisico > 0, ricarico ≥ 15% sul costo vero, **primi 10 sul totale**, prova di vendita (rete 30gg o MPF 90gg), e non già bruciato (click 30gg × CPC < margine × 1,5).
+
+**240 SKU** — 164 vendono in rete (€7.612/30gg), 108 hanno venduto su MPF (€4.056/90gg). Margine medio €4,76, posizione attesa media **5,3**. Scritti come `ADD`, `action_source='pulizia_forza_civetta_0508'`.
+
+Due ostacoli trovati per strada:
+
+1. **Il cap li avrebbe espulsi subito.** La priorità premiava le vendite locali: uno SKU che vende in rete ma non ancora su MPF aveva punteggio da ultimo della fila, e sarebbe uscito dal fondo della lista lo stesso giorno in cui l'avevamo forzato dentro. Aggiunti due termini: ADD deliberato (+300.000, sotto i pin e sopra il test) e **fatturato di rete 30gg × 0,05**. La prova di domanda su un altro tenant vale meno del venduto locale, ma più di uno score.
+
+2. **100 erano in quarantena, e la quarantena batte l'ADD.** Il ramo `action='ADD'` nella costruzione del feed richiede `fq.id IS NULL`. Liberati 114 (la dottrina è chiara: *la quarantena non è per sempre, chi ricomincia a vendere esce subito*). Restano **5** bloccati: sono `is_burner_rule`, e i due veti di rilascio hanno porte incompatibili — `veto_release_burner_rule` lascia passare solo `xhp.writer LIKE 'capo_%'`, `veto_release_incidenza_alta` solo `sessione_%`. Nessun writer li soddisfa entrambi. Cinque SKU non valgono una migrazione; la incoerenza resta annotata.
+
+### Risultato
+
+**235 dei 240 nel CSV**, feed fermo a **19.500** (sotto il tetto dei 20.000 ordinato dal capo). Il cap ha fatto lo scambio da solo: sono entrati i 235 con prova di vendita e margine, sono usciti altrettanti dalla coda muta.
+
+Venditori 30gg ancora fuori dal feed: 211, ma **147 hanno stock 0** — non esportabili in nessun caso. Quelli con magazzino fisico ancora fuori sono 64.
+
+Restano 1.192 posizionabili senza prova di vendita (mai venduti né qui né in rete). Sono la seconda ondata, dopo aver misurato 24-48h questa — gradualità, non a botto.

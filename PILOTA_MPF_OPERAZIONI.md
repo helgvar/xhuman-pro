@@ -896,3 +896,26 @@ Cinque dei rimanenti erano protetti da `porta_carrelli_sani`. Ho fatto il conto 
 **Per il capo, due cose da decidere, non da eseguire:**
 1. Le guardie L2/L4 (`vende_e_ripaga`) e la guardia carrello (`porta_carrelli_sani`) misurano **fatturato e costo click, mai il margine del prodotto**. Finché è così proteggono chi vende in perdita. Serve una migrazione che ci metta dentro il margine vero — non la faccio di mia iniziativa perché tocca tutta la rete, non solo il pilota.
 2. Il prezzo di questi prodotti non è alzabile (veto rialzi, territorio Farmabooster). L'unica leva nostra è la vetrina. Se il listino è sbagliato, la correzione sta a monte.
+
+### 11:05 — quanto vale lo stesso buco sul resto della rete (solo misura, nessun tocco)
+
+Il pilota è su MPF e ci resta. Ma il conto sotto-costo si fa anche altrove in lettura, per dare al capo la dimensione del premio prima di decidere. Prodotti **dentro il CSV** con margine unitario vero negativo, e quanto sono costati in 90 giorni:
+
+| tenant | SKU sotto costo | peggiore | pezzi 90gg | perdita 90gg |
+|---|---|---|---|---|
+| SubitoFarma | 35 | −23,33 | 1.281 | **−2.002,73** |
+| Mandanici | 8 | −10,37 | 228 | −1.147,58 |
+| San Vito | 35 | −5,42 | 463 | −598,60 |
+| Farmainsieme | 22 | −4,75 | 220 | −441,83 |
+| Procaccini | 18 | −5,70 | 191 | −361,85 |
+| Ospedale | 14 | −6,80 | 249 | −318,63 |
+| Papa | 19 | −4,30 | 235 | −176,51 |
+| MPF (dopo la pulizia) | 5 | −10,40 | 379 | −162,48 |
+| Farmacri | 12 | −35,47 | 122 | −52,26 |
+| Farmastelia | 8 | −1,64 | 11 | −6,36 |
+
+**176 prodotti, circa €5.270 di margine bruciato in 90 giorni — €58 al giorno sulla rete.** Non è spesa Trovaprezzi: è margine che se ne va a ogni vendita, indipendentemente dal canale.
+
+Su MPF ne restano 5 per scelta ragionata (i quasi-pari con volume e HYALUBRIX che il carrello ripaga). Sugli altri nove tenant non tocco nulla: **il pilota è MPF, l'ordine del 4/8 è quello, e questi numeri sono un dossier, non un'operazione.** Se il capo dà il via si applica lo stesso metodo — netto 90gg che include il margine proprio, non solo il costo del click.
+
+Da notare per SubitoFarma: sta sotto il floor del 15% per scelta del cliente e questo è noto e accettato. Vendere **sotto costo** è un'altra cosa e vale €2.000 in tre mesi.

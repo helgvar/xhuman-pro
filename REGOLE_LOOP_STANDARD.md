@@ -60,10 +60,24 @@ Nessun SKU a 1-4 click merita una condanna individuale. Ma il blocco costa:
 
 **Regola da codificare** — filtri obbligatori prima di togliere un blocco di rumore:
 1. Brand protetti del tenant (`health_config.killer_protected_brands`) — **fuori solo dove il cliente li ha chiesti**. Dal 5/8 esiste **solo su MPF**: UNI/GAD/MYC/EUC erano finiti su Papa e Procaccini per propagazione (stesso `updated_at` al microsecondo), non per volontà di quei clienti. Non inventare uno scudo dove la config non c'è.
-2. Venduto fra 31 e 90 giorni **con stock fisico** (`erp_stock > 0`) — fuori: è magazzino della farmacia, va spinto (regola aurea).
-3. Ordini reali Magento a 30 giorni, whitelist stati — se ha venduto anche una volta, resta.
-4. `action_source` deve iniziare per `pulizia_` o il rerun engine la cancella.
-5. Writer `capo_%` solo sotto ordine esplicito, sempre a verbale.
+2. Ordini reali Magento a 30 giorni, whitelist stati — se ha venduto anche una volta, resta.
+3. `action_source` deve iniziare per `pulizia_` o il rerun engine la cancella.
+4. Writer `capo_%` solo sotto ordine esplicito, sempre a verbale.
+5. Intoccabili: `capo_pin`, `muro_scavalco`, `manual`. **Non** `manual_pepita` — vedi 2.7.
+
+### 2.7 Nessuna finestra oltre i 30 giorni — mai
+
+**Ordine del capo 5/8, ripetuto:** *"i 90gg sono troppi come già ti ho detto 7659 volte."* Si giudica cosa vende e cosa no su **15 o 30 giorni**. Le finestre lunghe non sono prudenza: fanno sembrare vivo un prodotto morto da due mesi.
+
+Conseguenze già applicate:
+- Cade la salvaguardia *"venduto fra 31 e 90 giorni con stock fisico"* — era la finestra a 90gg travestita da regola aurea.
+- `crossTenantOblio.js` passa a 15gg su ordini e click.
+
+**Trappola: quando si stringe una finestra, ricontrollare ogni criterio di continuità che ci vive dentro.** In `crossTenantOblio.js` la finestra era già stata portata a 15 giorni ma la continuità era rimasta `COUNT(DISTINCT date_trunc('month', fetch_date)) >= 2`: due mesi distinti dentro 15 giorni esistono solo a cavallo del cambio mese, quindi **dal 16 di ogni mese il cron trovava zero candidati**. Non dà errore, dà zero righe — e "zero nuovi burner" sembra un risultato legittimo. Corretto a settimane distinte il 5/8.
+
+Lo stock fisico **non è un veto** sotto questa regola, è una nota di merito. Un prodotto di magazzino che prende click e non vende in 30 giorni non si sta girando pagando la vetrina: si taglia, e si guarda per primo se il fatturato cede.
+
+`manual_pepita` non protegge: pepita che ha preso click e non ha venduto in 30gg = ipotesi falsificata. Diverso da `capo_pin`, che è una decisione e resta.
 
 ### 2.3 Le guardie sono cieche sul margine
 
@@ -113,8 +127,10 @@ Papa il 30/7 ha fatto 18 click e il 31/7 zero, mentre tutta la rete girava: budg
 | Tenant | Feed prima | Feed dopo | REMOVE | Risparmio teorico/gg |
 |---|---|---|---|---|
 | MPF | 20.394 | 19.500 | 894 + 9 sottocosto | ~25,47 |
-| Papa | 24.939 | 23.797 | 1.124 | 20,35 |
-| Farmastelia | 26.738 | 24.701 | 2.039 | 34,33 |
+| Papa | 24.939 | **23.509** | 1.124 + 278 + 125 oblio | ~40,2 |
+| Farmastelia | 26.738 | **24.371** | 2.039 + 269 + 70 oblio | ~62,4 |
+
+Più l'OBLIO di rete: 450 SKU, 751 REMOVE su 7 tenant, €22,30/giorno.
 
 **Teorico, non reale**: i click TP si rigenerano per rotazione della coda. Il risparmio vero si legge sulla riga piena di domani (cron 05:02), non oggi.
 

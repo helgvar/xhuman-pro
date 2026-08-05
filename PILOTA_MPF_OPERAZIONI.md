@@ -1052,3 +1052,71 @@ Poi tagliato il rumore che quel filtro aveva salvato per errore:
 | Farmastelia | 26.738 | **24.701** | −2.037 | 2.039 |
 
 **Da tenere d'occhio:** senza config, i motori possono ora killare e ri-prezzare UNI/GAD/MYC su tutti i tenant tranne MPF. Su Papa restano 335 SKU di quei brand nel feed, su Farmastelia 185. Ma il cambio tocca anche **Procaccini** (349 SKU), che non era nel perimetro dell'analisi di oggi: lì il comportamento dei motori cambia senza che nessuno abbia guardato quei prodotti.
+
+---
+
+## 5/8/2026 — finestre strette a 15/30gg, taglio del cliccato-non-venduto e OBLIO di rete
+
+**Ordine del capo:** *"stringiamo gli archi temporali, ragioniamo su 15/30gg massimo per capire cosa vende e cosa no, i 90gg sono troppi come già ti ho detto 7659 volte. Guarda Papa e Farmastelia e taglia tutto il cliccato non venduto nei 15/30gg. Facciamo un altro giro per eliminare tutti i prodotti 1-2-3 click ciclici sulla rete che non vendono mai da nessuna parte e mettili in oblio."* + *"sì, controlla Procaccini prima di tagliarli."*
+
+### Procaccini, controllo preventivo sui brand ex-protetti
+
+Chiesto dal capo prima di lasciar correre i motori sui brand a cui è stata tolta la config.
+
+| Brand | SKU feed | Click 30gg | Costo | Venduti | Fatturato |
+|---|---|---|---|---|---|
+| GAD | 297 | 93 | 30,63 | 1 | 27,39 |
+| UNI | 47 | 21 | 6,92 | 5 | 114,20 |
+| EUC | 4 | 1 | 0,33 | 1 | 25,41 |
+| MYC | 5 | 0 | 0 | 0 | 0 |
+
+I GAD sono tutori ortopedici Gibaud: **zero stock fisico** su tutta la linea, 3-6 click ciascuno, zero vendite. UNI ed EUC hanno vendite in 30gg e le guardie li tengono. **Nessun venditore a rischio**: togliere la config su Procaccini non espone niente di vivo.
+
+### Taglio del cliccato-non-venduto (finestra 30gg)
+
+Cade la salvaguardia *"venduto fra 31 e 90 giorni con stock fisico"*: è una finestra fuori mandato. Restano intoccabili solo `capo_pin`, `muro_scavalco`, `manual`. **`manual_pepita` non è più protetta**: una pepita che ha preso click e non ha venduto in 30 giorni è un'ipotesi falsificata, non una decisione da preservare (Papa 98, Farmastelia 10).
+
+| Tenant | ≥15 click | 5-14 click | 1-4 click | Totale | Risparmio/gg |
+|---|---|---|---|---|---|
+| Papa | 12 | 125 | 141 | 278 | 16,91 |
+| Farmastelia | 29 | 205 | 35 | 269 | 26,59 |
+
+547 REMOVE scritte, `action_source = pulizia_click_morto_0508`.
+
+**Nota di merito, non di veto:** 153 dei 547 hanno `erp_stock > 0` — magazzino fisico della farmacia, che la regola aurea vorrebbe spingere. Hanno preso click e non hanno venduto in 30 giorni: pagare la vetrina non li sta girando. Tagliati come ordinato, ma è il sottoinsieme da guardare per primo se il fatturato cede.
+
+### OBLIO di rete — i 1-3 click ciclici che non vendono da nessuna parte
+
+Criterio: click su **≥2 tenant**, **max 3 click per tenant**, **≥2 settimane distinte** con click (ciclicità), **zero ordini reali ovunque** in 30gg. Brand protetti MPF esclusi — l'OBLIO è globale e li toglierebbe anche da MPF.
+
+Imbuto: 8.560 SKU su 2+ tenant → 4.945 entro i 3 click → 1.522 ciclici → **512 a zero vendite**. Di questi 62 erano già in OBLIO attivo o di brand protetto: **450 nuovi**, 2.031 click in 30gg, **€22,30/giorno**.
+
+| Tenant | REMOVE |
+|---|---|
+| Farmainsieme | 156 |
+| SubitoFarma | 132 |
+| Papa | 125 |
+| MPF | 115 |
+| Procaccini | 97 |
+| Farmastelia | 70 |
+| Mandanici | 56 |
+
+751 REMOVE, `action_source = pulizia_oblio_rete_0508`. OBLIO attivo passa da 1.105 a 1.555.
+
+### Bug trovato e corretto: il cron OBLIO era morto per metà mese
+
+`crossTenantOblio.js` era stato stretto a 15 giorni ma il criterio di continuità era rimasto `COUNT(DISTINCT date_trunc('month', fetch_date)) >= 2`. Due mesi distinti dentro una finestra di 15 giorni esistono **solo a cavallo del cambio mese**: dal 16 di ogni mese in poi il cron trovava zero candidati e nessuno se ne accorgeva, perché "zero nuovi burner" sembra un risultato legittimo.
+
+Corretto a `date_trunc('week') >= 2` (settimane distinte), deployato e riavviato.
+
+### Stato del feed a fine giornata
+
+| Tenant | Inizio giornata | Fine giornata | Differenza |
+|---|---|---|---|
+| MPF | 20.394 | 19.500 | −894 |
+| Papa | 24.939 | **23.509** | −1.430 |
+| Farmastelia | 26.738 | **24.371** | −2.367 |
+
+Solo 21 SKU rientrati dopo il rerun (Papa 13, Farmastelia 7, MPF 1): protetti da altre guardie, lasciati stare.
+
+**Da sistemare, emerso dagli alert al riavvio:** `Mandanici/ZombieCron` fermo da 16,4 giorni e `Farmastelia/MCSync` **mai** eseguito. Le 56 REMOVE su Mandanici poggiano quindi su click reali ma vecchi di due settimane.

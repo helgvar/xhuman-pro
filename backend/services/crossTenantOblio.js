@@ -10,20 +10,20 @@
 
 const { pool } = require('../db/pool');
 
-const POPOLA_BATCH_SIZE = 50;
+const POPOLA_BATCH_SIZE = 500;
 
 /**
  * Query "burner cross-tenant" reusabile:
  *  click su >2 tenant E 0 vendite (store, aggr, ord reali) ovunque.
  */
-async function findCrossTenantBurners(limit = 50, excludeSkus = []) {
+async function findCrossTenantBurners(limit = 50, excludeSkus = [], protectedBrands = []) {
   const { rows } = await pool.query(`
-    -- Ordini reali Magento 90g (qualunque tenant)
+    -- Ordini reali Magento 15g (finestra stretta, ordine capo 5/8)
     WITH ord_reali_90d AS (
       SELECT oi.sku, COUNT(DISTINCT o.id) AS ord_90d
       FROM orders o JOIN order_items oi ON oi.order_id=o.id
       WHERE o.order_status NOT IN ('canceled','closed','pending_payment')
-        AND o.order_date >= NOW() - INTERVAL '90 days'
+        AND o.order_date >= NOW() - INTERVAL '15 days'
       GROUP BY oi.sku
     ),
     -- Sales seller/aggregated (FB fornisce 30d, fallback)
@@ -33,20 +33,24 @@ async function findCrossTenantBurners(limit = 50, excludeSkus = []) {
         MAX(COALESCE(sales_30d_aggregated,0)) AS aggr_max
       FROM products GROUP BY sku
     ),
-    -- Click e cost 90g aggregati da feed_daily_tracking (per tenant + sku)
+    -- Click REALI 15g da zombie_clicks (CARDINALE: feed_daily_tracking
+    -- sottoriporta 2-4x). Costo = click x CPC fisso 0.27+22% IVA = 0.3294
     clicks_90d AS (
-      SELECT sku, tenant_id,
-        SUM(clicks) AS click_tot, SUM(click_cost) AS cost_tot
-      FROM feed_daily_tracking
-      WHERE track_date >= NOW() - INTERVAL '90 days'
-      GROUP BY sku, tenant_id HAVING SUM(clicks) > 0
+      SELECT product_code AS sku, tenant_id,
+        SUM(clicks) AS click_tot,
+        SUM(clicks) * 0.3294 AS cost_tot,
+        COUNT(DISTINCT date_trunc('week', fetch_date)) AS sett
+      FROM zombie_clicks
+      WHERE fetch_date >= NOW() - INTERVAL '15 days'
+      GROUP BY product_code, tenant_id HAVING SUM(clicks) > 0
     ),
-    -- Aggregazione cross-tenant: n_tenant distinti + click/cost totale
+    -- Aggregazione cross-tenant: n_tenant distinti + continuita' (settimane con click)
     cross_tenant AS (
       SELECT c.sku,
         COUNT(DISTINCT c.tenant_id) AS n_tenant,
         SUM(c.click_tot) AS click_tot,
-        SUM(c.cost_tot) AS cost_tot
+        SUM(c.cost_tot) AS cost_tot,
+        MAX(c.sett) AS sett_max
       FROM clicks_90d c
       GROUP BY c.sku
     )
@@ -58,14 +62,19 @@ async function findCrossTenantBurners(limit = 50, excludeSkus = []) {
     FROM cross_tenant ct
     LEFT JOIN sales_all s ON s.sku = ct.sku
     LEFT JOIN ord_reali_90d o ON o.sku = ct.sku
-    WHERE ct.n_tenant > 2
+    WHERE ct.n_tenant >= 2               -- direttiva 3/7: 2 o piu' tenant
+      AND ct.sett_max >= 2               -- click CONTINUI: almeno 2 settimane distinte
       AND COALESCE(s.store_tot,0) = 0
       AND COALESCE(s.aggr_max,0) = 0
       AND COALESCE(o.ord_90d,0) = 0
       AND ($2::text[] IS NULL OR NOT (ct.sku = ANY($2::text[])))
+      -- Brand protetti (strategia cliente, es. MPF): mai in OBLIO globale
+      AND ($3::text[] = '{}' OR UPPER(COALESCE(
+            (SELECT MAX(p2.brand) FROM products p2 WHERE p2.sku=ct.sku), ''))
+            <> ALL($3::text[]))
     ORDER BY ct.cost_tot DESC
     LIMIT $1
-  `, [limit, excludeSkus.length > 0 ? excludeSkus : null]);
+  `, [limit, excludeSkus.length > 0 ? excludeSkus : null, protectedBrands]);
   return rows;
 }
 
@@ -79,7 +88,17 @@ async function populateOblio(batchSize = POPOLA_BATCH_SIZE) {
   );
   const activeSkus = active.map(r => r.sku);
 
-  const burners = await findCrossTenantBurners(batchSize, activeSkus);
+  // Brand protetti di QUALSIASI tenant (strategia cliente): esclusi dall'OBLIO
+  // globale — la rimozione varrebbe ovunque, anche dove il brand e' investimento
+  const { rows: pbRows } = await pool.query(
+    `SELECT config_value FROM health_config WHERE config_key='killer_protected_brands'`
+  );
+  const protectedBrands = [...new Set(
+    pbRows.flatMap(r => (r.config_value || '').split(','))
+      .map(b => b.trim().toUpperCase()).filter(Boolean)
+  )];
+
+  const burners = await findCrossTenantBurners(batchSize, activeSkus, protectedBrands);
 
   let inserted = 0;
   for (const b of burners) {
@@ -90,7 +109,7 @@ async function populateOblio(batchSize = POPOLA_BATCH_SIZE) {
       ON CONFLICT DO NOTHING
     `, [
       b.sku, b.product_name, b.brand,
-      `Burner cross-tenant: ${b.n_tenant} tenant, ${b.click_tot} click, €${parseFloat(b.cost_tot).toFixed(2)} cost 30g, 0 vendite ovunque`,
+      `Burner cross-tenant: ${b.n_tenant} tenant, ${b.click_tot} click continui (2+ settimane), €${parseFloat(b.cost_tot).toFixed(2)} cost 15g, 0 vendite ovunque`,
       b.n_tenant, b.click_tot, b.cost_tot,
     ]);
     inserted++;
@@ -127,13 +146,13 @@ async function checkAndReleaseOblio() {
 
   const skuList = oblioSkus.map(o => o.sku);
 
-  // Verifica vendite (store/aggregated 30d + ord reali 90g) per ogni SKU
+  // Verifica vendite (store/aggregated 30d + ord reali 15g) per ogni SKU
   const { rows: stillBurner } = await pool.query(`
     WITH ord_reali_90d AS (
       SELECT oi.sku, COUNT(DISTINCT o.id) AS ord_90d
       FROM orders o JOIN order_items oi ON oi.order_id=o.id
       WHERE o.order_status NOT IN ('canceled','closed','pending_payment')
-        AND o.order_date >= NOW() - INTERVAL '90 days'
+        AND o.order_date >= NOW() - INTERVAL '15 days'
       GROUP BY oi.sku
     ),
     sales_all AS (

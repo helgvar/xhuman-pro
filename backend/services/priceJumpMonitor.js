@@ -58,8 +58,8 @@ async function runPriceJumpMonitor() {
     SELECT t.name AS tname, pre.tenant_id, pre.sku,
       pre.ord_pre AS ord_tot, COALESCE(r.ord_rec, 0) AS ord_rec,
       ROUND(pre.prezzo_pre::numeric, 2) AS prezzo_pre,
-      ROUND(COALESCE(r.prezzo_rec, COALESCE(p.applied_price, p.exported_price, p.sell_price))::numeric, 2) AS prezzo_recent,
-      ROUND(((COALESCE(r.prezzo_rec, COALESCE(p.applied_price, p.exported_price, p.sell_price)) / pre.prezzo_pre - 1) * 100)::numeric, 1) AS salto_pct,
+      ROUND(COALESCE(r.prezzo_rec, NULLIF(prezzo_vero_row(p.tenant_id, p.sku, p.applied_price, p.exported_price, p.sell_price), 0))::numeric, 2) AS prezzo_recent,
+      ROUND(((COALESCE(r.prezzo_rec, NULLIF(prezzo_vero_row(p.tenant_id, p.sku, p.applied_price, p.exported_price, p.sell_price), 0)) / pre.prezzo_pre - 1) * 100)::numeric, 1) AS salto_pct,
       CASE WHEN COALESCE(r.ord_rec, 0) = 0 THEN 'AMMUTOLITO'
            WHEN COALESCE(r.ord_rec, 0) < pre.ord_pre * 0.4 * (7.0/14) THEN 'DIMEZZATO'
            ELSE 'sopravvissuto' END AS firma,
@@ -81,7 +81,7 @@ async function runPriceJumpMonitor() {
       AND (
         (r.prezzo_rec IS NOT NULL AND r.prezzo_rec > pre.prezzo_pre * 1.03)
         OR (COALESCE(r.ord_rec, 0) < pre.ord_pre * 0.4 * (7.0/14)
-            AND COALESCE(p.applied_price, p.exported_price, p.sell_price) > pre.prezzo_pre * 1.03)
+            AND NULLIF(prezzo_vero_row(p.tenant_id, p.sku, p.applied_price, p.exported_price, p.sell_price), 0) > pre.prezzo_pre * 1.03)
       )
       AND NOT EXISTS (SELECT 1 FROM feed_killers fk WHERE fk.tenant_id = p.tenant_id AND fk.sku = p.sku AND fk.is_active)
       AND NOT EXISTS (SELECT 1 FROM feed_actions fa WHERE fa.tenant_id = p.tenant_id AND fa.sku = p.sku
@@ -237,7 +237,7 @@ async function runPriceJumpMonitor() {
       ),
       cand AS (
         SELECT a.tenant_id, a.sku, a.ord, p.sell_price, p.erp_cost,
-          COALESCE(p.applied_price, p.exported_price, p.sell_price) AS prezzo_eff,
+          NULLIF(prezzo_vero_row(p.tenant_id, p.sku, p.applied_price, p.exported_price, p.sell_price), 0) AS prezzo_eff,
           -- PREZZO SECCO (capo 21/8): prezzo_eff e sell_price sono SECCHI. Con
           -- MIN(total_price) confrontavamo mele con pere e alzavamo di ~2,83 EUR
           -- di media sopra il vero best esterno.

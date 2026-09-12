@@ -480,8 +480,12 @@ async function costruisciAzionePerControllo(tenantId, input) {
     // `sell_price` e' cieco sui prezzi applicati: e' il prezzo di listino del
     // catalogo, non quello con cui il prodotto sta in vetrina. Calcolare la
     // percentuale di taglio e i margini minimi su quel numero vuol dire
-    // misurare da un punto che non esiste. Il prezzo vero e' `applied_price`
-    // per chi e' DENTRO il feed, `exported_price` per chi e' fuori.
+    // misurare da un punto che non esiste.
+    //
+    // Il prezzo vero lo dice prezzo_vero_row() (mig 131/132), non un COALESCE
+    // scritto a mano: applied_price e' lo specchio di Magento e vale SOLO
+    // finche' un'azione viva lo tiene aggiornato. Morta l'azione il numero si
+    // fossilizza, e su quel fossile l'agente calcolava tagli e margini falsi.
     //
     // Il costo: `erp_cost` e' il minimo grossista, ma se il pezzo e' gia' sullo
     // scaffale il costo che conta e' quello che si e' pagato davvero
@@ -490,10 +494,8 @@ async function costruisciAzionePerControllo(tenantId, input) {
     const skus = (input.products || []).map(p => p.sku);
     const { rows: products } = await pool.query(`
       SELECT p.sku, p.brand, p.is_civetta, pr.rule_type,
-             COALESCE(
-               CASE WHEN p.is_civetta THEN p.applied_price ELSE p.exported_price END,
-               p.exported_price, p.applied_price, p.sell_price
-             ) AS prezzo_vero,
+             NULLIF(prezzo_vero_row(p.tenant_id, p.sku, p.applied_price,
+                                    p.exported_price, p.sell_price), 0) AS prezzo_vero,
              GREATEST(COALESCE(p.erp_cost, 0),
                       CASE WHEN COALESCE(p.erp_stock,0) > 0 THEN COALESCE(p.erp_purchase_cost, 0) ELSE 0 END
              ) AS costo_vero

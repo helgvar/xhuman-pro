@@ -84,8 +84,11 @@ async function runForAll() {
               AND fa.action IN ('PRICE_CUT', 'ADD')
           ) pc ON TRUE
           CROSS JOIN LATERAL (
-            SELECT COALESCE(pc.newprice, NULLIF(p.applied_price, 0),
-                            p.exported_price, p.sell_price) AS pz
+            -- mig 132: mai applied_price grezzo. Senza un'azione viva quel
+            -- numero e' un fossile: appliedPriceMirror non lo aggiorna piu'.
+            SELECT COALESCE(pc.newprice,
+                            NULLIF(prezzo_vero_row(p.tenant_id, p.sku, p.applied_price,
+                                                   p.exported_price, p.sell_price), 0)) AS pz
           ) v
           WHERE o.tenant_id = $1
             AND o.order_status = ANY($3::text[])

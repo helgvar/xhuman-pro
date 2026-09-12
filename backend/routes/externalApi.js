@@ -657,8 +657,11 @@ async function recalculateStableCache(tenantId) {
             AND fa.action IN ('PRICE_CUT', 'ADD')
         ) pc ON TRUE
         CROSS JOIN LATERAL (
-          SELECT COALESCE(pc.newprice, NULLIF(p.applied_price, 0),
-                          p.exported_price, p.sell_price) AS pz
+          -- mig 132: mai applied_price grezzo. Senza un'azione viva quel
+          -- numero e' un fossile: appliedPriceMirror non lo aggiorna piu'.
+          SELECT COALESCE(pc.newprice,
+                          NULLIF(prezzo_vero_row(p.tenant_id, p.sku, p.applied_price,
+                                                 p.exported_price, p.sell_price), 0)) AS pz
         ) v
         -- Concorrenti sul prezzo secco, scrape fresco (≤48h). La tabella è
         -- unica per (product_code, merchant): la nostra riga si esclude da sé

@@ -18,7 +18,8 @@
  *    sono entrambi lordi, quindi il rapporto non si sposta.
  *  - Costo vero alla sorgente: floor su erp_purchase_cost se c'e' stock fisico.
  *    Costo mancante = NON SO, lo SKU non si giudica (mai condannare al buio).
- *  - Prezzo esposto vero: applied_price -> exported_price -> sell_price
+ *  - Prezzo esposto vero: prezzo_vero_row() (mig 131/132). applied_price vale
+ *    solo finche' un'azione viva lo aggiorna; dopo e' un fossile.
  *    (sell_price da solo e' cieco sui prezzi applicati).
  *  - Scala del click: sotto MIN_CLICKS_TO_JUDGE lo zero vendite e' rumore.
  *    La soglia si misura su JUDGE_WINDOW_DAYS (90gg): il dry run del 15/8 ha
@@ -73,8 +74,10 @@ function budgetClicksBrackets(marginEur, brackets) {
 const MEASURE_SQL = `
 WITH px AS (
   SELECT p.tenant_id, p.sku, p.product_name,
-         COALESCE(NULLIF(p.applied_price, 0), NULLIF(p.exported_price, 0),
-                  NULLIF(p.sell_price, 0))                              AS prezzo,
+         -- mig 132: legge del prezzo, non applied_price grezzo. Il margine che
+         -- esce di qui decide max_click_budget, cioe' chi vive e chi muore.
+         NULLIF(prezzo_vero_row(p.tenant_id, p.sku, p.applied_price,
+                                p.exported_price, p.sell_price), 0)     AS prezzo,
          GREATEST(
            COALESCE(NULLIF(p.erp_cost, 0), 0),
            CASE WHEN COALESCE(p.erp_stock, 0) > 0
@@ -286,13 +289,13 @@ async function writeCounters(tenant, misura) {
       clicks_consumed = COALESCE(cl.click, 0),
       cost_consumed   = ROUND(COALESCE(cl.click, 0) * $3::numeric, 2),
       max_click_budget = ROUND(GREATEST(
-        (COALESCE(NULLIF(p.applied_price,0), NULLIF(p.exported_price,0), NULLIF(p.sell_price,0))
+        (NULLIF(prezzo_vero_row(p.tenant_id, p.sku, p.applied_price, p.exported_price, p.sell_price), 0)
          - GREATEST(COALESCE(NULLIF(p.erp_cost,0),0),
              CASE WHEN COALESCE(p.erp_stock,0) > 0
                   THEN COALESCE(p.erp_purchase_cost,0) ELSE 0 END)) * $5::numeric, 0), 2),
       budget_pct_used = LEAST(9999, ROUND(
         100.0 * COALESCE(cl.click,0) * $3::numeric / NULLIF(GREATEST(
-          (COALESCE(NULLIF(p.applied_price,0), NULLIF(p.exported_price,0), NULLIF(p.sell_price,0))
+          (NULLIF(prezzo_vero_row(p.tenant_id, p.sku, p.applied_price, p.exported_price, p.sell_price), 0)
            - GREATEST(COALESCE(NULLIF(p.erp_cost,0),0),
                CASE WHEN COALESCE(p.erp_stock,0) > 0
                     THEN COALESCE(p.erp_purchase_cost,0) ELSE 0 END)) * $5::numeric, 0), 0), 1)),

@@ -5,8 +5,22 @@
  * Magento: quando FB esporta i nostri PC, noi eravamo ciechi (ROVIGON: sito
  * €10,70, DB €10,89). Questo mirror legge ogni 2h il prezzo REALE da Magento
  * (special_price, fallback price) per gli SKU con azioni prezzo attive e lo
- * salva in products.applied_price. Le analisi su "cosa vende davvero il
- * tenant" usano COALESCE(applied_price, sell_price).
+ * salva in products.applied_price.
+ *
+ * SCADENZA DELLO SPECCHIO (ordine capo 12/09/2026). Il mirror rinfresca SOLO gli
+ * SKU con un feed_actions.recommended_price vivo. Morta l'azione, il valore
+ * restava congelato per sempre: 34.297 fossili, 18.432 in feed, scarto fino a
+ * 297 EUR. Un prezzo morto letto come vivo ha fatto danni veri, misurati:
+ *   - trg_veto_rialzi_universale azzerava in silenzio i tagli legittimi
+ *     (3.719 SKU sui tenant operativi in 30gg);
+ *   - merita_rilascio() trovava il prezzo sotto il pavimento e non apriva mai
+ *     le quarantene (i 251/251 bocciati dell'11/09);
+ *   - products.margin_pct risultava negativo su merce in utile (338 falsi).
+ * Adesso: niente azione viva, niente specchio. Il campo torna NULL e chi legge
+ * cade su exported_price / sell_price, cioe' sulla legge unica prezzo_vero()
+ * (mig 131).
+ *
+ * NON leggere mai applied_price da solo: usa prezzo_vero(tenant_id, sku).
  */
 
 const { pool } = require('../db/pool');
@@ -55,8 +69,33 @@ async function fetchPricesSafe(cfg, skus) {
   return result;
 }
 
+// Spegne lo specchio dove non c'e' piu' nessuno ad aggiornarlo. Gira PRIMA di
+// rileggere Magento, cosi' il campo non resta mai fossile piu' di un giro.
+// trg_feed_movement scatta solo su UPDATE OF is_civetta: nessuna riga sporca il
+// registro movimenti. trg_margin_vero invece ricalcola margin/margin_pct, che e'
+// esattamente quello che serve.
+async function scadiSpecchiMorti() {
+  const { rowCount } = await pool.query(`
+    UPDATE products p SET applied_price = NULL
+    WHERE p.applied_price IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM feed_actions a
+                      WHERE a.tenant_id = p.tenant_id AND a.sku = p.sku
+                        AND a.recommended_price IS NOT NULL)`);
+  if (rowCount > 0) {
+    console.log(`[AppliedPrice] specchi morti spenti: ${rowCount} (azione finita = prezzo non piu' verificabile)`);
+  }
+  return rowCount;
+}
+
 async function runAppliedPriceMirror() {
   const { getMagentoConfig } = require('./magentoSync');
+
+  let spenti = 0;
+  try {
+    spenti = await scadiSpecchiMorti();
+  } catch (e) {
+    console.error('[AppliedPrice] scadenza specchi fallita:', e.message);
+  }
 
   const { rows: tenants } = await pool.query(`
     SELECT t.id, t.name, COUNT(*) AS n
@@ -64,7 +103,7 @@ async function runAppliedPriceMirror() {
     WHERE fa.recommended_price IS NOT NULL AND t.status = 'active'
     GROUP BY t.id, t.name ORDER BY n DESC`);
 
-  const summary = [];
+  const summary = spenti > 0 ? [`specchi morti spenti: ${spenti}`] : [];
   for (const t of tenants) {
     try {
       const cfg = await getMagentoConfig(t.id);
@@ -111,4 +150,4 @@ function startAppliedPriceMirror() {
   console.log('[AppliedPrice] Cron started — ogni 2h, primo run tra 10 min');
 }
 
-module.exports = { runAppliedPriceMirror, startAppliedPriceMirror };
+module.exports = { runAppliedPriceMirror, startAppliedPriceMirror, scadiSpecchiMorti };

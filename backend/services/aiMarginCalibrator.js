@@ -65,24 +65,24 @@ async function runAiMarginCalibrator() {
       GROUP BY 1, 2 HAVING COUNT(DISTINCT o.id) >= 3
     )
     SELECT t.name AS tname, a.tenant_id, a.sku, a.ord,
-      ROUND(COALESCE(p.applied_price, p.exported_price, p.sell_price)::numeric, 2) AS eff,
+      ROUND(v.eff::numeric, 2) AS eff,
       p.sell_price AS listino, p.erp_cost,
-      ROUND((p.erp_cost * CASE WHEN COALESCE(p.applied_price, p.sell_price) < 10 THEN 1.18 ELSE 1.15 END)::numeric, 2) AS floor_std,
+      ROUND((p.erp_cost * CASE WHEN v.eff < 10 THEN 1.18 ELSE 1.15 END)::numeric, 2) AS floor_std,
       -- PREZZO SECCO (capo 21/8): applied/exported/sell_price sono SECCHI, quindi
       -- i vicini e la posizione si misurano su base_price. Col totale il
       -- calibrator vedeva tutti i competitor "sopra di noi" e alzava a vuoto.
       (SELECT MAX(sc.base_price) FROM scraper_competitors sc
        WHERE sc.product_code = a.sku AND sc.base_price > 0
          AND sc.scraped_at >= NOW() - INTERVAL '48 hours'  -- guardrail freschezza (retention 7g)
-         AND sc.base_price < COALESCE(p.applied_price, p.exported_price, p.sell_price) - 0.005) AS vicino_sotto,
+         AND sc.base_price < v.eff - 0.005) AS vicino_sotto,
       (SELECT MIN(sc.base_price) FROM scraper_competitors sc
        WHERE sc.product_code = a.sku AND sc.base_price > 0
          AND sc.scraped_at >= NOW() - INTERVAL '48 hours'  -- guardrail freschezza (retention 7g)
-         AND sc.base_price > COALESCE(p.applied_price, p.exported_price, p.sell_price) + 0.005) AS vicino_sopra,
+         AND sc.base_price > v.eff + 0.005) AS vicino_sopra,
       (SELECT COUNT(*) + 1 FROM scraper_competitors sc
        WHERE sc.product_code = a.sku AND sc.base_price > 0
          AND sc.scraped_at >= NOW() - INTERVAL '48 hours'  -- guardrail freschezza (retention 7g)
-         AND sc.base_price < COALESCE(p.applied_price, p.exported_price, p.sell_price)) AS pos,
+         AND sc.base_price < v.eff) AS pos,
       (SELECT pe.best_band FROM position_economics pe
        WHERE pe.tenant_id = a.tenant_id AND pe.sku = a.sku) AS banda_top,
       (SELECT dt.stato FROM demand_trends dt
@@ -90,6 +90,13 @@ async function runAiMarginCalibrator() {
     FROM alto a
     JOIN tenants t ON t.id = a.tenant_id AND t.name = ANY($1)
     JOIN products p ON p.tenant_id = a.tenant_id AND p.sku = a.sku
+    -- mig 132: il prezzo vivo si calcola UNA volta qui, non dentro le tre
+    -- sotto-query sui concorrenti (la' verrebbe rivalutato per ogni riga di
+    -- scraper_competitors). applied_price da solo e' un fossile quando l'azione
+    -- che lo teneva aggiornato e' morta, e questo motore ALZA i prezzi: su un
+    -- fossile basso vedeva spazio sopra che non esisteva.
+    CROSS JOIN LATERAL (SELECT NULLIF(prezzo_vero_row(p.tenant_id, p.sku, p.applied_price,
+                                                      p.exported_price, p.sell_price), 0) AS eff) v
     WHERE p.erp_cost > 0 AND p.saleable = true
       AND (p.erp_stock + COALESCE(p.supplier_stock, 0)) > 0
       AND NOT EXISTS (SELECT 1 FROM feed_killers fk WHERE fk.tenant_id = a.tenant_id AND fk.sku = a.sku AND fk.is_active)
@@ -98,7 +105,7 @@ async function runAiMarginCalibrator() {
       AND NOT EXISTS (SELECT 1 FROM health_config hc
         WHERE hc.tenant_id = a.tenant_id AND hc.config_key = 'killer_protected_brands'
           AND UPPER(COALESCE(p.brand, '')) = ANY(STRING_TO_ARRAY(UPPER(hc.config_value), ',')))
-    ORDER BY (a.ord * COALESCE(p.applied_price, p.sell_price)) DESC`,
+    ORDER BY (a.ord * v.eff) DESC`,
     [PIPE]);
 
   // Solo chi ha spazio: vicino_sopra almeno +3% del nostro eff

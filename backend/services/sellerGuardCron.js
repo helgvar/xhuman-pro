@@ -75,14 +75,15 @@ async function runSellerGuard() {
         LEFT(p.product_name, 30) nome,
         COALESCE(ck.c7,0) c7, COALESCE(ck.c14prec,0) c14prec,
         COALESCE(p.erp_stock,0)+COALESCE(p.supplier_stock,0) disp,
-        COALESCE(NULLIF(p.applied_price,0), NULLIF(p.exported_price,0), p.sell_price) vivo,
+        -- mig 132: legge del prezzo. applied_price vale solo con azione viva
+        NULLIF(prezzo_vero_row(p.tenant_id, p.sku, p.applied_price, p.exported_price, p.sell_price), 0) vivo,
         f.p1, ROUND((f.p1-0.01)::numeric,2) target,
         -- floor ALLINEATO all'igiene (feedHygieneCycle): stessa base GREATEST e
         -- stesso default 15 — altrimenti l'igiene delle 06:00 annulla i PC delle 07:10
         GREATEST(COALESCE(NULLIF(p.erp_cost,0),0),
                  CASE WHEN COALESCE(p.erp_stock,0)>0 THEN COALESCE(p.erp_purchase_cost,0) ELSE 0 END) costo,
         CASE WHEN op.floor_cfg > 0 THEN op.floor_cfg
-             WHEN COALESCE(NULLIF(p.applied_price,0),p.sell_price) < 10 THEN 18
+             WHEN NULLIF(prezzo_vero_row(p.tenant_id, p.sku, p.applied_price, p.exported_price, p.sell_price), 0) < 10 THEN 18
              ELSE 15 END floorpct,
         (EXISTS(SELECT 1 FROM feed_membership fm WHERE fm.tenant_id=op.id AND fm.sku=s.sku)) in_csv,
         (EXISTS(SELECT 1 FROM feed_quarantine q WHERE q.tenant_id=op.id AND q.sku=s.sku AND q.reactivated=false)) in_dieta,

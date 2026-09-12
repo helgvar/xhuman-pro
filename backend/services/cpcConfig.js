@@ -13,6 +13,10 @@
 const { pool } = require('../db/pool');
 
 const DEFAULT_CPC = 0.27;
+// `health_config.avg_tp_cpc` e' sempre il CPC NETTO (IVA esclusa). Il costo che
+// paghiamo davvero e' netto + IVA 22%: 0,27 -> 0,3294. Ogni cifra mostrata come
+// "spesa" o usata come numeratore di un'incidenza deve essere LORDA.
+const VAT_MULT = 1.22;
 const TTL_MS = 10 * 60 * 1000;
 
 const _cache = new Map(); // tenantId → { cpc, expires }
@@ -38,8 +42,14 @@ async function getTenantCpc(tenantId) {
   return cpc;
 }
 
+// CPC lordo = quello che esce davvero dal conto corrente. Usare questo per
+// spesa e incidenza; `getTenantCpc` resta il netto per chi confronta con tariffe.
+async function getTenantCpcGross(tenantId) {
+  return (await getTenantCpc(tenantId)) * VAT_MULT;
+}
+
 function invalidateCpcCache(tenantId) {
   if (tenantId) _cache.delete(tenantId); else _cache.clear();
 }
 
-module.exports = { getTenantCpc, invalidateCpcCache, DEFAULT_CPC };
+module.exports = { getTenantCpc, getTenantCpcGross, invalidateCpcCache, DEFAULT_CPC, VAT_MULT };

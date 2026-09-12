@@ -30,20 +30,29 @@ async function runPriceJumpMonitor() {
   //  A) sopravvissuti: venduto recente > venduto pre +3%
   //  B) ammutoliti/dimezzati: ordini recenti < 40% dei pre E prezzo ATTUALE
   //     (applied/exported/sell) > venduto pre +3%
+  // 🧾 IVA (ordine capo 21/08): tutti i prezzi e i costi si ragionano LORDI.
+  // `order_items.price` e `row_total` sono IVA ESCLUSA, mentre applied/exported/
+  // sell_price ed erp_cost sono IVA INCLUSA. Confrontarli faceva leggere un
+  // +22,0% da fermo — era solo l'aliquota. Due danni: il filtro d'ingresso a
+  // +3% lo sfondava ogni prodotto, e il ripristino (max fra floor e prezzo_pre)
+  // scriveva un prezzo netto come prezzo di vendita, regalando il 22%.
+  // 32 casi su 408, 4 finiti a scaffale. Ora la finestra storica esce lorda.
   const { rows: jumps } = await pool.query(`
     WITH pre AS (
-      SELECT o.tenant_id, oi.sku, COUNT(DISTINCT o.id) AS ord_pre, AVG(oi.price) AS prezzo_pre
+      SELECT o.tenant_id, oi.sku, COUNT(DISTINCT o.id) AS ord_pre, AVG(COALESCE(NULLIF(oi.row_total_incl_tax,0), oi.row_total) / NULLIF(oi.qty_ordered, 0)) AS prezzo_pre
       FROM orders o JOIN order_items oi ON oi.order_id = o.id
       WHERE (o.order_date AT TIME ZONE 'Europe/Rome')::date
           BETWEEN (NOW() AT TIME ZONE 'Europe/Rome')::date - 21 AND (NOW() AT TIME ZONE 'Europe/Rome')::date - 8
-        AND oi.price > 0 AND o.order_status NOT IN ('canceled','closed','pending_payment')
+        AND COALESCE(NULLIF(oi.row_total_incl_tax,0), oi.row_total) > 0 AND oi.qty_ordered > 0
+        AND o.order_status NOT IN ('canceled','closed','pending_payment')
       GROUP BY 1, 2 HAVING COUNT(DISTINCT o.id) >= 3
     ),
     recenti AS (
-      SELECT o.tenant_id, oi.sku, COUNT(DISTINCT o.id) AS ord_rec, AVG(oi.price) AS prezzo_rec
+      SELECT o.tenant_id, oi.sku, COUNT(DISTINCT o.id) AS ord_rec, AVG(COALESCE(NULLIF(oi.row_total_incl_tax,0), oi.row_total) / NULLIF(oi.qty_ordered, 0)) AS prezzo_rec
       FROM orders o JOIN order_items oi ON oi.order_id = o.id
       WHERE (o.order_date AT TIME ZONE 'Europe/Rome')::date >= (NOW() AT TIME ZONE 'Europe/Rome')::date - 7
-        AND oi.price > 0 AND o.order_status NOT IN ('canceled','closed','pending_payment')
+        AND COALESCE(NULLIF(oi.row_total_incl_tax,0), oi.row_total) > 0 AND oi.qty_ordered > 0
+        AND o.order_status NOT IN ('canceled','closed','pending_payment')
       GROUP BY 1, 2
     )
     SELECT t.name AS tname, pre.tenant_id, pre.sku,
@@ -54,7 +63,7 @@ async function runPriceJumpMonitor() {
       CASE WHEN COALESCE(r.ord_rec, 0) = 0 THEN 'AMMUTOLITO'
            WHEN COALESCE(r.ord_rec, 0) < pre.ord_pre * 0.4 * (7.0/14) THEN 'DIMEZZATO'
            ELSE 'sopravvissuto' END AS firma,
-      p.sell_price, p.erp_cost, p.erp_stock,
+      p.sell_price, p.erp_cost, p.erp_stock, p.supplier_min_cost, p.supplier_stock,
       ROUND(phs.scraper_position) AS pos_now,
       -- floor basso SOLO fornitura esterna pura: erp_stock=0 obbligatorio
       (p.erp_stock = 0 AND COALESCE((SELECT pr.rule_name ~* 'grossist' FROM price_rules pr
@@ -87,6 +96,32 @@ async function runPriceJumpMonitor() {
     const floorPrice = Math.round(parseFloat(j.erp_cost) * (1 + floorPct / 100) * 100) / 100;
     const newPrice = Math.max(floorPrice, parseFloat(j.prezzo_pre));
     const anchor = Math.max(parseFloat(j.sell_price), parseFloat(j.prezzo_recent));
+
+    // 🩸 COSTO PONDERATO (5/8, corretto in giornata dopo il rilievo del capo).
+    // erp_cost NON e' un dato sballato: e' l'acquisto vero dei pezzi a scaffale
+    // (erp_purchase_cost identico su 802 SKU su 802 in rete). Il difetto e' che
+    // il floor lo applicava a TUTTI i pezzi, anche alle centinaia del grossista
+    // che costano molto di piu'. Su LACTOFLORENE REPAIR IBS (4 pezzi a 0,37,
+    // 296 a 5,95) chiedeva tagli a 5,54: 158 PRICE_CUT in 10 giorni, mai
+    // applicati, che intanto lo tenevano in feed (il ramo PRICE_CUT della build
+    // lo esenta pure dal filtro strict).
+    // Il costo giusto e' la media pesata sulle giacenze: chi ha lo scaffale
+    // profondo comprato bene deve poterlo vendere (regola "spingi magazzino"),
+    // chi ha 4 pezzi su 300 no. Sotto quel costo non si taglia: e' materia da
+    // feed, non da price cut. Nessun rialzo, si salta e basta.
+    const stkErp = parseFloat(j.erp_stock) || 0;
+    const stkGr = parseFloat(j.supplier_stock) || 0;
+    const cErp = parseFloat(j.erp_cost) || 0;
+    const cGr = parseFloat(j.supplier_min_cost) || cErp;
+    const costoPesato = (stkErp + stkGr) > 0
+      ? (stkErp * cErp + stkGr * cGr) / (stkErp + stkGr)
+      : Math.max(cErp, cGr);
+    if (newPrice < costoPesato) {
+      perTenant[j.tname].report.push(
+        `${j.sku} SOTTO COSTO PONDERATO: ripristino €${newPrice} < costo €${costoPesato.toFixed(2)} ` +
+        `(scaffale ${stkErp}@${cErp.toFixed(2)}, grossista ${stkGr}@${cGr.toFixed(2)}) — saltato`);
+      continue;
+    }
 
     if (PIPE_ATTIVA.includes(j.tname) && newPrice < anchor - 0.05) {
       // ARBITRO (14/7): l'auto-fix si firma — era il grosso degli "anonimi"
@@ -203,8 +238,11 @@ async function runPriceJumpMonitor() {
       cand AS (
         SELECT a.tenant_id, a.sku, a.ord, p.sell_price, p.erp_cost,
           COALESCE(p.applied_price, p.exported_price, p.sell_price) AS prezzo_eff,
-          (SELECT MIN(sc.total_price) FROM scraper_competitors sc
-           WHERE sc.product_code = a.sku AND sc.total_price > 0
+          -- PREZZO SECCO (capo 21/8): prezzo_eff e sell_price sono SECCHI. Con
+          -- MIN(total_price) confrontavamo mele con pere e alzavamo di ~2,83 EUR
+          -- di media sopra il vero best esterno.
+          (SELECT MIN(sc.base_price) FROM scraper_competitors sc
+           WHERE sc.product_code = a.sku AND sc.base_price > 0
              -- guardrail freschezza (retention 7g dal 11/7): prezzi solo da scrape recente
              AND sc.scraped_at >= NOW() - INTERVAL '48 hours'
              AND sc.merchant !~* 'personal farma|subitofarma|san vito|procaccini|farmacri|mandanici|farmainsieme|ospedale|farmacia papa|farmastelia') AS best_esterno
@@ -256,10 +294,16 @@ async function runPriceJumpMonitor() {
   }
 
   if (jumps.length > 0) {
-    let msg = `📈🔻 <b>Price Jump Monitor</b>: ${jumps.length} venditori col prezzo salito >3% (7gg vs 8-21gg)\n\n`;
+    // Le righe di report contengono '<' (es. "ripristino €X < costo €Y"):
+    // in parseMode HTML Telegram lo legge come tag aperto e rifiuta TUTTO il
+    // messaggio ("can't parse entities: Unsupported start tag"). Dal 13/8 gli
+    // alert non arrivavano più. Si scappa tutto ciò che è interpolato; i <b>
+    // del template restano.
+    const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    let msg = `📈🔻 <b>Price Jump Monitor</b>: ${jumps.length} venditori col prezzo salito &gt;3% (7gg vs 8-21gg)\n\n`;
     for (const [name, d] of Object.entries(perTenant)) {
-      msg += `<b>${name}</b>: ${d.fix} auto-fix`;
-      if (d.report.length) msg += ` | da segnalare al cliente: ${d.report.length}\n` + d.report.slice(0, 5).map(r => `  ${r}`).join('\n');
+      msg += `<b>${esc(name)}</b>: ${d.fix} auto-fix`;
+      if (d.report.length) msg += ` | da segnalare al cliente: ${d.report.length}\n` + d.report.slice(0, 5).map(r => `  ${esc(r)}`).join('\n');
       msg += '\n';
     }
     try { await sendTelegram(msg.slice(0, 3900), { key: 'price_jump', parseMode: 'HTML', throttleMs: 12 * 3600 * 1000 }); } catch {}

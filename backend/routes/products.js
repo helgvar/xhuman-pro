@@ -314,9 +314,13 @@ router.get('/:sku/history', requireRole('superadmin', 'admin', 'viewer'), async 
          FROM product_cost_history WHERE tenant_id = $1 AND sku = $2 ORDER BY data, source`,
       [tenantId, sku]
     );
+    // La source va restituita: dal 6/8 (mig 094) la tabella tiene tre serie
+    // distinte — fb_pubblico (listino), applicato (quello che incassa),
+    // esportato (quello che vede Trovaprezzi) — e senza la colonna sembrerebbe
+    // una serie sola che salta avanti e indietro.
     const price = await pool.query(
-      `SELECT to_char(data,'YYYY-MM-DD') AS data, ROUND(prezzo::numeric, 4) AS prezzo
-         FROM product_price_history WHERE tenant_id = $1 AND sku = $2 ORDER BY data`,
+      `SELECT to_char(data,'YYYY-MM-DD') AS data, source, ROUND(prezzo::numeric, 4) AS prezzo
+         FROM product_price_history WHERE tenant_id = $1 AND sku = $2 ORDER BY data, source`,
       [tenantId, sku]
     );
     res.json({ sku, cost: cost.rows, price: price.rows });

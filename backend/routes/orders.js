@@ -3,7 +3,7 @@ const { pool } = require('../db/pool');
 const { authMiddleware } = require('../middleware/auth');
 const { tenantMiddleware } = require('../middleware/tenant');
 const { requireRole } = require('../middleware/acl');
-const { importOrders } = require('../services/magentoOrders');
+const { importOrders, VALID_STATUSES } = require('../services/magentoOrders');
 
 const router = express.Router();
 
@@ -77,14 +77,16 @@ router.get('/stats', requireRole('superadmin', 'admin', 'viewer'), async (req, r
          COUNT(CASE WHEN order_status = 'complete' THEN 1 END) as complete_orders,
          COUNT(CASE WHEN order_status = 'processing' THEN 1 END) as processing_orders,
          COUNT(CASE WHEN order_status = 'pending' THEN 1 END) as pending_orders,
-         COALESCE(SUM(grand_total_products), 0) as total_revenue,
+         COUNT(CASE WHEN order_status = 'canceled' THEN 1 END) as canceled_orders,
+         -- fatturato solo su ordini reali: l'annullato si vede nei conteggi, mai negli euro
+         COALESCE(SUM(grand_total_products) FILTER (WHERE order_status = ANY($2)), 0) as total_revenue,
          MIN(order_date) as oldest_order,
          MAX(order_date) as newest_order,
          (SELECT completed_at FROM import_jobs
           WHERE tenant_id = $1 AND job_type IN ('orders', 'orders_sync')
             AND status = 'completed' ORDER BY completed_at DESC LIMIT 1) as last_import_at
        FROM orders WHERE tenant_id = $1`,
-      [tenantId]
+      [tenantId, VALID_STATUSES]
     );
 
     res.json({ stats: rows[0] });
@@ -108,7 +110,7 @@ router.get('/:id', requireRole('superadmin', 'admin', 'viewer'), async (req, res
     }
 
     const { rows: items } = await pool.query(
-      `SELECT sku, product_name, qty_ordered, price, row_total
+      `SELECT sku, product_name, qty_ordered, price, row_total, row_total_incl_tax
        FROM order_items WHERE order_id = $1 ORDER BY product_name`,
       [req.params.id]
     );

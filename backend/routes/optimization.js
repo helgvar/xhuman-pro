@@ -4,6 +4,13 @@ const { authMiddleware } = require('../middleware/auth');
 const { tenantMiddleware } = require('../middleware/tenant');
 const { requireRole } = require('../middleware/acl');
 const { computeHealthScores, getGlobalPnl, getWeeklyBreakdown } = require('../services/productHealth');
+const { getTenantCpcGross, VAT_MULT } = require('../services/cpcConfig');
+
+// Fatturato "vero" per ogni incidenza mostrata a video: quello che il cliente ha
+// pagato per i PRODOTTI. `grand_total` include la spedizione (va tolta, non e'
+// vendita); `grand_total_products` e' IVA ESCLUSA (= SUM(row_total)) e sgonfia il
+// denominatore del 14%. L'unico campo giusto e' grand_total - shipping_incl_tax.
+const REVENUE_EXPR = '(o.grand_total - COALESCE(o.shipping_incl_tax, 0))';
 
 const router = express.Router();
 
@@ -36,17 +43,19 @@ router.get('/kpi-range', requireRole('superadmin', 'admin', 'viewer'), async (re
         FROM zombie_clicks WHERE tenant_id = $1 AND fetch_date >= $2::date AND fetch_date <= $3::date
       `, [tenantId, dateFrom, dateTo]);
 
-      // Ordini Magento (stesso periodo dei click)
+      // Ordini Magento (stesso periodo dei click). Niente JOIN sugli items: il
+      // fatturato sta sulla testata, unirlo alle righe lo moltiplicherebbe.
       const { rows: [orders] } = await pool.query(`
-        SELECT COUNT(DISTINCT o.id) as ordini, ROUND(COALESCE(SUM(oi.row_total), 0)::numeric, 2) as revenue
-        FROM orders o JOIN order_items oi ON oi.order_id = o.id
+        SELECT COUNT(*) as ordini, ROUND(COALESCE(SUM(${REVENUE_EXPR}), 0)::numeric, 2) as revenue
+        FROM orders o
         WHERE o.tenant_id = $1 AND o.order_date::date >= $2::date AND o.order_date::date <= $3::date
           AND o.order_status NOT IN ('canceled','closed','pending_payment')
       `, [tenantId, dateFrom, dateTo]);
 
-      // Ordini solo da prodotti civetta (attribuibili a TP)
+      // Ordini solo da prodotti civetta (attribuibili a TP). Qui serve la riga,
+      // quindi row_total_incl_tax: e' l'unico campo di riga con l'IVA dentro.
       const { rows: [civettaOrders] } = await pool.query(`
-        SELECT COUNT(DISTINCT o.id) as ordini, ROUND(COALESCE(SUM(oi.row_total), 0)::numeric, 2) as revenue
+        SELECT COUNT(DISTINCT o.id) as ordini, ROUND(COALESCE(SUM(oi.row_total_incl_tax), 0)::numeric, 2) as revenue
         FROM orders o JOIN order_items oi ON oi.order_id = o.id
         JOIN products p ON p.sku = oi.sku AND p.tenant_id = o.tenant_id AND p.is_civetta = true
         WHERE o.tenant_id = $1 AND o.order_date::date >= $2::date AND o.order_date::date <= $3::date
@@ -54,7 +63,7 @@ router.get('/kpi-range', requireRole('superadmin', 'admin', 'viewer'), async (re
       `, [tenantId, dateFrom, dateTo]);
 
       const clickCount = parseInt(clicks.click) || 0;
-      const clickCost = +(clickCount * 0.27).toFixed(2);
+      const clickCost = +(clickCount * await getTenantCpcGross(tenantId)).toFixed(2);
       const storeRevenue = parseFloat(orders.revenue) || 0;
       const civettaRevenue = parseFloat(civettaOrders.revenue) || 0;
 
@@ -602,7 +611,7 @@ router.get('/dashboard', requireRole('superadmin', 'admin', 'viewer'), async (re
     );
     const cfg = {};
     for (const r of cfgRows) cfg[r.config_key] = r.config_value;
-    const cpc = parseFloat(cfg.avg_tp_cpc) || 0.27;
+    const cpc = (parseFloat(cfg.avg_tp_cpc) || 0.27) * VAT_MULT;  // lordo: netto tenant + IVA 22%
     const tpDirectRevenue = parseFloat(cfg.ga4_tp_revenue_30d) || 0;
     const tpIndirectRevenue = parseFloat(cfg.ga4_cross_session_revenue_30d) || 0;
     const tpAttributedTotal = +(tpDirectRevenue + tpIndirectRevenue).toFixed(2);
@@ -637,7 +646,7 @@ router.get('/dashboard', requireRole('superadmin', 'admin', 'viewer'), async (re
       ),
       orders30 AS (
         SELECT COUNT(DISTINCT o.id) AS total_orders,
-               COALESCE(SUM(o.grand_total), 0) AS total_revenue
+               COALESCE(SUM(${REVENUE_EXPR}), 0) AS total_revenue
         FROM orders o
         JOIN active_days a ON a.d = o.order_date::date
         WHERE o.tenant_id = $1 AND o.order_status IN ('pending','processing','complete','ritiro_farmacia','Ritirato','ritiro_sede_tmp')
@@ -724,6 +733,7 @@ router.get('/dashboard', requireRole('superadmin', 'admin', 'viewer'), async (re
         totalClicks,
         totalOrders,
         clickCost: totalClickCost,
+        cpc: +cpc.toFixed(4),                        // CPC lordo usato (netto tenant + IVA 22%)
         // Feed feedo source-of-truth (stable_feed_codes) — cio' che davvero arriva a TP
         feedTotal: feedTotalSize,
         toRemove: removedSize,
@@ -779,7 +789,7 @@ router.get('/segments', requireRole('superadmin', 'admin', 'viewer'), async (req
           AND o.order_date::date >= CURRENT_DATE - 30
         GROUP BY 1
       ),
-      cfg AS (SELECT COALESCE(MAX(config_value)::numeric, 0.27) cpc FROM health_config WHERE tenant_id=$1 AND config_key='avg_tp_cpc')
+      cfg AS (SELECT COALESCE(MAX(config_value)::numeric, 0.27) * 1.22 cpc FROM health_config WHERE tenant_id=$1 AND config_key='avg_tp_cpc')
       SELECT COUNT(*)::int n,
              COALESCE(SUM(zc.clicks), 0)::int clicks,
              ROUND((COALESCE(SUM(zc.clicks), 0) * (SELECT cpc FROM cfg))::numeric, 2)::float cost
@@ -862,7 +872,7 @@ router.get('/segments/:type', requireRole('superadmin', 'admin', 'viewer'), asyn
             AND o.order_date::date >= CURRENT_DATE - 30
           GROUP BY 1
         ),
-        cfg AS (SELECT COALESCE(MAX(config_value)::numeric, 0.27) cpc FROM health_config WHERE tenant_id=$1 AND config_key='avg_tp_cpc')
+        cfg AS (SELECT COALESCE(MAX(config_value)::numeric, 0.27) * 1.22 cpc FROM health_config WHERE tenant_id=$1 AND config_key='avg_tp_cpc')
         SELECT zc.sku, zc.clicks::int,
                ROUND((zc.clicks * (SELECT cpc FROM cfg))::numeric, 2)::float cost,
                p.sell_price::float, p.margin_pct::float, p.is_civetta,
@@ -985,12 +995,12 @@ async function getDailyTrend(tenantId, days, ga4StartDate) {
       FROM zombie_clicks WHERE tenant_id = $1 GROUP BY 1
     ),
     orders_d AS (
-      SELECT (order_date AT TIME ZONE 'Europe/Rome')::date d, COUNT(*) o, SUM(grand_total) r
-      FROM orders
-      WHERE tenant_id = $1 AND order_status IN ('pending','processing','complete','ritiro_farmacia','Ritirato','ritiro_sede_tmp')
+      SELECT (o.order_date AT TIME ZONE 'Europe/Rome')::date d, COUNT(*) o, SUM(${REVENUE_EXPR}) r
+      FROM orders o
+      WHERE o.tenant_id = $1 AND o.order_status IN ('pending','processing','complete','ritiro_farmacia','Ritirato','ritiro_sede_tmp')
       GROUP BY 1
     ),
-    cfg AS (SELECT COALESCE(MAX(config_value)::numeric, 0.27) cpc FROM health_config WHERE tenant_id=$1 AND config_key='avg_tp_cpc')
+    cfg AS (SELECT COALESCE(MAX(config_value)::numeric, 0.27) * 1.22 cpc FROM health_config WHERE tenant_id=$1 AND config_key='avg_tp_cpc')
     SELECT d.d::text AS date,
            COALESCE(clicks.c, 0)::int AS clicks,
            ROUND((COALESCE(clicks.c, 0) * (SELECT cpc FROM cfg))::numeric, 2)::float AS cost,
@@ -1485,16 +1495,17 @@ router.get('/category-rules', requireRole('superadmin', 'admin', 'viewer'), asyn
     const enabled = enabledCfg?.config_value === 'true';
 
     // Stats per category
+    const catCpc = await getTenantCpcGross(req.tenantId);
     const { rows: categories } = await pool.query(`
       SELECT zc.trovaprezzi_category as category,
         COUNT(DISTINCT zc.product_code) as products,
         SUM(zc.clicks) as clicks,
-        ROUND(SUM(zc.clicks) * 0.27, 2) as cost,
+        ROUND(SUM(zc.clicks) * $2::numeric, 2) as cost,
         COUNT(DISTINCT zc.product_code) FILTER (WHERE ph.tp_attributed_orders > 0) as with_orders,
         COALESCE(SUM(ph.tp_attributed_orders), 0) as orders,
         ROUND(COALESCE(SUM(ph.tp_attributed_revenue), 0)::numeric, 2) as revenue,
         CASE WHEN SUM(ph.tp_attributed_revenue) > 0
-          THEN ROUND((SUM(zc.clicks) * 0.27 / SUM(ph.tp_attributed_revenue) * 100)::numeric, 1)
+          THEN ROUND((SUM(zc.clicks) * $2::numeric / SUM(ph.tp_attributed_revenue) * 100)::numeric, 1)
           ELSE NULL END as incidence,
         ROUND(AVG(p.margin_pct)::numeric, 1) as avg_margin
       FROM zombie_clicks zc
@@ -1505,7 +1516,7 @@ router.get('/category-rules', requireRole('superadmin', 'admin', 'viewer'), asyn
       GROUP BY zc.trovaprezzi_category
       HAVING SUM(zc.clicks) >= 5
       ORDER BY SUM(zc.clicks) DESC
-    `, [req.tenantId]);
+    `, [req.tenantId, catCpc]);
 
     // Merge rules with stats
     const merged = categories.map(c => ({

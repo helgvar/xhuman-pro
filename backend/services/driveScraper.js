@@ -10,6 +10,20 @@
  *
  * Prices use Italian format (comma = decimal, quotes around prices).
  * Reviews use Italian format (dot = thousands separator).
+ *
+ * ⏱️ Il timestamp dentro il CSV è ora di BUCAREST (UTC+3), non UTC: un file
+ * creato su Drive alle 15:01:11Z porta righe timbrate 18:00:08 — tre ore
+ * esatte, verificato l'11/8/2026 su results.csv, hot_results.csv e
+ * hot_changes.csv. Scritto com'era, mandava 319.426 righe nel FUTURO e faceva
+ * sembrare tutto 3 ore più fresco di quanto fosse. La conversione la fa
+ * Postgres (`AT TIME ZONE 'Europe/Bucharest'`), non JS: così l'ora legale è
+ * gestita dal database e non da un +3 scritto a mano.
+ *
+ * 📦 CADENZA NUOVA (ordine capo 11/8 sera): file piccoli (~2.000 prodotti)
+ * ogni 15 minuti invece di un file gigante ogni 4-5 ore. Non si prendono più
+ * "gli ultimi N file per tipo": si prende OGNI file mai visto (registro
+ * `scraper_files_seen`), e ogni file si fonde nella base completa con UPSERT —
+ * i piccoli aggiornano, non sostituiscono.
  */
 
 const { google } = require('googleapis');
@@ -20,7 +34,19 @@ const MAX_FILE_SIZE = 500 * 1024 * 1024; // 500MB (12/7: FB ha consegnato un res
 const MAX_FILES_AGE_HOURS = 72;
 const BATCH_DOWNLOAD_SIZE = 2;
 const BATCH_DELAY_MS = 500;
-const MAX_FILES_PER_TYPE = 2; // Only latest N files per type (results/walls)
+// Tetto per GIRO, non per tipo: i file nuovi non si perdono, si smaltiscono
+// nei giri successivi (il poller passa ogni 5 minuti). Serve solo a non far
+// durare un'ora il primo giro quando c'è un arretrato di file grossi.
+const MAX_FILES_PER_RUN = 8;
+
+// Nomi consegnati dal fornitore. results/walls hanno lo stesso formato
+// posizionale; top_results è la mappa dei listing (parser suo).
+const NOMI_DETTAGLIO = ['results.csv', 'walls.csv'];
+const NOMI_MAPPA = ['top_results.csv'];
+// 🚫 ORDINE CAPO 11/8 sera: "hot_results e hot_change ignorali, i file sono
+// sempre results". Elencati qui e non fra gli sconosciuti, così il log non
+// urla a ogni giro per file che scartiamo di proposito.
+const NOMI_IGNORATI = ['hot_results.csv', 'hot_changes.csv'];
 
 /**
  * Get Google Drive client using service account credentials from DB
@@ -68,7 +94,7 @@ async function getDriveClient(tenantId) {
 /**
  * List CSV files in Drive folder (results.csv + walls.csv only)
  */
-async function listScraperFiles(drive, folderId) {
+async function listScraperFiles(drive, folderId, opts = {}) {
   const cutoff = new Date(Date.now() - MAX_FILES_AGE_HOURS * 3600 * 1000).toISOString();
 
   let allFiles = [];
@@ -76,9 +102,17 @@ async function listScraperFiles(drive, folderId) {
 
   do {
     const resp = await drive.files.list({
-      q: `'${folderId}' in parents AND (mimeType = 'text/csv' OR mimeType = 'application/octet-stream') AND trashed = false AND createdTime > '${cutoff}'`,
-      fields: 'nextPageToken, files(id, name, createdTime, size)',
-      orderBy: 'createdTime asc',
+      // Finestra su modifiedTime e non su createdTime: se il fornitore
+      // sovrascrive un file al posto di caricarne uno nuovo, createdTime resta
+      // vecchio e il file sparirebbe dall'elenco pur essendo appena cambiato.
+      // I fogli Google entrano nell'elenco solo per essere DETTI: non si
+      // scaricano con alt=media e l'export sopra i 10 MB Drive lo rifiuta
+      // ("This file is too large to be exported"). Senza di loro nell'elenco
+      // il buco era invisibile: 2 file 'results' da 8 MB dell'11/8 non li
+      // vedeva nessuno, nemmeno il log dei nomi sconosciuti.
+      q: `'${folderId}' in parents AND (mimeType = 'text/csv' OR mimeType = 'application/octet-stream' OR mimeType = 'application/vnd.google-apps.spreadsheet') AND trashed = false AND modifiedTime > '${cutoff}'`,
+      fields: 'nextPageToken, files(id, name, mimeType, createdTime, modifiedTime, size)',
+      orderBy: 'modifiedTime asc',
       pageSize: 1000,
       pageToken,
     });
@@ -86,15 +120,24 @@ async function listScraperFiles(drive, folderId) {
     pageToken = resp.data.nextPageToken;
   } while (pageToken);
 
-  // results.csv/walls.csv = dettaglio competitor; top_results.csv = MAPPA dei
+  // results/walls/hot_* = dettaglio competitor; top_results.csv = MAPPA dei
   // listing visitati dallo scraper (~23k/passaggio). Scartarla ci rendeva ciechi
   // sulla copertura reale (scoperto 11/7: FB scrappa tutto, noi vedevamo solo
   // la fetta a rotazione dei results.csv)
-  const scraperFiles = allFiles.filter(f =>
-    f.name === 'results.csv' || f.name === 'walls.csv' || f.name === 'top_results.csv'
-  );
+  const noti = [...NOMI_DETTAGLIO, ...NOMI_MAPPA];
+  const eFoglio = f => f.mimeType === 'application/vnd.google-apps.spreadsheet';
+  const scraperFiles = allFiles.filter(f => noti.includes(f.name) && !eFoglio(f));
 
-  // Skip files > 200MB
+  // Nomi che non conosciamo: non li ingeriamo alla cieca, ma li DICIAMO. Un
+  // file scartato in silenzio è un buco che nessuno scopre (es. 'results'
+  // senza estensione, 8MB, visto l'11/8).
+  const ignorati = allFiles.filter(f => (!noti.includes(f.name) || eFoglio(f)) && !NOMI_IGNORATI.includes(f.name));
+  if (ignorati.length > 0) {
+    const nomi = [...new Set(ignorati.map(f => `${f.name}${eFoglio(f) ? ' [foglio Google]' : ''}`))].join(', ');
+    console.log(`[DriveScraper] ${ignorati.length} file con nome non riconosciuto, ignorati: ${nomi}`);
+  }
+
+  // Skip files troppo grossi
   const validFiles = scraperFiles.filter(f => {
     const size = parseInt(f.size || 0);
     if (size > MAX_FILE_SIZE) {
@@ -104,17 +147,49 @@ async function listScraperFiles(drive, folderId) {
     return true;
   });
 
-  // Only keep latest N files per type (they're sorted asc, so take from end)
-  const resultFiles = validFiles.filter(f => f.name === 'results.csv').slice(-MAX_FILES_PER_TYPE);
-  const wallFiles = validFiles.filter(f => f.name === 'walls.csv').slice(-MAX_FILES_PER_TYPE);
-  const topFiles = validFiles.filter(f => f.name === 'top_results.csv').slice(-MAX_FILES_PER_TYPE);
-  // Return in chronological order (older first for correct merge)
-  const selected = [...resultFiles, ...wallFiles, ...topFiles].sort((a, b) =>
-    new Date(a.createdTime) - new Date(b.createdTime)
-  );
+  // Controllo a mano: si vuole l'elenco intero, registro compreso, e lo
+  // sfoltimento lo fa chi chiama (nessun log, non è un giro di ingestione).
+  if (opts.ignoraRegistro) return validFiles;
 
-  console.log(`[DriveScraper] Selected ${selected.length} files (${resultFiles.length} results + ${wallFiles.length} walls + ${topFiles.length} top) from ${validFiles.length} total`);
+  // Fuori quelli già ingeriti: chiave (id, modified_time). Stesso id con
+  // modified_time nuovo = il fornitore ha sovrascritto, si rifà.
+  const { rows: visti } = await pool.query(
+    `SELECT file_id, modified_time FROM scraper_files_seen WHERE file_id = ANY($1::text[])`,
+    [validFiles.map(f => f.id)]
+  );
+  const vistoAl = new Map(visti.map(r => [r.file_id, r.modified_time ? new Date(r.modified_time).getTime() : 0]));
+  const nuovi = validFiles.filter(f => {
+    const t = vistoAl.get(f.id);
+    if (t === undefined) return true;
+    return new Date(f.modifiedTime || f.createdTime).getTime() > t;
+  });
+
+  // Ordine cronologico (il più vecchio per primo: chi arriva dopo sovrascrive)
+  nuovi.sort((a, b) => new Date(a.modifiedTime || a.createdTime) - new Date(b.modifiedTime || b.createdTime));
+  const selected = nuovi.slice(0, MAX_FILES_PER_RUN);
+  const rimandati = nuovi.length - selected.length;
+
+  console.log(`[DriveScraper] ${validFiles.length} file in finestra ${MAX_FILES_AGE_HOURS}h, ${nuovi.length} mai visti, ne prendo ${selected.length}${rimandati > 0 ? ` (${rimandati} al giro dopo)` : ''}`);
   return selected;
+}
+
+/**
+ * Segna un file come ingerito. Si scrive DOPO il salvataggio: se il processo
+ * muore a metà, il file resta "mai visto" e al giro dopo si rifà — meglio
+ * rifare (l'UPSERT è idempotente) che perdere una consegna.
+ */
+async function segnaFileVisto(f, righe) {
+  await pool.query(
+    `INSERT INTO scraper_files_seen (file_id, file_name, created_time, modified_time, size_bytes, rows_parsed)
+     VALUES ($1, $2, $3::timestamptz, $4::timestamptz, $5, $6)
+     ON CONFLICT (file_id) DO UPDATE SET
+       modified_time = EXCLUDED.modified_time,
+       size_bytes = EXCLUDED.size_bytes,
+       rows_parsed = EXCLUDED.rows_parsed,
+       processed_at = NOW()`,
+    [f.id, f.name, f.createdTime || null, f.modifiedTime || f.createdTime || null,
+     parseInt(f.size || 0) || null, righe]
+  ).catch(e => console.error(`[DriveScraper] registro file err (${f.name}): ${e.message}`));
 }
 
 /**
@@ -233,12 +308,14 @@ async function persistListingMap(rows) {
     const params = [];
     batch.forEach((r, j) => {
       const b = j * 4;
-      vals.push(`($${b + 1},$${b + 2},$${b + 3},$${b + 4}::timestamptz)`);
+      vals.push(`($${b + 1},$${b + 2},$${b + 3},$${b + 4}::timestamp)`);
       params.push(r.code, r.url, r.name, r.scrapedAt);
     });
     await pool.query(
+      // ts arriva senza fuso ed è ora di Bucarest: la conversione la fa il DB
       `INSERT INTO scraper_listing_map (product_code, tp_url, tp_name, first_seen, last_seen)
-       SELECT v.code, v.url, v.name, v.ts, v.ts
+       SELECT v.code, v.url, v.name,
+              (v.ts AT TIME ZONE 'Europe/Bucharest'), (v.ts AT TIME ZONE 'Europe/Bucharest')
        FROM (VALUES ${vals.join(',')}) v(code, url, name, ts)
        ON CONFLICT (product_code) DO UPDATE SET
          tp_url = EXCLUDED.tp_url, tp_name = EXCLUDED.tp_name,
@@ -253,13 +330,47 @@ async function persistListingMap(rows) {
 }
 
 /**
- * Merge records into index (newer overwrites older)
+ * Merge dei record nell'indice — vince lo scatto più fresco
  * index = { code: { merchant: record } }
  */
+/**
+ * Ora dello SCATTO di una riga (stringa nuda del CSV, ora di Bucarest).
+ * Serve solo per confrontare due righe fra loro: il fuso lo mette Postgres
+ * al salvataggio, qui conta la distanza relativa, non l'ora assoluta.
+ */
+function oraScatto(r) {
+  if (!r || !r.scrapedAt) return null;
+  const t = Date.parse(String(r.scrapedAt).trim().replace(' ', 'T'));
+  return Number.isNaN(t) ? null : t;
+}
+
+/**
+ * Il nuovo record scalza quello già in memoria solo se lo scatto è più recente.
+ * A parità di scatto è lo stesso dato riletto (il fornitore ricarica gli stessi
+ * file): si tiene quello che c'è già. Chi non ha timestamp non scalza chi ce
+ * l'ha: un dato senza ora non può smentire un dato datato.
+ */
+function scattoPiuFresco(nuovo, attuale) {
+  const tn = oraScatto(nuovo);
+  const ta = oraScatto(attuale);
+  if (tn === null && ta === null) return true;   // nessuno dei due datato: vale l'ultimo letto
+  if (tn === null) return false;
+  if (ta === null) return true;
+  return tn > ta;
+}
+
 function mergeIntoIndex(index, records) {
   for (const r of records) {
     if (!index[r.code]) index[r.code] = {};
-    // Newer file always overwrites
+    // ⏱️ ORDINE CAPO 11/8 sera: vince lo scatto più FRESCO, non l'ultimo file
+    // letto. Il file grosso arriva DOPO i piccoli ma dentro ha righe vecchie di
+    // ore (misurato: un results.csv delle 18:41 contiene scatti dalle 07:00,
+    // 924.887 righe più vecchie di 2h). Quando piccoli e grosso cadono nello
+    // stesso giro si fondono qui PRIMA di toccare il DB, quindi la guardia
+    // anti-regressione dell'UPSERT non li vede nemmeno: senza questo confronto
+    // il grosso riportava indietro prezzi già aggiornati dai piccoli.
+    const attuale = index[r.code][r.merchant];
+    if (attuale && !scattoPiuFresco(r, attuale)) continue;
     index[r.code][r.merchant] = r;
   }
 }
@@ -287,11 +398,13 @@ async function persistToDB(index) {
     let idx = 1;
 
     for (const e of batch) {
-      values.push(`($${idx++}, $${idx++}, $${idx++}, $${idx++}, $${idx++}, $${idx++}, $${idx++}, $${idx++}, $${idx++})`);
+      // scraped_at: stringa nuda del CSV, ora di Bucarest. NULL se manca —
+      // COALESCE mette NOW(), mai un'ora inventata.
+      values.push(`($${idx++}, $${idx++}, $${idx++}, $${idx++}, $${idx++}, $${idx++}, $${idx++}, $${idx++}, COALESCE(($${idx++})::timestamp AT TIME ZONE 'Europe/Bucharest', NOW()))`);
       params.push(
         e.code, e.merchant, e.position,
         e.basePrice, e.shippingCost, e.totalPrice,
-        e.reviews, e.source, e.scrapedAt || new Date()
+        e.reviews, e.source, e.scrapedAt || null
       );
     }
 
@@ -306,7 +419,16 @@ async function persistToDB(index) {
          reviews = EXCLUDED.reviews,
          source = EXCLUDED.source,
          scraped_at = EXCLUDED.scraped_at,
-         updated_at = NOW()`,
+         updated_at = NOW()
+       -- Un file vecchio ingerito dopo uno nuovo non deve riportare indietro il
+       -- prezzo: si sovrascrive SOLO con uno scatto più recente. Con file ogni
+       -- 15 minuti l'ordine di arrivo non è più garantito, e il fornitore
+       -- ricarica lo stesso contenuto due volte (visti due file da 1.058.776
+       -- righe identiche a 24 minuti di distanza).
+       -- Ordine capo 11/8 sera: strettamente maggiore, non ">=". A parità di
+       -- scatto il dato è lo stesso: riscriverlo aggiorna updated_at e fa
+       -- sembrare fresca una riga che nessuno ha ri-guardato.
+       WHERE EXCLUDED.scraped_at > scraper_competitors.scraped_at`,
       params
     );
     saved += batch.length;
@@ -356,13 +478,14 @@ async function importScraperData(tenantId, jobId = null) {
     console.log(`[DriveScraper] Found ${files.length} CSV files (last ${MAX_FILES_AGE_HOURS}h)`);
 
     if (files.length === 0) {
-      console.log('[DriveScraper] No CSV files found');
-      if (jobId) await updateJob({ status: 'completed', completed_at: new Date(), metadata: JSON.stringify({ phase: 'done', phase_label: 'Nessun file trovato', pct: 100 }) });
+      console.log('[DriveScraper] nessun file nuovo da ingerire');
+      if (jobId) await updateJob({ status: 'completed', completed_at: new Date(), metadata: JSON.stringify({ phase: 'done', phase_label: 'Nessun file nuovo', pct: 100 }) });
       return { filesProcessed: 0, products: 0, entries: 0 };
     }
 
     // 3. Download and parse files in batches
     const index = {};
+    const daSegnare = [];
     let filesProcessed = 0;
 
     for (let i = 0; i < files.length; i += BATCH_DOWNLOAD_SIZE) {
@@ -382,15 +505,19 @@ async function importScraperData(tenantId, jobId = null) {
 
       for (const dl of downloads) {
         if (!dl) continue;
-        if (dl.file.name === 'top_results.csv') {
+        if (NOMI_MAPPA.includes(dl.file.name)) {
           const rows = parseTopResults(dl.content);
           const saved = await persistListingMap(rows);
+          await segnaFileVisto(dl.file, saved);
           filesProcessed++;
           console.log(`[DriveScraper] Parsed ${dl.file.name} (${dl.file.createdTime}): ${saved} listing in mappa`);
           continue;
         }
         const records = parseCSV(dl.content, dl.file.name);
         mergeIntoIndex(index, records);
+        // Il dettaglio si salva tutto insieme dopo il merge: il file si segna
+        // solo se quel salvataggio va a buon fine (lista sotto).
+        daSegnare.push({ file: dl.file, righe: records.length });
         filesProcessed++;
         console.log(`[DriveScraper] Parsed ${dl.file.name} (${dl.file.createdTime}): ${records.length} records`);
       }
@@ -423,6 +550,9 @@ async function importScraperData(tenantId, jobId = null) {
     if (jobId) await updateJob({ metadata: JSON.stringify({ phase: 'saving', phase_label: `Salvataggio ${entryCount} record...`, pct: 75 }) });
     const saved = await persistToDB(index);
     console.log(`[DriveScraper] Saved ${saved} records to DB`);
+
+    // Salvataggio andato a buon fine: solo ora i file di dettaglio sono "visti"
+    for (const d of daSegnare) await segnaFileVisto(d.file, d.righe);
 
     // 6. Log refresh
     await pool.query(
@@ -466,4 +596,10 @@ async function importScraperData(tenantId, jobId = null) {
   }
 }
 
-module.exports = { importScraperData, getDriveClient };
+// Le funzioni interne servono anche ai controlli a mano (ri-lettura di un
+// gruppo di file per verificare che in tabella ci sia davvero lo scatto più
+// fresco): meglio esporle che riscriverle a parte e farle divergere.
+module.exports = {
+  importScraperData, getDriveClient,
+  listScraperFiles, downloadFile, parseCSV, mergeIntoIndex, persistToDB, oraScatto,
+};

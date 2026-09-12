@@ -29,7 +29,8 @@ async function getClient() {
       _anthropic = false;
       return false;
     }
-    _anthropic = new Anthropic({ apiKey: key });
+    const { getAiClient } = require('./aiClient');
+    _anthropic = (await getAiClient('auditor', key)) || false;
     return _anthropic;
   } catch (e) {
     console.warn('[aiAuditor] Anthropic SDK init failed:', e.message);

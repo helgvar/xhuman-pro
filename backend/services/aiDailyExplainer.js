@@ -61,7 +61,10 @@ async function getCpc(tenantId) {
 async function getClaudeClient() {
   const apiKey = await readGlobalConfig('claude_api_key');
   if (!apiKey) throw new Error('claude_api_key non configurata in global_config');
-  return new Anthropic({ apiKey });
+  const { getAiClient } = require('./aiClient');
+  const c = await getAiClient('explainer', apiKey);
+  if (!c) throw new Error('nessun provider AI disponibile');
+  return c;
 }
 
 async function isTenantEnabled(tenantId) {

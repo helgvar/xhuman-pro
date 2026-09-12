@@ -1,72 +1,73 @@
 /**
- * 📦 SCRAPER DELIVERY WATCH (ordine capo 11/7/2026 sera)
+ * 📦 SCRAPER DELIVERY WATCH v2 (ordine capo 12/8/2026 sera)
  *
- * "Fai sempre un check una volta ogni ora per vedere se lo scraper ha
- *  consegnato." — La sentinella che è mancata il 9/7, quando il dump si è
- * decimato (104k→7,7k MINSAN) e nessuno se n'è accorto per 2 giorni.
+ * "Ti arriveranno più consegne più veloci, non solo una ogni 4 ore:
+ *  devi aggiornare sempre guardando la data."
  *
- * Ogni ora (dopo il giro del poller):
- *  - 📦 CONSEGNA PIENA (>100k righe nuove) → conferma Telegram con numeri
- *  - ⚠️ CONSEGNA DECIMATA (nuove righe ma sotto soglia) → allarme
- *  - 🔇 SILENZIO (nessuna slice nuova da >6h; FB consegna ogni 4-5h) → allarme
+ * Dal 11/8 lo scraper consegna file piccoli (~2.000 prodotti) a flusso
+ * quasi continuo (gap massimo osservato ~3h), non più dump da >100k righe
+ * ogni 4-12h. Contare le righe "per consegna" non significa più niente e
+ * generava falsi allarmi "consegna RIDOTTA": il giudizio si fa sulle
+ * FINESTRE DI DATA.
+ *
+ * Ogni ora:
+ *  - 🔇 SILENZIO: nessuna riga nuova da >4h (gap normale <3h) → allarme
+ *  - ⚠️ DECIMAZIONE: copertura rotante 24h sotto 60k MINSAN distinti
+ *    (rotazione sana ~110k; il 9/7 crollò a 7,7k) → allarme
+ *  - ✅ RIENTRO: primo check verde dopo un allarme → conferma
+ * Niente più ping orario "consegna OK": parla solo quando cambia qualcosa.
  * I timestamp scraper sono in ORA ITALIANA (non UTC).
  */
 
 const { pool } = require('../db/pool');
 const { sendTelegram } = require('./telegramNotifier');
 
-const SOGLIA_PIENA = 100000;   // righe per considerare la consegna "piena"
-// 12/7 sera (capo): lo scraper riattivato consegnerà ~ogni 12h — la soglia
-// silenzio segue la nuova cadenza (prima 6h sull'era 4-5h)
-const ORE_SILENZIO = 16;
+const ORE_SILENZIO = 4;            // gap max osservato 2,9h → oltre 4h è anomalia
+const SOGLIA_MINSAN_24H = 60000;   // rotazione sana ~110k MINSAN/24h
 
-let lastMaxSeen = null; // baseline in RAM (al riavvio riparte dal MAX corrente)
+let statoAllarme = false; // in RAM: al riavvio riparte verde (niente allarmi retroattivi)
 
 async function runDeliveryWatch() {
   try {
-    const { rows: [m] } = await pool.query(
-      'SELECT MAX(scraped_at) AS mx FROM scraper_competitors');
-    if (!m.mx) return;
-    const maxTs = new Date(m.mx);
-
-    // Età della consegna: scraped_at è ora italiana "naive" → confronto con
-    // l'ora italiana corrente ricavata dal DB (evita doppi shift)
-    const { rows: [e] } = await pool.query(
-      `SELECT EXTRACT(EPOCH FROM ((NOW() AT TIME ZONE 'Europe/Rome') - MAX(scraped_at)))/3600 AS ore
+    // scraped_at è ora italiana "naive" → confronto con l'ora italiana
+    // corrente ricavata dal DB (evita doppi shift)
+    const { rows: [f] } = await pool.query(
+      `SELECT MAX(scraped_at) AS ultima,
+              EXTRACT(EPOCH FROM ((NOW() AT TIME ZONE 'Europe/Rome') - MAX(scraped_at)))/3600 AS ore
        FROM scraper_competitors`);
-    const oreDaUltima = parseFloat(e.ore);
+    if (!f.ultima) return;
+    const oreDaUltima = parseFloat(f.ore);
 
-    if (lastMaxSeen === null) {
-      lastMaxSeen = maxTs; // baseline post-riavvio: niente allarmi retroattivi
-      console.log(`[DeliveryWatch] baseline: ultima slice ${m.mx} (${oreDaUltima.toFixed(1)}h fa)`);
-    } else if (maxTs > lastMaxSeen) {
-      // SLICE NUOVA dall'ultimo check: quanto ha consegnato?
-      const { rows: [n] } = await pool.query(
-        `SELECT COUNT(*) AS righe, COUNT(DISTINCT product_code) AS minsan
-         FROM scraper_competitors WHERE scraped_at > $1`, [lastMaxSeen]);
-      const righe = parseInt(n.righe);
-      lastMaxSeen = maxTs;
-      if (righe >= SOGLIA_PIENA) {
-        console.log(`[DeliveryWatch] 📦 consegna PIENA: ${righe} righe, ${n.minsan} MINSAN`);
-        await sendTelegram(
-          `📦 <b>Scraper: consegna OK</b> — ${Math.round(righe / 1000)}k prezzi, ${Math.round(parseInt(n.minsan) / 1000)}k MINSAN (slice ${String(m.mx).slice(11, 16)})`,
-          { key: 'scraper_delivery_ok', parseMode: 'HTML', throttleMs: 60 * 60 * 1000 });
-      } else {
-        console.log(`[DeliveryWatch] ⚠️ consegna RIDOTTA: ${righe} righe`);
-        await sendTelegram(
-          `⚠️ <b>Scraper: consegna RIDOTTA</b> — solo ${righe} righe nuove (${n.minsan} MINSAN), attese >100k.\n` +
-          `Possibile nuovo guasto export FB (come il 9/7). Verificare col dev.`,
-          { key: 'scraper_delivery_low', parseMode: 'HTML', throttleMs: 4 * 3600 * 1000 });
-      }
-    } else if (oreDaUltima > ORE_SILENZIO) {
-      // Nessuna slice nuova e silenzio oltre soglia
-      await sendTelegram(
-        `🔇 <b>Scraper: NESSUNA consegna da ${oreDaUltima.toFixed(1)}h</b> (cadenza normale 4-5h).\n` +
-        `Ultima slice: ${String(m.mx).slice(0, 16)}. Verificare lato FB.`,
-        { key: 'scraper_delivery_silence', parseMode: 'HTML', throttleMs: 4 * 3600 * 1000 });
+    const { rows: [c] } = await pool.query(
+      `SELECT COUNT(DISTINCT product_code) AS minsan, COUNT(*) AS righe
+       FROM scraper_competitors
+       WHERE scraped_at > (NOW() AT TIME ZONE 'Europe/Rome') - interval '24 hours'`);
+    const minsan24 = parseInt(c.minsan);
+    const righe24 = parseInt(c.righe);
+
+    if (oreDaUltima > ORE_SILENZIO) {
+      statoAllarme = true;
       console.log(`[DeliveryWatch] 🔇 silenzio da ${oreDaUltima.toFixed(1)}h`);
+      await sendTelegram(
+        `🔇 <b>Scraper: NESSUNA consegna da ${oreDaUltima.toFixed(1)}h</b> (flusso continuo, gap normale &lt;3h).\n` +
+        `Ultima riga: ${String(f.ultima).slice(0, 16)}. Verificare lato FB.`,
+        { key: 'scraper_delivery_silence', parseMode: 'HTML', throttleMs: 4 * 3600 * 1000 });
+    } else if (minsan24 < SOGLIA_MINSAN_24H) {
+      statoAllarme = true;
+      console.log(`[DeliveryWatch] ⚠️ copertura 24h decimata: ${minsan24} MINSAN`);
+      await sendTelegram(
+        `⚠️ <b>Scraper: copertura 24h DECIMATA</b> — ${Math.round(minsan24 / 1000)}k MINSAN distinti ` +
+        `(rotazione sana ~110k, soglia 60k).\nPossibile guasto export FB (come il 9/7). Verificare col dev.`,
+        { key: 'scraper_delivery_low', parseMode: 'HTML', throttleMs: 4 * 3600 * 1000 });
+    } else if (statoAllarme) {
+      statoAllarme = false;
+      console.log(`[DeliveryWatch] ✅ rientro: ${minsan24} MINSAN/24h, ultima ${oreDaUltima.toFixed(1)}h fa`);
+      await sendTelegram(
+        `✅ <b>Scraper: flusso rientrato</b> — ${Math.round(minsan24 / 1000)}k MINSAN/24h ` +
+        `(${Math.round(righe24 / 1000)}k prezzi), ultima consegna ${Math.round(oreDaUltima * 60)} min fa.`,
+        { key: 'scraper_delivery_recover', parseMode: 'HTML', throttleMs: 60 * 60 * 1000 });
     } else {
-      console.log(`[DeliveryWatch] nessuna slice nuova (ultima ${oreDaUltima.toFixed(1)}h fa, ok)`);
+      console.log(`[DeliveryWatch] ok — ${minsan24} MINSAN/24h, ultima ${oreDaUltima.toFixed(1)}h fa`);
     }
   } catch (err) {
     console.error('[DeliveryWatch] err:', err.message);
@@ -82,7 +83,7 @@ function startScraperDeliveryWatch() {
     runDeliveryWatch();
     setInterval(runDeliveryWatch, 60 * 60 * 1000);
   }, 8 * 60 * 1000);
-  console.log('[DeliveryWatch] 📦 sentinella consegne scraper attiva — check orario');
+  console.log('[DeliveryWatch] 📦 sentinella consegne scraper v2 attiva — check orario su finestre di data');
 }
 
 module.exports = { runDeliveryWatch, startScraperDeliveryWatch };

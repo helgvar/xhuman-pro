@@ -1,6 +1,7 @@
 const { pool } = require('../db/pool');
 const { importOrders } = require('./magentoOrders');
 const { isJobRunning } = require('./requestQueue');
+const { releaseSoldCodaLunga } = require('./codaLungaLoop');
 
 const SYNC_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
 const SYNC_DAYS_BACK = 3;
@@ -53,6 +54,17 @@ async function syncAllTenants() {
 
         await importOrders(tenant.id, SYNC_DAYS_BACK, rows[0].id);
         console.log(`[OrderSync] Tenant "${tenant.name}" sync complete`);
+
+        // Rientro a evento loop coda lunga: SKU esiliato che risulta venduto
+        // negli ordini appena importati rientra subito, senza aspettare il retest.
+        try {
+          const released = await releaseSoldCodaLunga(tenant.id);
+          if (released > 0) {
+            console.log(`[OrderSync] Tenant "${tenant.name}": ${released} SKU rilasciati dall'esilio coda lunga (venduti)`);
+          }
+        } catch (err) {
+          console.error(`[OrderSync] Tenant "${tenant.name}" rientro coda lunga fallito:`, err.message);
+        }
       } catch (err) {
         console.error(`[OrderSync] Tenant "${tenant.name}" sync failed:`, err.message);
       }

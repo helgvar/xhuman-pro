@@ -15,7 +15,32 @@
 const { pool } = require('../db/pool');
 const { sendTelegram } = require('./telegramNotifier');
 
-async function runPositionLog() {
+// 🛑 FRENO (11/8/2026 sera). Questo giro macina ~20 minuti. Da quando lo
+// scraper consegna ogni 15 minuti lo chiamano in due — scraperPoller e
+// healthCron — e si è arrivati a QUATTRO esecuzioni contemporanee sullo stesso
+// DB. Il freno sta qui e non nei chiamanti: chi chiama non può sapere cosa
+// stanno facendo gli altri. Il cron giornaliero delle 09:45 passa con `force`,
+// perché quello è l'appuntamento che non si salta.
+const CATENA_MIN_MS = 30 * 60 * 1000;
+let inCorso = false;
+let ultimoGiro = null;
+
+async function runPositionLog(opts = {}) {
+  if (inCorso) { console.log('[PositionLog] già in corso, salto'); return; }
+  if (!opts.force && ultimoGiro && Date.now() - ultimoGiro < CATENA_MIN_MS) {
+    console.log(`[PositionLog] saltato — ultimo giro ${Math.round((Date.now() - ultimoGiro) / 60000)} min fa (minimo ${CATENA_MIN_MS / 60000})`);
+    return;
+  }
+  inCorso = true;
+  try {
+    return await eseguiPositionLog();
+  } finally {
+    inCorso = false;
+    ultimoGiro = Date.now();
+  }
+}
+
+async function eseguiPositionLog() {
   // 1) Snapshot del giorno (idempotente per snap_date)
   const { rowCount } = await pool.query(`
     WITH venditori AS (
@@ -101,11 +126,12 @@ async function runPositionLog() {
       cluster AS (
         SELECT DISTINCT sc.product_code AS sku
         FROM scraper_competitors sc
-        WHERE sc.total_price > 0
+        WHERE sc.base_price > 0
           -- guardrail freschezza (retention 7g dal 11/7): un doppione di prezzo
           -- vecchio di giorni fabbricherebbe un muro fantasma e abbasserebbe il floor
           AND sc.scraped_at >= NOW() - INTERVAL '48 hours'
-        GROUP BY sc.product_code, sc.total_price
+        -- PREZZO SECCO (capo 21/8): cluster sul prezzo prodotto, non sul totale
+        GROUP BY sc.product_code, sc.base_price
         HAVING COUNT(*) >= 2
       ),
       qualificati AS (
@@ -188,7 +214,7 @@ function startPositionLog() {
     const next = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 7, 45, 0));
     if (next <= now) next.setUTCDate(next.getUTCDate() + 1);
     setTimeout(async () => {
-      try { await runPositionLog(); } catch (e) { console.error('[PositionLog] err:', e.message); }
+      try { await runPositionLog({ force: true }); } catch (e) { console.error('[PositionLog] err:', e.message); }
       tick();
     }, next.getTime() - now.getTime());
   };

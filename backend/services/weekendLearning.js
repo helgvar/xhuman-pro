@@ -41,7 +41,7 @@ async function updatePostWeekendMetrics(snapshotDate = SNAPSHOT_DATE,
     FROM (
       SELECT oi.sku, o.tenant_id,
              COUNT(DISTINCT o.id) AS ord_tot,
-             SUM(oi.row_total) AS rev_tot
+             SUM(COALESCE(NULLIF(oi.row_total_incl_tax,0), oi.row_total)) AS rev_tot
       FROM orders o JOIN order_items oi ON oi.order_id = o.id
       WHERE o.order_status NOT IN ('canceled','closed','pending_payment')
         AND o.order_date::date BETWEEN $2 AND $3

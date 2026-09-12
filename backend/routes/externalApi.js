@@ -126,7 +126,8 @@ async function recalculateStableCache(tenantId) {
   const filterEnabled = filterCfgRows.length > 0 && filterCfgRows[0].config_value === 'true';
 
   // Filtro STRICT (direttiva 3/7/2026): nel CSV TP restano SOLO SKU vendibili
-  // (pos <= 10) o che vendono (store/seller/rete), più le eccezioni meritate
+  // (pos <= bersaglio della regola, mig 119) o che vendono (store/seller/rete),
+  // più le eccezioni meritate
   // (coorti fresche, azioni manuali, ADD engine, brand protetti).
   // Vive QUI — a monte della cache — perché is_civetta è un mirror di Magento
   // che productSync/civetta_sync sovrascrivono ogni ciclo: un flag locale non
@@ -167,6 +168,22 @@ async function recalculateStableCache(tenantId) {
     strictPosMin = minRows[0]?.v || 0;
   }
 
+  // POSIZIONE BERSAGLIO (mig 119, ordine capo 11/9: "La regola di salvabilancio
+  // viene attivata quando i prodotti non rientrano nelle posizioni di classifica
+  // indicate nella regola"). La classifica da raggiungere sta SCRITTA nella
+  // regola di Ricarico del tenant (rule_data->>'scraper_position'): Procaccini 5,
+  // Farmainsieme 7, Papa 8, MPF/Mandanici/Farmastelia 10, SubitoFarma 12,
+  // Farmacri 15. MISURA su 356 regole di rete: solo il tipo 1 (Ricarico) porta
+  // una posizione, 201 su 210; Sconto (90), Salva Bilancio (47) e Muro (9) ne
+  // hanno ZERO. Prima di oggi questo cancello usava 10 e 25, costanti nostre che
+  // non sono il bersaglio di nessuno: ammettevano Procaccini in 6-10 (che
+  // Farmabooster ha gia' dichiarato fuori posizione) ed escludevano Farmacri in
+  // 11-15 (che e' ancora dentro il suo bersaglio).
+  const { rows: bersRows } = await pool.query(
+    `SELECT posizione_bersaglio($1, NULL) AS pos`, [tenantId]
+  );
+  const posBersaglio = bersRows[0]?.pos || 10;
+
   // Pre-compute SKU con ordini reali 30g (per evitare EXISTS nested = 92s timeout).
   // Una sola scansione orders+order_items, poi JOIN nella query principale.
   const ctePrefix = (filterEnabled || strictEnabled) ? `
@@ -185,10 +202,14 @@ async function recalculateStableCache(tenantId) {
             WHERE phs.tenant_id = p.tenant_id AND phs.sku = p.sku
               AND (
                 COALESCE(phs.health_score, 0) >= 30
-                OR (phs.scraper_position IS NOT NULL AND phs.scraper_position <= 10
+                -- mig 119: il bersaglio sta nella regola di Ricarico del tenant,
+                -- non in una costante nostra. Due meriti diversi sullo STESSO
+                -- bersaglio: margine con giacenza qualunque, o giacenza di
+                -- farmacia con margine piu' alto.
+                OR (phs.scraper_position IS NOT NULL AND phs.scraper_position <= ${posBersaglio}
                     AND COALESCE(p.margin_pct, 0) >= 12
                     AND (COALESCE(p.erp_stock, 0) + COALESCE(p.supplier_stock, 0)) >= 3)
-                OR (phs.scraper_position IS NOT NULL AND phs.scraper_position <= 25
+                OR (phs.scraper_position IS NOT NULL AND phs.scraper_position <= ${posBersaglio}
                     AND COALESCE(p.erp_stock, 0) >= 3
                     AND COALESCE(p.margin_pct, 0) >= 15)
               )
@@ -237,7 +258,7 @@ async function recalculateStableCache(tenantId) {
   // REGOLA DI BACKUP (ordine capo 11/7): finché lo scraper FB non riparte
   // (pausa attiva), le attivazioni AI senza confronto competitor (ADD e
   // coorti) valgono solo se il civetta di Farmabooster è d'accordo (=1).
-  // Il merito oggettivo (pos<=10 con dato reale, venduto seller) e i brand
+  // Il merito oggettivo (pos dentro il bersaglio della regola, venduto seller) e i brand
   // protetti restano sovrani: lì il confronto o la vendita c'è.
   const scraperPausedBuild = await require('../services/scraperPause').isScraperOptimizationPaused();
   const civettaBackup = scraperPausedBuild ? 'AND p.is_civetta = true' : '';
@@ -288,7 +309,9 @@ async function recalculateStableCache(tenantId) {
          AND (COALESCE(p.sales_30d_seller, 0) > 0
               OR EXISTS (SELECT 1 FROM product_health_scores sphm
                          WHERE sphm.tenant_id = p.tenant_id AND sphm.sku = p.sku
-                           AND sphm.scraper_position <= 10)))
+                           -- mig 119: in posizione = dentro il bersaglio della
+                           -- SUA regola, non dentro un top10 inventato da noi
+                           AND sphm.scraper_position <= ${posBersaglio})))
         OR
         -- PIN DEL CAPO (13/7: 'se ti dico attiva un prodotto, xHumanPro lo
         -- recepisce e NON lo stacca più'): ordine esplicito, sempre in feed
@@ -429,7 +452,7 @@ async function recalculateStableCache(tenantId) {
       WITH ord90 AS (
         SELECT oi.sku,
                COUNT(DISTINCT o.id) AS ordini,
-               SUM(oi.qty_ordered * oi.price) AS fatt
+               SUM(COALESCE(NULLIF(oi.row_total_incl_tax,0), oi.row_total)) AS fatt
         FROM order_items oi
         JOIN orders o ON o.id = oi.order_id
         WHERE oi.tenant_id = $1
@@ -443,7 +466,7 @@ async function recalculateStableCache(tenantId) {
           AND reactivated_at > NOW() - INTERVAL '10 days'
       ),
       rete30 AS (
-        SELECT oi.sku, SUM(oi.qty_ordered * oi.price) AS fatt
+        SELECT oi.sku, SUM(COALESCE(NULLIF(oi.row_total_incl_tax,0), oi.row_total)) AS fatt
         FROM order_items oi
         JOIN orders o ON o.id = oi.order_id
         WHERE oi.tenant_id <> $1
@@ -483,7 +506,210 @@ async function recalculateStableCache(tenantId) {
 
     cappedProducts = feedCodes.splice(feedCapMax);
     console.log(`[FeedCap][T:${tenantId.slice(0, 8)}] Cap ${feedCapMax}: ${cappedProducts.length} products below threshold`);
+
+    // 📸 SNAPSHOT COMPOSIZIONE (mig 104, buco misurato il 18/08 su MPF).
+    // Con il cap saturo ogni ricostruzione rimescola chi occupa i posti, e
+    // senza storico il churn non e' ne' provabile ne' smentibile. Qui si
+    // registra CHI e' stato servito e chi il cap ha tagliato, una volta al
+    // giorno per tenant. Il feed non deve mai fallire per lo snapshot:
+    // qualunque errore viene loggato e ingoiato.
+    try {
+      const { rows: giaFatto } = await pool.query(
+        `SELECT 1 FROM feed_composition_snap
+         WHERE tenant_id = $1 AND snap_date = CURRENT_DATE LIMIT 1`, [tenantId]);
+      if (giaFatto.length === 0) {
+        const dentro = feedCodes;
+        const fuori = cappedProducts;
+        for (let i = 0; i < dentro.length; i += 5000) {
+          const lotto = dentro.slice(i, i + 5000);
+          await pool.query(
+            `INSERT INTO feed_composition_snap (tenant_id, snap_date, sku, in_feed, prio)
+             SELECT $1, CURRENT_DATE, u.sku, true, ($3::jsonb ->> u.sku)::numeric
+             FROM unnest($2::text[]) AS u(sku)
+             ON CONFLICT DO NOTHING`,
+            [tenantId, lotto, JSON.stringify(Object.fromEntries(
+              lotto.map(sk => [sk, priorityMap.get(sk) ?? null])))]);
+        }
+        for (let i = 0; i < fuori.length; i += 5000) {
+          const lotto = fuori.slice(i, i + 5000);
+          await pool.query(
+            `INSERT INTO feed_composition_snap (tenant_id, snap_date, sku, in_feed, prio)
+             SELECT $1, CURRENT_DATE, u.sku, false, ($3::jsonb ->> u.sku)::numeric
+             FROM unnest($2::text[]) AS u(sku)
+             ON CONFLICT DO NOTHING`,
+            [tenantId, lotto, JSON.stringify(Object.fromEntries(
+              lotto.map(sk => [sk, priorityMap.get(sk) ?? null])))]);
+        }
+        await pool.query(
+          `DELETE FROM feed_composition_snap
+           WHERE tenant_id = $1 AND snap_date < CURRENT_DATE - 30`, [tenantId]);
+        console.log(`[FeedSnap][T:${tenantId.slice(0, 8)}] composizione registrata: ${dentro.length} dentro, ${fuori.length} tagliati`);
+      }
+    } catch (e) {
+      console.error('[FeedSnap] snapshot err (ignorato):', e.message);
+    }
   }
+
+  // 🔬 WHITELIST FORZATA A TEMPO (ordine capo 5/8, test Papa giovedì 6/8).
+  // Config: health_config.feed_forced_whitelist = <test_label>, con expires_at.
+  // Alla scadenza il feed torna da solo alle regole normali, senza deploy.
+  //
+  // SOSTITUISCE il feed, non lo filtra. L'ordine è "inviamo nel feed SOLO i
+  // 4.393 prodotti che generano il fatturato degli ultimi 90gg": intersecare
+  // con le regole normali ne avrebbe lasciati 2.712, perché 1.681 venditori
+  // sono oggi fuori dal feed (posizione TP, filtro qualità, oblio). Quelli
+  // sono esattamente i prodotti che il test deve rimettere in vetrina.
+  //
+  // L'unico filtro che sopravvive è la vendibilità — "solo sui prodotti
+  // disponibili per la vendita" (stock proprio o del grossista, e un prezzo).
+  // Su 4.393 congelati ne restano 4.200: 193 non sono acquistabili.
+  //
+  // 📍 GATE POSIZIONE (ordine capo 11/8): "la whitelist deve lasciarli dentro
+  // solo se sono nelle posizioni 0-10. Se un venditore è in SB deve avere un
+  // pricecut per rientrare nelle top 5/8; se non può entrare non va messo nel
+  // feed." Un prodotto oltre la decima posizione non prende click ma occupa
+  // vetrina: su MPF 2.090 SKU fuori top10 costavano 14,56 EUR/giorno.
+  //
+  // La posizione si CALCOLA (products.scraper_position è NULL quasi ovunque) e
+  // si calcola sul PREZZO SECCO (dictat 10/8: base_price, non prezzo+spedizione)
+  // e sul prezzo che il feed manda DAVVERO — price cut incluso. Così chi rientra
+  // in top10 grazie al suo cut resta dentro senza logica separata, e chi il cut
+  // non ce l'ha (o non gli basta) esce da solo al giro dopo.
+  //
+  // Restano dentro comunque: i brand protetti (veto killer_protected_brands, il
+  // solo veto sopravvissuto all'ordine del capo) e chi non ha scrape fresco
+  // (≤48h) — su un dato assente non si condanna: prima i dati, poi il giudizio.
+  //
+  // 🛒 ESENZIONE VENDITORE (ordine capo 12/8, per-tenant
+  // `health_config.feed_whitelist_gate_venditori_in`): chi ha venduto almeno una
+  // volta negli ultimi 90 giorni non lo tocca il gate. La posizione qui è una
+  // STIMA sul prezzo secco mentre TP ordina sul totale con spedizione: contro un
+  // ordine incassato quella stima perde. Default = esenzione SPENTA, così i
+  // tenant che non l'hanno chiesta non cambiano comportamento.
+  //
+  // 🔙 ROLLBACK PER TENANT (ordine capo 11/8, sera): su Papa il gate ha portato
+  // il feed da 4.299 a 1.838 e il capo lo vuole di nuovo intero. Interruttore
+  // per-tenant `health_config.feed_whitelist_gate_off` (letto con expires_at,
+  // come ogni bypass): quando è attivo la whitelist torna a valere per intero e
+  // la posizione non seleziona più nulla. Default = gate ACCESO: chi non ha il
+  // flag non cambia comportamento.
+  //
+  // Nota: gli SKU esclusi NON vanno aggiunti a removeCodes. GET /feed/civetta
+  // calcola già il diff contro last_dispatched_feed ed emette civetta=0 per
+  // tutto ciò che era nel dispatch precedente e non è più nel feed.
+  //
+  // Il flag è per-tenant: nessun altro tenant viene sfiorato.
+  let forcedWhitelistSet = null;
+  try {
+    const { rows: forced } = await pool.query(
+      `SELECT
+         MAX(CASE WHEN config_key = 'feed_forced_whitelist' THEN config_value END) AS label,
+         BOOL_OR(config_key = 'feed_whitelist_gate_off'
+                 AND LOWER(config_value) NOT IN ('0', 'false', 'off')) AS gate_off,
+         BOOL_OR(config_key = 'feed_whitelist_gate_venditori_in'
+                 AND LOWER(config_value) NOT IN ('0', 'false', 'off')) AS venditori_in
+       FROM health_config
+       WHERE tenant_id = $1
+         AND config_key IN ('feed_forced_whitelist', 'feed_whitelist_gate_off',
+                            'feed_whitelist_gate_venditori_in')
+         AND COALESCE(config_value, '') <> ''
+         AND (expires_at IS NULL OR expires_at > NOW())`, [tenantId]);
+    if (forced.length > 0 && forced[0].label) {
+      const label = forced[0].label;
+      const gateOff = forced[0].gate_off === true;
+      const venditoriIn = forced[0].venditori_in === true;
+      const { rows: wl } = await pool.query(`
+        -- 🛒 ESENZIONE VENDITORE (ordine capo 12/8: "su Farmastelia siamo stati
+        -- troppo aggressivi, rimetti dentro chi può vendere o ha portato vendite
+        -- indirette negli ultimi 90gg"). Il gate stima la posizione sul prezzo
+        -- secco, ma TP ordina sul TOTALE con spedizione: su un venditore vero
+        -- quella stima non può valere più di un ordine incassato. Misurato su
+        -- Farmastelia: i 1.206 venditori bloccati dal gate costavano 10,60
+        -- EUR/giorno di click e in 90gg avevano fatto 1.648 ordini, 46.219 EUR
+        -- diretti e 82.430 EUR sulle altre righe dei loro carrelli.
+        -- Nessun "vendite indirette" a forfait: il carrello si conta riga per
+        -- riga, e qui basta esserci stato dentro almeno una volta.
+        WITH venditori AS (
+          SELECT DISTINCT oi.sku
+          FROM order_items oi
+          JOIN orders o ON o.id = oi.order_id
+          WHERE oi.tenant_id = $1
+            AND o.order_status IN ('processing', 'pending', 'complete',
+                                   'ritiro_farmacia', 'Ritirato')
+            AND (o.order_date AT TIME ZONE 'Europe/Rome')::date >= CURRENT_DATE - 90
+        )
+        SELECT p.sku,
+               (c.arr IS NULL) AS senza_scraper,
+               bp.protetto,
+               (vd.sku IS NOT NULL) AS venditore,
+               (SELECT COUNT(*) FROM unnest(COALESCE(c.arr, '{}'::numeric[])) x
+                 WHERE x < v.pz) + 1 AS pos
+        FROM feed_test_whitelist w
+        JOIN products p ON p.tenant_id = w.tenant_id AND p.sku = w.sku
+        LEFT JOIN venditori vd ON vd.sku = p.sku
+        -- Prezzo che il feed manda davvero: il price cut vince sul prezzo a
+        -- listino. MIN() perché più azioni possono insistere sullo stesso SKU:
+        -- il payload verso Farmabooster porta comunque il taglio più basso.
+        LEFT JOIN LATERAL (
+          SELECT MIN(fa.recommended_price) AS newprice FROM feed_actions fa
+          WHERE fa.tenant_id = p.tenant_id AND fa.sku = p.sku
+            AND fa.recommended_price IS NOT NULL
+            AND fa.action IN ('PRICE_CUT', 'ADD')
+        ) pc ON TRUE
+        CROSS JOIN LATERAL (
+          SELECT COALESCE(pc.newprice, NULLIF(p.applied_price, 0),
+                          p.exported_price, p.sell_price) AS pz
+        ) v
+        -- Concorrenti sul prezzo secco, scrape fresco (≤48h). La tabella è
+        -- unica per (product_code, merchant): la nostra riga si esclude da sé
+        -- perché il confronto è STRETTAMENTE minore del nostro prezzo.
+        LEFT JOIN LATERAL (
+          SELECT array_agg(sc.base_price ORDER BY sc.base_price) AS arr
+          FROM scraper_competitors sc
+          WHERE sc.product_code = p.sku
+            AND sc.scraped_at > NOW() - INTERVAL '48 hours'
+            AND sc.base_price > 0
+        ) c ON TRUE
+        CROSS JOIN LATERAL (
+          SELECT UPPER(COALESCE(p.brand, '')) IN (
+                   SELECT BTRIM(UPPER(x)) FROM health_config hc,
+                          unnest(STRING_TO_ARRAY(hc.config_value, ',')) x
+                   WHERE hc.tenant_id = $1 AND hc.config_key = 'killer_protected_brands'
+                 ) AS protetto
+        ) bp
+        WHERE w.tenant_id = $1 AND w.test_label = $2
+          AND p.saleable = true
+          AND (COALESCE(p.erp_stock, 0) + COALESCE(p.supplier_stock, 0)) > 0
+          AND COALESCE(p.sell_price, 0) > 0`, [tenantId, label]);
+
+      // Gate posizione applicato qui e non in SQL per poter dire nel log
+      // QUANTI escono e perché: un taglio muto è un taglio che nessuno verifica.
+      const dentro = gateOff
+        ? wl
+        : wl.filter(r => r.senza_scraper || r.protetto
+                      || (venditoriIn && r.venditore) || Number(r.pos) <= 10);
+      const fuoriPos = wl.length - dentro.length;
+      const senzaDato = wl.filter(r => r.senza_scraper).length;
+      const perBrand = wl.filter(r => !r.senza_scraper && r.protetto && Number(r.pos) > 10).length;
+      const perVendita = venditoriIn
+        ? wl.filter(r => !r.senza_scraper && !r.protetto && r.venditore && Number(r.pos) > 10).length
+        : 0;
+
+      if (dentro.length === 0) {
+        // Lista vuota: non svuoto il feed per un errore di configurazione.
+        console.error(`[FeedStable][T:${tenantId.slice(0, 8)}] 🔬 whitelist '${label}' VUOTA — restrizione IGNORATA`);
+      } else {
+        const before = feedCodes.length;
+        feedCodes = dentro.map(r => r.sku);
+        forcedWhitelistSet = new Set(feedCodes);
+        // Il cap ha già tagliato una coda che ora non c'entra più nulla: se
+        // restasse, quegli SKU finirebbero in removeCodes e uscirebbero a
+        // civetta=0 pur essendo nella whitelist. (Su Papa il cap è spento.)
+        cappedProducts = [];
+        console.log(`[FeedStable][T:${tenantId.slice(0, 8)}] 🔬 WHITELIST FORZATA '${label}': feed ${before} -> ${feedCodes.length} (whitelist ${wl.length} vendibili, ${gateOff ? 'GATE POSIZIONE SPENTO (rollback capo): tutti dentro' : `-${fuoriPos} oltre top10; dentro per brand protetto ${perBrand}, per vendita 90gg ${perVendita}, senza scrape fresco ${senzaDato}`})`);
+      }
+    }
+  } catch (e) { console.error('[FeedStable] whitelist forzata err:', e.message); }
 
   // Build civetta=0 list (quarantine + explicit REMOVE — ALWAYS included in response)
   const { rows: removeRows } = await pool.query(`
@@ -496,13 +722,29 @@ async function recalculateStableCache(tenantId) {
     ) sub
   `, [tenantId]);
 
-  const removeCodes = removeRows.map(r => r.sku);
+  let removeCodes = removeRows.map(r => r.sku);
 
   // Add capped products to remove list (Module 2)
   if (cappedProducts.length > 0) {
     const removeSet = new Set(removeCodes);
     for (const sku of cappedProducts) {
       if (!removeSet.has(sku)) removeCodes.push(sku);
+    }
+  }
+
+  // 🔬 Whitelist forzata attiva: sugli SKU che hanno passato il gate posizione
+  // non esistono altri vincoli né veti (ordine capo 5/8; la posizione invece
+  // vale eccome, ordine 11/8, ed è già stata applicata sopra su feedCodes).
+  // Su POST /feed/civetta removeCodes ha la precedenza
+  // sul feed: una quarantena o una REMOVE rimasta a DB rimanderebbe a
+  // civetta=0 un prodotto che il test vuole in vetrina. Qui la whitelist
+  // vince su tutto. (Su GET il problema non si pone: la risposta è
+  // feedCodes + il diff contro last_dispatched_feed, removeCodes non entra.)
+  if (forcedWhitelistSet) {
+    const before = removeCodes.length;
+    removeCodes = removeCodes.filter(sku => !forcedWhitelistSet.has(sku));
+    if (before !== removeCodes.length) {
+      console.log(`[FeedStable][T:${tenantId.slice(0, 8)}] 🔬 veti annullati sulla whitelist: removeCodes ${before} -> ${removeCodes.length}`);
     }
   }
 
@@ -545,8 +787,12 @@ async function recalculateStableCache(tenantId) {
        FROM tenant_configs WHERE tenant_id = $1 AND config_key = 'stable_feed_codes'`, [tenantId]);
     const prevN = guardPrev.length > 0 ? parseInt(guardPrev[0].n) : 0;
     const { rows: guardOff } = await pool.query(
+      // expires_at è la scadenza del bypass: senza questo controllo il
+      // paracadute restava spento per sempre. Misurato l'11/8: 5 tenant
+      // avevano il flag scaduto il 17/7 e il paracadute disarmato da 25 giorni.
       `SELECT 1 FROM health_config WHERE tenant_id = $1
-       AND config_key = 'feed_drop_guard_off' AND config_value = '1'`, [tenantId]);
+       AND config_key = 'feed_drop_guard_off' AND config_value = '1'
+       AND (expires_at IS NULL OR expires_at > NOW())`, [tenantId]);
     if (guardOff.length === 0 && prevN > 1000 && feedCodes.length < prevN * 0.90) {
       console.error(`[FeedStable][T:${tenantId.slice(0, 8)}] 🪂 PARACADUTE: build ${feedCodes.length} vs precedente ${prevN} (oltre -10%) — feed precedente MANTENUTO`);
       try {
@@ -558,6 +804,25 @@ async function recalculateStableCache(tenantId) {
       } catch {}
       const prevCfg = JSON.parse(guardPrev[0].config_value);
       const prevEntry = { feedCodes: prevCfg.codes || [], removeCodes: prevCfg.removeCodes || [], priceCuts, updatedAt };
+      // ⚠️ Ordine capo 10/09: "per niente al mondo i prezzi ai possono andare
+      // sotto floor. non esiste nessun veto o nessun ordine manuale che può
+      // bloccare il ricalcolo di un prezzo ai che va sotto floor".
+      // Il paracadute protegge la LARGHEZZA del CSV, non i prezzi: uscendo di
+      // qui senza salvare congelava anche la lista prezzi. Misurato il 10/09 su
+      // Farmacri: snapshot fermo al 31/07, 30 prezzi sotto floor e 1 sotto costo
+      // spediti a Farmabooster per 41 giorni. I codici restano quelli vecchi, i
+      // PREZZI si salvano sempre.
+      try {
+        await pool.query(
+          `INSERT INTO tenant_configs (tenant_id, config_key, config_value)
+           VALUES ($1, 'stable_price_cuts', $2)
+           ON CONFLICT (tenant_id, config_key) DO UPDATE SET config_value = $2`,
+          [tenantId, JSON.stringify({ products: priceCuts })]
+        );
+        console.log(`[FeedStable][T:${tenantId.slice(0, 8)}] 🪂 codici congelati ma PREZZI aggiornati: ${priceCuts.length} price cuts salvati`);
+      } catch (e) {
+        console.error('[FeedStable] paracadute: salvataggio prezzi fallito:', e.message);
+      }
       stableCache.set(tenantId, prevEntry);
       return prevEntry;
     }

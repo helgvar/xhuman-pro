@@ -4,6 +4,7 @@ const { authMiddleware } = require('../middleware/auth');
 const { tenantMiddleware } = require('../middleware/tenant');
 const { requireRole } = require('../middleware/acl');
 const zombieService = require('../services/zombieService');
+const { getTenantCpcGross } = require('../services/cpcConfig');
 
 const router = express.Router();
 
@@ -40,14 +41,17 @@ router.get('/overview', requireRole('superadmin', 'admin', 'viewer'), async (req
       [tenantId]
     );
 
-    // Click trend (last 30 days)
+    // Click trend (last 30 days). Il costo lo calcola il server col CPC LORDO del
+    // tenant: il browser non puo' saperlo e prima ci moltiplicava un 0,27 fisso.
+    const cpc = await getTenantCpcGross(tenantId);
     const { rows: clickTrend } = await pool.query(
-      `SELECT fetch_date, COUNT(*) as products, SUM(clicks) as total_clicks
+      `SELECT fetch_date, COUNT(*) as products, SUM(clicks) as total_clicks,
+              ROUND((SUM(clicks) * $2::numeric)::numeric, 2)::float as cost
        FROM zombie_clicks
        WHERE tenant_id = $1 AND fetch_date >= CURRENT_DATE - INTERVAL '30 days'
        GROUP BY fetch_date
        ORDER BY fetch_date ASC`,
-      [tenantId]
+      [tenantId, cpc]
     );
 
     // Last 5 runs

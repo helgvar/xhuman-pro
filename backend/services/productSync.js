@@ -2,10 +2,73 @@ const { pool } = require('../db/pool');
 const { importProducts } = require('./farmaboosterProducts');
 const { isJobRunning } = require('./requestQueue');
 const { withTenantLock, farmaboosterQueue } = require('./apiQueue');
+const { sendTelegram } = require('./telegramNotifier');
 
 const SYNC_INTERVAL_MS = 60 * 60 * 1000;      // 1 hour (era 6h; prezzi e stock_source cambiano intra-giorno,
                                               // cfr. feedback_pricing_freshness_critical)
 const STAGGER_DELAY_MS = 60 * 1000;           // 60s delay between tenants (protegge FB server)
+
+// Ordine capo 10/09: "ad ogni loop di dati i pc vengono ricontrollati in base al
+// costo attuale e ricalcolati o cancellati". Il costo d'acquisto e' una serie
+// temporale: appena il sync porta a casa i costi nuovi, ogni price cut vivo del
+// tenant viene ripesato sul costo di RIACQUISTO di adesso e, se ha sfondato il
+// floor di fascia, ricalcolato giu' / rialzato fino al minimo consentito (solo
+// se e' il costo ad averlo affondato, ordine capo 10/09) / cancellato.
+// Il guardiano gira DENTRO il lock del tenant, subito dopo l'import: nessun
+// altro motore sta scrivendo su quel tenant in quel momento.
+// Legge capo 10/09: "tutti i pc vanno rivalutati ad ogni aggiornamento per
+// valutare se il costo di riferimento e' cambiato". Nessun tetto: se un taglio
+// e' sotto il minimo non puo' aspettare il giro dopo.
+const PC_GUARD_CAP = null;
+
+/**
+ * Ricontrolla i price cut del tenant sul costo appena importato.
+ * Non deve MAI far fallire il sync: ogni errore e' loggato e ingoiato.
+ */
+async function reconfirmPriceCuts(tenant) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows } = await client.query(
+      'SELECT esito, tenant, n FROM reconfirm_price_cuts_v2(false, $1::uuid, $2::int)',
+      [tenant.id, PC_GUARD_CAP]
+    );
+    await client.query('COMMIT');
+
+    const n = (e) => rows.filter(r => r.esito === e).reduce((s, r) => s + parseInt(r.n, 10), 0);
+    const giu = n('ricalcolato_giu');
+    const rialzo = n('rialzo_riparazione');
+    const cancellati = n('cancellato') + n('cancellato_veto')
+                     + n('cancellato_dato_assente') + n('cancellato_costo_vecchio')
+                     + n('cancellato_regola_fb');
+    const costoVecchio = n('fermo_costo_vecchio') + n('cancellato_costo_vecchio');
+    // Ordine capo 10/09: su muro e sconto non si emettono price cut, e un PC che
+    // entra in regola muro viene annullato. Una ADD non si cancella mai (uscirebbe
+    // dal feed): le si toglie solo il prezzo. Mig 113/114.
+    const regolaFb = n('cancellato_regola_fb');
+    const addSenzaPrezzo = n('prezzo_add_annullato');
+    const coda = n('in_coda');
+    const toccati = giu + rialzo + cancellati + addSenzaPrezzo;
+
+    if (toccati > 0) {
+      console.log(`[ProductSync/PcGuardian] "${tenant.name}": costo nuovo -> giu=${giu}, rialzo_riparazione=${rialzo}, cancellati=${cancellati} (di cui regola_fb=${regolaFb}), add_senza_prezzo=${addSenzaPrezzo}, costo_vecchio=${costoVecchio}, in_coda=${coda}`);
+      if (toccati >= 50) {
+        try {
+          await sendTelegram(`🛡️ <b>Guardiano PC</b> — ${tenant.name}\nCosto d'acquisto cambiato: ricalcolati giù ${giu}, rialzati al minimo consentito ${rialzo}, cancellati ${cancellati}${regolaFb > 0 ? ` (${regolaFb} entrati in muro/sconto)` : ''}${addSenzaPrezzo > 0 ? `, ADD lasciate senza prezzo ${addSenzaPrezzo}` : ''}.${coda > 0 ? `\nIn coda al prossimo giro: ${coda}.` : ''}`);
+        } catch (_) {}
+      }
+    } else {
+      console.log(`[ProductSync/PcGuardian] "${tenant.name}": nessun PC fuori floor sul costo di adesso`);
+    }
+    return { giu, rialzo, cancellati, regolaFb, addSenzaPrezzo, costoVecchio, coda };
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error(`[ProductSync/PcGuardian] "${tenant.name}" ERRORE:`, e.message);
+    return null;
+  } finally {
+    client.release();
+  }
+}
 
 let syncRunning = false;
 let syncRunningSince = null;
@@ -65,6 +128,9 @@ async function syncAllProducts() {
 
           await importProducts(tenant.id, rows[0].id);
           console.log(`[ProductSync] Tenant "${tenant.name}" sync complete`);
+
+          // Costi appena aggiornati -> riconferma immediata di tutti i price cut vivi
+          await reconfirmPriceCuts(tenant);
         });
       } catch (err) {
         console.error(`[ProductSync] Tenant "${tenant.name}" sync failed:`, err.message);
@@ -90,4 +156,4 @@ function startProductSync() {
   }, INITIAL_DELAY_MS);
 }
 
-module.exports = { startProductSync, syncAllProducts };
+module.exports = { startProductSync, syncAllProducts, reconfirmPriceCuts };

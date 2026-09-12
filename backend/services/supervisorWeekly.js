@@ -24,7 +24,10 @@ async function getClient(_tenantId) {
   const { getGlobal } = require('./globalConfig');
   const apiKey = await getGlobal('claude_api_key');
   if (!apiKey) throw new Error('Claude API key non configurata (global_config.claude_api_key)');
-  return new Anthropic({ apiKey });
+  const { getAiClient } = require('./aiClient');
+  const c = await getAiClient('supervisor_weekly', apiKey);
+  if (!c) throw new Error('nessun provider AI disponibile');
+  return c;
 }
 
 const SYSTEM_PROMPT = `Sei l'analyst settimanale di xHumanPro. Scrivi un report di review settimanale per il responsabile del tenant (responsabile e-commerce farmacia online).

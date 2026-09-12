@@ -4,7 +4,8 @@
  * "questa logica sui salvabilancio in e out la devi fare più volte al giorno"
  *
  * Ogni 4h, per ogni tenant attivo: prodotti sotto regole Salva Bilancio che
- * risultano in posizione VISIBILE (scraper_position <= 10) ma fuori dal CSV,
+ * risultano in posizione VISIBILE (entro la posizione bersaglio scritta nella
+ * regola di Ricarico del tenant, mig 119 — non una costante nostra) ma fuori dal CSV,
  * con stock, ricarico >= floor (grossista per-tenant via config, default 15%)
  * e senza lock (killer/quarantena/oblio) vengono ATTIVATI (coorte + civetta).
  * L'OUT è già gestito da strict filter + isteresi 72h + killer dinamico.
@@ -31,19 +32,24 @@ async function runSbSweep() {
     ),
     cand AS (
       SELECT p.tenant_id, t.name AS tname, p.sku, p.sell_price, p.erp_cost, p.erp_stock,
-        ROUND(phs.scraper_position) AS pos,
+        ROUND(phs.scraper_position) AS pos, pb.pos_bersaglio AS bersaglio,
         ROUND(((p.sell_price - p.erp_cost) / p.erp_cost * 100)::numeric, 1) AS ricarico,
         ROW_NUMBER() OVER (PARTITION BY p.tenant_id ORDER BY (p.sell_price - p.erp_cost) DESC) AS rk
       FROM products p
       JOIN tenants t ON t.id = p.tenant_id AND t.status = 'active'
       JOIN price_rules pr ON pr.tenant_id = p.tenant_id AND pr.rule_id = p.price_rule_id
       JOIN product_health_scores phs ON phs.tenant_id = p.tenant_id AND phs.sku = p.sku
+      JOIN v_posizione_bersaglio pb ON pb.tenant_id = p.tenant_id
       LEFT JOIN csv c ON c.tenant_id = p.tenant_id AND c.sku = p.sku
       LEFT JOIN health_config hcf ON hcf.tenant_id = p.tenant_id
         AND hcf.config_key = 'ricarico_floor_grossista'
       LEFT JOIN floor_overrides fo ON fo.tenant_id = p.tenant_id AND fo.sku = p.sku
       WHERE (pr.rule_type = 'salva_bilancio' OR pr.rule_name ~* 'salva')
-        AND phs.scraper_position <= 10
+        -- Mig 119: la posizione bersaglio sta nella regola di Ricarico del tenant
+        -- (Procaccini 5, Papa 8, SubitoFarma 12, Farmacri 15...), non in una costante
+        -- nostra. Il Salva Bilancio e' il ripiego di chi non ci arriva: se uno ci arriva
+        -- comunque, quello e' il candidato da rimettere in vetrina.
+        AND phs.scraper_position <= pb.pos_bersaglio
         AND c.sku IS NULL
         AND p.saleable = true AND (p.erp_stock + COALESCE(p.supplier_stock, 0)) > 0
         AND COALESCE(p.sell_price, 0) > 0 AND p.erp_cost > 0
@@ -62,7 +68,7 @@ async function runSbSweep() {
     ins_c AS (
       INSERT INTO activation_cohorts (cohort_name, tenant_id, sku, sell_price, ricarico_pct, scraper_position, erp_stock, note)
       SELECT $1, tenant_id, sku, sell_price, ricarico, pos, erp_stock,
-        'sb_sweep: pos ' || pos || ', ricarico ' || ricarico || '%'
+        'sb_sweep: pos ' || pos || ' (bersaglio ' || bersaglio || '), ricarico ' || ricarico || '%'
       FROM scelti RETURNING tenant_id, sku
     ),
     upd AS (

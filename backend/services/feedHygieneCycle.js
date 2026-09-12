@@ -90,6 +90,21 @@ async function runFeedHygieneCycle() {
       WHERE p.tenant_id=fa.tenant_id AND p.sku=fa.sku AND t.id=fa.tenant_id AND t.status='active'
         AND fa.recommended_price IS NOT NULL
         AND fa.action_source <> 'muro_scavalco'
+        -- Guardia legame regola (31/8): durante products_sync le price_rules
+        -- vengono rifatte PRIMA dei prodotti, quindi chi punta a un rule_id
+        -- gia' sparito non trova match e risulta fuori perimetro PC anche se
+        -- non lo e'. Misurato: 10.401 orfani su San Vito, 3.630 su Farmastelia
+        -- a sync in volo. Non si condanna su legame rotto.
+        AND (p.price_rule_id IS NULL OR EXISTS (
+              SELECT 1 FROM price_rules pr
+              WHERE pr.tenant_id = p.tenant_id AND pr.rule_id = p.price_rule_id))
+        -- Guardia sync in volo: a catalogo in scrittura anche sell_price ed
+        -- erp_cost sono in transito. Finestra 60 min per non restare bloccati
+        -- su un job incastrato.
+        AND NOT EXISTS (
+              SELECT 1 FROM import_jobs ij
+              WHERE ij.tenant_id = fa.tenant_id AND ij.job_type = 'products_sync'
+                AND ij.status = 'running' AND ij.created_at > NOW() - INTERVAL '60 minutes')
         AND (NOT is_price_cut_allowed(fa.tenant_id, fa.sku)
              OR fa.recommended_price > p.sell_price - 0.01
              OR fa.recommended_price < GREATEST(COALESCE(NULLIF(p.erp_cost,0),0),
@@ -213,7 +228,9 @@ async function runFeedHygieneCycle() {
           GROUP BY 1),
         muri2 AS (SELECT DISTINCT product_code FROM scraper_competitors
           WHERE scraped_at >= (NOW() AT TIME ZONE 'Europe/Rome') - INTERVAL '30 hours'
-          GROUP BY product_code, total_price HAVING COUNT(*) >= 3)
+          -- PREZZO SECCO (capo 21/8): il muro e' 3+ venditori allo stesso prezzo
+          -- PRODOTTO. Sul totale spedizioni diverse spezzavano muri veri.
+          GROUP BY product_code, base_price HAVING COUNT(*) >= 3)
         INSERT INTO feed_actions (tenant_id, sku, action, action_reason, action_source, current_price, recommended_price, computed_at, expires_at, status)
         SELECT c.tenant_id, c.sku, 'PRICE_CUT', 'cutback prezzi-saliti (igiene auto)', 'manual_pepita',
           p.sell_price, ROUND((sc.quarto-0.01)::numeric,2), NOW(), NOW()+INTERVAL '21 days', 'pending'

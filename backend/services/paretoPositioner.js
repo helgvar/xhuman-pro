@@ -99,7 +99,9 @@ async function runParetoPositioner() {
   const Anthropic = require('@anthropic-ai/sdk').default || require('@anthropic-ai/sdk');
   const key = await getGlobal('claude_api_key');
   if (!key) { console.error('[ParetoAI] claude_api_key mancante'); return; }
-  const client = new Anthropic({ apiKey: key });
+  const { getAiClient } = require('./aiClient');
+  const client = await getAiClient('pareto', key);
+  if (!client) throw new Error('nessun provider AI disponibile');
 
   const { rows: tenants } = await pool.query(
     "SELECT id, name FROM tenants WHERE status='active' ORDER BY name");

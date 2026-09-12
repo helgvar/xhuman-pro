@@ -103,7 +103,7 @@ async function createTest(tenantId, sku, opts = {}) {
 
   // 2. Trova competitor in posizione targetPos e prima
   const { rows: comp } = await pool.query(
-    `SELECT product_code, total_price, merchant, position
+    `SELECT product_code, base_price, total_price, merchant, position
      FROM scraper_competitors WHERE product_code = $1
        AND updated_at > NOW() - INTERVAL '48 hours'
      ORDER BY position ASC LIMIT 10`, [sku]);
@@ -125,7 +125,8 @@ async function createTest(tenantId, sku, opts = {}) {
   // attualmente è in posizione (N-1). Quindi prendiamo i competitor sopra di noi (prezzo>nostro)
   // ordinati per prezzo ASC e selezioniamo l'(N-2)-esimo (pos2→idx0, pos3→idx1).
   const above = competitorsExt
-    .map(c => ({ ...c, price: parseFloat(c.total_price) }))
+    // PREZZO SECCO (capo 21/8): prod.sell_price e' secco, il bersaglio pure
+    .map(c => ({ ...c, price: parseFloat(c.base_price) }))
     .filter(c => c.price > parseFloat(prod.sell_price))
     .sort((a, b) => a.price - b.price);
 
@@ -182,7 +183,7 @@ async function createTest(tenantId, sku, opts = {}) {
   `, [tenantId, sku, prod.product_name,
       `Pos 1 → pos ${targetPos}: ridurre click marginali mantenendo conversioni`,
       prod.sell_price, targetPrice, 1, targetPos,
-      targetCompetitor.merchant, targetCompetitor.total_price,
+      targetCompetitor.merchant, targetCompetitor.base_price,
       baselineDays, base.clicks, base.orders, base.revenue, baselineCpa,
       evalAt.toISOString(), endAt.toISOString(), createdBy]);
 

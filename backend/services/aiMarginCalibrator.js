@@ -27,7 +27,8 @@ async function getAnthropic() {
     const { getGlobal } = require('./globalConfig');
     const key = await getGlobal('claude_api_key');
     if (!key) return null;
-    return new Anthropic({ apiKey: key });
+    const { getAiClient } = require('./aiClient');
+    return await getAiClient('calibrator', key);
   } catch { return null; }
 }
 
@@ -67,18 +68,21 @@ async function runAiMarginCalibrator() {
       ROUND(COALESCE(p.applied_price, p.exported_price, p.sell_price)::numeric, 2) AS eff,
       p.sell_price AS listino, p.erp_cost,
       ROUND((p.erp_cost * CASE WHEN COALESCE(p.applied_price, p.sell_price) < 10 THEN 1.18 ELSE 1.15 END)::numeric, 2) AS floor_std,
-      (SELECT MAX(sc.total_price) FROM scraper_competitors sc
-       WHERE sc.product_code = a.sku AND sc.total_price > 0
+      -- PREZZO SECCO (capo 21/8): applied/exported/sell_price sono SECCHI, quindi
+      -- i vicini e la posizione si misurano su base_price. Col totale il
+      -- calibrator vedeva tutti i competitor "sopra di noi" e alzava a vuoto.
+      (SELECT MAX(sc.base_price) FROM scraper_competitors sc
+       WHERE sc.product_code = a.sku AND sc.base_price > 0
          AND sc.scraped_at >= NOW() - INTERVAL '48 hours'  -- guardrail freschezza (retention 7g)
-         AND sc.total_price < COALESCE(p.applied_price, p.exported_price, p.sell_price) - 0.005) AS vicino_sotto,
-      (SELECT MIN(sc.total_price) FROM scraper_competitors sc
-       WHERE sc.product_code = a.sku AND sc.total_price > 0
+         AND sc.base_price < COALESCE(p.applied_price, p.exported_price, p.sell_price) - 0.005) AS vicino_sotto,
+      (SELECT MIN(sc.base_price) FROM scraper_competitors sc
+       WHERE sc.product_code = a.sku AND sc.base_price > 0
          AND sc.scraped_at >= NOW() - INTERVAL '48 hours'  -- guardrail freschezza (retention 7g)
-         AND sc.total_price > COALESCE(p.applied_price, p.exported_price, p.sell_price) + 0.005) AS vicino_sopra,
+         AND sc.base_price > COALESCE(p.applied_price, p.exported_price, p.sell_price) + 0.005) AS vicino_sopra,
       (SELECT COUNT(*) + 1 FROM scraper_competitors sc
-       WHERE sc.product_code = a.sku AND sc.total_price > 0
+       WHERE sc.product_code = a.sku AND sc.base_price > 0
          AND sc.scraped_at >= NOW() - INTERVAL '48 hours'  -- guardrail freschezza (retention 7g)
-         AND sc.total_price < COALESCE(p.applied_price, p.exported_price, p.sell_price)) AS pos,
+         AND sc.base_price < COALESCE(p.applied_price, p.exported_price, p.sell_price)) AS pos,
       (SELECT pe.best_band FROM position_economics pe
        WHERE pe.tenant_id = a.tenant_id AND pe.sku = a.sku) AS banda_top,
       (SELECT dt.stato FROM demand_trends dt

@@ -29,7 +29,10 @@ async function getClient(_tenantId) {
   const { getGlobal } = require('./globalConfig');
   const apiKey = await getGlobal('claude_api_key');
   if (!apiKey) throw new Error('Claude API key non configurata (global_config.claude_api_key)');
-  return new Anthropic({ apiKey });
+  const { getAiClient } = require('./aiClient');
+  const c = await getAiClient('supervisor', apiKey);
+  if (!c) throw new Error('nessun provider AI disponibile');
+  return c;
 }
 
 // ─── TOOLS for the supervisor ─────────────────────────────

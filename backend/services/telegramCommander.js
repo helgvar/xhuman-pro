@@ -93,7 +93,9 @@ async function askAgent(userText) {
   const Anthropic = require('@anthropic-ai/sdk').default || require('@anthropic-ai/sdk');
   const key = await getGlobal('claude_api_key');
   if (!key) return 'Configurazione mancante (claude_api_key)';
-  const client = new Anthropic({ apiKey: key });
+  const { getAiClient } = require('./aiClient');
+  const client = await getAiClient('commander', key);
+  if (!client) return 'Nessun provider AI disponibile';
 
   const oggi = new Date().toISOString().slice(0, 10);
   if (giornoFallback !== oggi) { usaFallback = false; giornoFallback = oggi; }

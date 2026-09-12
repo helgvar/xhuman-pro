@@ -130,7 +130,9 @@ async function runMantraLoop() {
   let fonte = 'AI';
   try {
     const apiKey = await getApiKey();
-    const client = new Anthropic({ apiKey });
+    const { getAiClient } = require('./aiClient');
+    const client = await getAiClient('mantra', apiKey);
+    if (!client) throw new Error('nessun provider AI disponibile');
     const msg = await client.messages.create({
       model: MODEL,
       max_tokens: 2000,

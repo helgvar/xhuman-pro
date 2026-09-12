@@ -327,7 +327,7 @@ async function analyzeTenant(tenantId, opts = {}) {
       GROUP BY 1
     ),
     ord AS (
-      SELECT oi.sku, COUNT(DISTINCT o.id) AS ords, SUM(oi.row_total) AS rev
+      SELECT oi.sku, COUNT(DISTINCT o.id) AS ords, SUM(COALESCE(NULLIF(oi.row_total_incl_tax,0), oi.row_total)) AS rev
       FROM orders o JOIN order_items oi ON oi.order_id = o.id
       WHERE o.tenant_id = $1 AND o.order_status NOT IN ('canceled','closed','pending_payment')
         AND o.order_date::date >= CURRENT_DATE - 30

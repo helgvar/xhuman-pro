@@ -16,7 +16,8 @@
 
 const { pool } = require('../db/pool');
 const { importScraperData } = require('./driveScraper');
-const { syncCivettaFromMagento } = require('./farmaboosterProducts');
+const { syncCivettaFromMagento, importProducts } = require('./farmaboosterProducts');
+const { withTenantLock } = require('./apiQueue');
 const { computeHealthScores } = require('./productHealth');
 const { persistGA4Attribution } = require('./ga4Analytics');
 const { googleApiService } = require('./googleApi');
@@ -277,9 +278,58 @@ async function _runForAllTenantsInner() {
         }
       }
 
-      // Step 3: Feed Daily Engine (timeout 300s - query con JOIN orders può richiedere tempo)
-      await withStepTimeout('feed_daily', tenant.id, tLabel,
-        () => runDailyFeedEngine(tenant.id), 300 * 1000);
+      // Step 2c: COSTI FRESCHI PRIMA DELLA DECISIONE (ordine capo 6/8/2026).
+      // productSync girava su un cron indipendente: nessuna garanzia che i
+      // costi fossero aggiornati quando il motore decideva. Ora il refresh
+      // costi e' DENTRO la pipeline, subito prima di feed_daily, e se resta
+      // stantio il motore NON decide (fail-closed, cfr.
+      // feedback_ordine_dei_ragionamenti + feedback_pricing_freshness_critical).
+      const COST_REFRESH_AGE_SEC = 2 * 3600;  // oltre 2h: risincronizza
+      const COST_MAX_AGE_SEC = 4 * 3600;      // oltre 4h: non si decide
+      const costAge = async () => {
+        const { rows } = await pool.query(
+          `SELECT EXTRACT(EPOCH FROM (NOW() - MAX(updated_at))) AS sec
+           FROM products WHERE tenant_id = $1`, [tenant.id]
+        );
+        return rows[0]?.sec != null ? parseFloat(rows[0].sec) : Number.POSITIVE_INFINITY;
+      };
+      let ageSec = await costAge();
+      if (ageSec > COST_REFRESH_AGE_SEC) {
+        console.log(`[HealthCron] [${tLabel}] costi vecchi di ${Math.round(ageSec / 60)}min → refresh prima di decidere`);
+        await withStepTimeout('cost_refresh', tenant.id, tLabel, async () => {
+          const { rows: jr } = await pool.query(
+            `INSERT INTO import_jobs (tenant_id, job_type, status, metadata)
+             VALUES ($1, 'products_sync', 'pending', $2) RETURNING id`,
+            [tenant.id, JSON.stringify({ trigger: 'healthCron_pre_decision' })]
+          );
+          // La riga del job nasce PRIMA del lock, e `withTenantLock` rifiuta
+          // con throw se quel tenant è già in coda: senza questo catch la riga
+          // resta 'pending' per sempre e nessuno la chiude. Erano 452 orfani il
+          // 16/08 — che poi si leggono come "47 in coda" e fanno gridare la
+          // sentinella su una coda che non esiste.
+          try {
+            return await withTenantLock(tenant.id, () => importProducts(tenant.id, jr[0].id));
+          } catch (lockErr) {
+            await pool.query(
+              `UPDATE import_jobs SET status='failed', completed_at=NOW(), error_message=$1
+                WHERE id=$2 AND status='pending'`,
+              [String(lockErr.message).slice(0, 200), jr[0].id]
+            );
+            throw lockErr;
+          }
+        }, 900 * 1000);
+        ageSec = await costAge();
+      }
+      if (ageSec > COST_MAX_AGE_SEC) {
+        // Fail-closed: meglio nessuna decisione che una condanna su costi stantii.
+        log.error(`feed_daily SKIP: costi stantii (${Math.round(ageSec / 60)}min)`,
+          { source: 'healthCron', tenantId: tenant.id, tenantName: tLabel, costAgeSec: Math.round(ageSec) });
+        console.warn(`[HealthCron] [${tLabel}] feed_daily SKIP: costi stantii da ${Math.round(ageSec / 60)}min (soglia ${COST_MAX_AGE_SEC / 60}min)`);
+      } else {
+        // Step 3: Feed Daily Engine (timeout 300s - query con JOIN orders può richiedere tempo)
+        await withStepTimeout('feed_daily', tenant.id, tLabel,
+          () => runDailyFeedEngine(tenant.id), 300 * 1000);
+      }
 
       // Step 4: Reactivations (timeout 60s)
       await withStepTimeout('reactivations', tenant.id, tLabel,

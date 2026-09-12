@@ -102,6 +102,81 @@ const UNBREAKABLE_RULES = [
   },
 ];
 
+// ─── GUARDIE ASINCRONE SULLE RIMOZIONI ──────────────────
+//
+// Le UNBREAKABLE_RULES qui sopra sono sincrone, quindi possono guardare solo
+// quello che l'azione si porta dietro: numeri di prodotti e prezzi. Sulla
+// RIMOZIONE dal feed questo non basta — le ondate di taglio fatte a mano hanno
+// sempre avuto quattro guardie che leggono il DB, e l'agente non ne aveva
+// nessuna. Poteva togliere dal feed un prodotto che vende, uno a magazzino, o
+// condannare per "non vende" chi non ha abbastanza click perche' quel giudizio
+// abbia senso.
+//
+// Sono invalicabili come le altre: non esiste conferma ne' password che le apra.
+// Le vendite si contano SOLO sugli ordini reali Magento, con la whitelist degli
+// stati (gli annullati non sono vendite e non devono nemmeno salvare uno SKU).
+const STATI_ORDINE_VALIDI = ['complete', 'processing', 'pending', 'Ritirato', 'ritiro_farmacia', 'ritiro_sede_tmp'];
+
+async function guardieRimozione(action, tenantId) {
+  if (action.type !== 'remove' || !action.skus?.length) return null;
+  const skus = action.skus;
+  const inBlocco = skus.length > 1;
+
+  // Vendite proprie a 30gg, click TP a 30gg e stock, in una lettura sola.
+  // order_date e' in Europe/Rome, NOW() e' UTC: si converte su entrambi i lati.
+  // zombie_clicks e' l'unica sorgente dei click (fetch_date, non click_date).
+  const { rows } = await pool.query(`
+    SELECT p.sku,
+           COALESCE(p.erp_stock, 0) AS erp_stock,
+           COALESCE(v.pezzi, 0)     AS venduti_30gg,
+           COALESCE(z.click, 0)     AS click_30gg
+    FROM products p
+    LEFT JOIN (
+      SELECT oi.sku, SUM(oi.qty_ordered) AS pezzi
+      FROM order_items oi
+      JOIN orders o ON o.id = oi.order_id AND o.tenant_id = oi.tenant_id
+      WHERE oi.tenant_id = $1
+        AND oi.sku = ANY($2)
+        AND o.order_status = ANY($3)
+        AND (o.order_date AT TIME ZONE 'Europe/Rome') >= ((NOW() AT TIME ZONE 'Europe/Rome') - INTERVAL '30 days')
+      GROUP BY oi.sku
+    ) v ON v.sku = p.sku
+    LEFT JOIN (
+      SELECT product_code, SUM(clicks) AS click
+      FROM zombie_clicks
+      WHERE tenant_id = $1
+        AND product_code = ANY($2)
+        AND fetch_date >= (CURRENT_DATE - INTERVAL '30 days')
+      GROUP BY product_code
+    ) z ON z.product_code = p.sku
+    WHERE p.tenant_id = $1 AND p.sku = ANY($2)
+  `, [tenantId, skus, STATI_ORDINE_VALIDI]);
+
+  for (const r of rows) {
+    const venduti = parseInt(r.venduti_30gg) || 0;
+    const click = parseInt(r.click_30gg) || 0;
+    const stock = parseInt(r.erp_stock) || 0;
+
+    // G1 — chi vende non si tocca. Vale per uno come per mille.
+    if (venduti > 0) {
+      return { id: 'remove_venditore', motivo: `${r.sku} ha venduto ${venduti} pezzi in 30gg (ordini reali): non si rimuove chi vende` };
+    }
+    // G2 — il magazzino della farmacia si spinge, non si toglie dalla vetrina.
+    if (stock > 0) {
+      return { id: 'remove_magazzino', motivo: `${r.sku} ha ${stock} pezzi a magazzino: le condanne escludono il magazzino` };
+    }
+    // G3 — "zero vendite" e' un giudizio, e sotto i 15 click e' rumore.
+    if (click > 0 && click < 15) {
+      return { id: 'remove_rumore', motivo: `${r.sku} ha solo ${click} click in 30gg: sotto i 15 click "non vende" non e' misurabile, e' rumore` };
+    }
+    // G4 — un portatore di traffico si valuta uno per uno, mai dentro un blocco.
+    if (inBlocco && click >= 5) {
+      return { id: 'remove_portatore_in_blocco', motivo: `${r.sku} porta ${click} click in 30gg: i portatori di traffico si tolgono uno alla volta, non in blocco da ${skus.length}` };
+    }
+  }
+  return null;
+}
+
 // ─── SAFETY LEVELS ──────────────────────────────────────
 
 function calculateSafetyLevel(action, ctx) {
@@ -109,8 +184,11 @@ function calculateSafetyLevel(action, ctx) {
   const feedPct = ctx.feedSize > 0 ? (skuCount / ctx.feedSize) * 100 : 0;
 
   if (action.type === 'remove') {
-    if (skuCount <= 10) return 'safe';
-    if (skuCount <= 100) return 'risky';
+    // Nessun `safe` sulla rimozione: e' l'unica azione che condanna, e la
+    // condanna viene per ultima. Prima valeva `safe` fino a 10 SKU, cioe' una
+    // frase in chat toglieva dieci prodotti dal feed senza che nessuno
+    // confermasse. Ora si passa sempre dalla mano di chi legge.
+    if (skuCount <= 50) return 'risky';
     return 'critical';
   }
 
@@ -169,6 +247,17 @@ async function checkAction(action, tenantId, sessionId) {
         ruleId: rule.id,
       };
     }
+  }
+
+  // 2-bis. Guardie che devono leggere il DB (vendite, stock, click)
+  const guardia = await guardieRimozione(action, tenantId);
+  if (guardia) {
+    return {
+      allowed: false,
+      safetyLevel: 'blocked',
+      reason: guardia.motivo,
+      ruleId: guardia.id,
+    };
   }
 
   // 3. Check tenant-specific rules
@@ -273,7 +362,10 @@ async function verifyAdminPassword(userId, password) {
 
 module.exports = {
   UNBREAKABLE_RULES,
+  STATI_ORDINE_VALIDI,
+  guardieRimozione,
   checkAction,
+  checkTenantRule,
   calculateSafetyLevel,
   verifyAdminPassword,
 };

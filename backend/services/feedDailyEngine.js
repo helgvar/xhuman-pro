@@ -17,6 +17,7 @@
 
 const { pool } = require('../db/pool');
 const { calculateCompetitivePriceCut } = require('./feedPriceOptimizer');
+const { VALID_STATUSES } = require('./magentoOrders');
 
 const DEFAULT_CPC = 0.27; // EUR per click (netto, IVA esclusa)
 
@@ -221,13 +222,14 @@ async function buildGlobalSnapshot(tenantId, config) {
     // Magento: tutti ordini store nel periodo TP attivo
     const { rows: [orderData] } = await pool.query(`
       SELECT COUNT(DISTINCT o.id) as order_count,
-             COALESCE(SUM(oi.row_total), 0) as revenue
+             COALESCE(SUM(COALESCE(NULLIF(oi.row_total_incl_tax,0), oi.row_total)), 0) as revenue
       FROM orders o
       JOIN order_items oi ON oi.order_id = o.id
       WHERE o.tenant_id = $1
+        AND o.order_status = ANY($4)
         AND o.order_date >= $2::date
         AND o.order_date < ($3::date + INTERVAL '1 day')
-    `, [tenantId, firstDay, lastDay]);
+    `, [tenantId, firstDay, lastDay, VALID_STATUSES]);
     totalRevenue = parseFloat(orderData.revenue) || 0;
     totalOrders = parseInt(orderData.order_count) || 0;
   }
@@ -282,16 +284,17 @@ async function updateDailyTracking(tenantId, config) {
     // Get orders for this date (margin from product catalog, not order_items)
     const { rows: orders } = await pool.query(`
       SELECT oi.sku, COUNT(DISTINCT o.id) as order_count,
-             SUM(oi.row_total) as revenue,
+             SUM(COALESCE(NULLIF(oi.row_total_incl_tax,0), oi.row_total)) as revenue,
              SUM(COALESCE(p2.margin, 0) * oi.qty_ordered) as margin_earned
       FROM orders o
       JOIN order_items oi ON oi.order_id = o.id
       LEFT JOIN products p2 ON p2.sku = oi.sku AND p2.tenant_id = o.tenant_id
       WHERE o.tenant_id = $1
+        AND o.order_status = ANY($3)
         AND o.order_date >= $2::date
         AND o.order_date < ($2::date + INTERVAL '1 day')
       GROUP BY oi.sku
-    `, [tenantId, dateStr]);
+    `, [tenantId, dateStr, VALID_STATUSES]);
 
     const orderMap = new Map(orders.map(o => [o.sku, o]));
 
@@ -420,8 +423,8 @@ async function detectKillers(tenantId) {
     WITH cross_orders_30d AS (
       SELECT oi.sku, COUNT(DISTINCT o.id) as ord_30d
       FROM orders o JOIN order_items oi ON oi.order_id = o.id
-      WHERE o.order_status NOT IN ('canceled','closed','pending_payment')
-        AND o.order_date >= NOW() - INTERVAL '15 days'
+      WHERE o.order_status IN ('processing','pending','complete','ritiro_farmacia','Ritirato')
+        AND o.order_date >= NOW() - INTERVAL '30 days'
       GROUP BY oi.sku
     )
     SELECT p.sku, p.product_name,
@@ -524,15 +527,19 @@ async function triageProducts(tenantId, config, snapshot, ruleSet = null) {
     -- su alcuni tenant rendeva l'incidenza calcolata 9999% e tutti i SKU
     -- diventavano "burner alta incidenza" anche se in realta' convertono.
     -- Usiamo il revenue dei veri ordini Magento per il calcolo bypass safety net.
+    -- FIX 6/8/2026: era INTERVAL '15 days' contro un tp_click_cost_30d che
+    -- valeva TUTTA la storia click. Incidenza gonfiata 4x-15x, burner finti.
+    -- Ora 30 giorni pieni su entrambi i lati, IVA inclusa (erp_cost e' IVA incl.)
+    -- e stato ordine in WHITELIST (la blacklist lasciava passare payment_review).
     actual_rev_30d AS (
       SELECT oi.sku,
-        SUM(oi.row_total) as rev_30d,
+        SUM(oi.row_total_incl_tax) as rev_30d,
         COUNT(DISTINCT o.id) as ord_30d
       FROM orders o
       JOIN order_items oi ON oi.order_id = o.id
       WHERE o.tenant_id = $1
-        AND o.order_status NOT IN ('canceled','closed','pending_payment')
-        AND o.order_date >= NOW() - INTERVAL '15 days'
+        AND o.order_status IN ('processing','pending','complete','ritiro_farmacia','Ritirato')
+        AND o.order_date >= NOW() - INTERVAL '30 days'
       GROUP BY oi.sku
     )
     SELECT pt.*,
@@ -972,8 +979,8 @@ async function findPriceCutCandidates(tenantId, config, snapshot) {
           AND COALESCE(p.margin, p.sell_price - p.erp_cost)
               * (SELECT COUNT(DISTINCT o.id) FROM orders o JOIN order_items oi ON oi.order_id=o.id
                  WHERE o.tenant_id=p.tenant_id AND oi.sku=p.sku
-                 AND o.order_status NOT IN ('canceled','closed','pending_payment')
-                 AND o.order_date >= NOW() - INTERVAL '15 days')
+                 AND o.order_status IN ('processing','pending','complete','ritiro_farmacia','Ritirato')
+                 AND o.order_date >= NOW() - INTERVAL '30 days')
               < COALESCE(phs.tp_click_cost_30d, 0) * 1.0
         )
       )
@@ -1387,8 +1394,8 @@ async function findStoreSellerPromotions(tenantId, config, snapshot, excludeSkus
           OR EXISTS (
             SELECT 1 FROM orders o JOIN order_items oi ON oi.order_id=o.id
             WHERE o.tenant_id=p.tenant_id AND oi.sku=p.sku
-              AND o.order_status NOT IN ('canceled','closed','pending_payment')
-              AND o.order_date >= NOW() - INTERVAL '15 days'
+              AND o.order_status IN ('processing','pending','complete','ritiro_farmacia','Ritirato')
+              AND o.order_date >= NOW() - INTERVAL '30 days'
           )
         )
         AND phs.scraper_best_price > 0
@@ -1614,7 +1621,15 @@ async function applyActions(tenantId, actions, config) {
                    -- spesa click era ripartita, in silenzio. La mano del capo
                    -- non deve dipendere da un prefisso: ogni 'capo_%' resta.
                    -- Il vincolo expires_at sotto continua a farle decadere.
-                   AND action_source NOT LIKE 'capo\_%' ESCAPE '\')
+                   AND action_source NOT LIKE 'capo\_%' ESCAPE '\'
+                   -- 12/8: stessa trappola sull'agente in chat. Le sue righe
+                   -- erano firmate 'agent' e nessuno le aveva messe qui: il
+                   -- rerun le spazzava, l'agente aveva detto "fatto" e il
+                   -- prodotto tornava in vetrina a spendere. Peggio, e' proprio
+                   -- l'agente a poter lanciare questo motore. Adesso restano —
+                   -- ma nascono con expires_at a 7 giorni, quindi la riga qui
+                   -- sotto le fa comunque decadere da sole.
+                   AND action_source <> 'agent')
                OR expires_at < NOW())
       `, [tenantId]);
       await dClient.query('COMMIT');
@@ -1889,7 +1904,30 @@ async function buildRuleSet(tenantId, rules, priceRulesMap) {
   };
 }
 
+/**
+ * Porta d'ingresso del motore giornaliero.
+ *
+ * Il lucchetto sta qui e non nei chiamanti perche' le porte sono due — il cron
+ * notturno e `recalculate_feed` dell'agente in chat — e finora non sapevano
+ * l'una dell'altra. Due giri sovrapposti sullo stesso tenant si pestano sul
+ * DELETE di `feed_actions`: il primo ha cancellato e sta riscrivendo, il
+ * secondo ricancella e riscrive con un'altra fotografia. Il feed che esce non
+ * e' il risultato di nessuno dei due.
+ *
+ * Chi trova occupato riceve `{ error: 'locked' }` e non aspetta: un ricalcolo
+ * messo in coda partirebbe comunque su numeri vecchi.
+ */
 async function runDailyFeedEngine(tenantId) {
+  const { conLockFeed } = require('./feedLock');
+  const { preso, risultato } = await conLockFeed(tenantId, () => eseguiMotoreGiornaliero(tenantId));
+  if (!preso) {
+    console.log(`[FeedDaily] SALTATO per tenant ${tenantId.slice(0, 8)}: ricalcolo gia' in corso`);
+    return { error: 'locked' };
+  }
+  return risultato;
+}
+
+async function eseguiMotoreGiornaliero(tenantId) {
   console.log(`[FeedDaily] Starting for tenant ${tenantId.slice(0, 8)}...`);
 
   const config = await loadConfig(tenantId);

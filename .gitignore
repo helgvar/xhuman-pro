@@ -5,3 +5,7 @@ dist/
 *.log
 .DS_Store
 pgdata/
+
+# spazzatura macOS (AppleDouble)
+._*
+.DS_Store

@@ -93,9 +93,19 @@ async function assembleProductData(tenantId, sellerName) {
      FROM zombie_clicks WHERE tenant_id = $1`,
     [tenantId]
   );
-  const clickFirstDate = clickRange?.first_click || new Date(Date.now() - 30 * 86400000);
+  // FIX 6/8/2026 (ordine capo): la finestra era MIN(fetch_date) = TUTTA LA STORIA
+  // dei click (Papa 225 giorni, Procaccini 143), non 30. I campi tp_clicks_30d /
+  // tp_click_cost_30d mentivano, e feedDailyEngine li confrontava con un revenue
+  // a 15 giorni: incidenza gonfiata 4x-15x e burner finti a valanga.
+  // Ora finestra = intersezione fra 30 giorni e la storia click davvero disponibile
+  // (se un tenant ha meno di 30 giorni di click, gli ordini restano allineati a
+  // quel periodo — altrimenti si conterebbe fatturato senza click a denominatore).
+  const HEALTH_WINDOW_DAYS = 30;
+  const windowStart = new Date(Date.now() - HEALTH_WINDOW_DAYS * 86400000);
+  const firstClick = clickRange?.first_click ? new Date(clickRange.first_click) : null;
+  const clickFirstDate = (firstClick && firstClick > windowStart) ? firstClick : windowStart;
   const clickDays = parseInt(clickRange?.days) || 0;
-  console.log(`[Health] Date alignment: clicks ${clickRange?.first_click || 'none'} → ${clickRange?.last_click || 'none'} (${clickDays} days), orders aligned to same range`);
+  console.log(`[Health] Finestra ${HEALTH_WINDOW_DAYS}g: da ${clickFirstDate.toISOString().slice(0, 10)} (storia click ${clickRange?.first_click || 'none'} → ${clickRange?.last_click || 'none'}, ${clickDays} giorni), ordini allineati alla stessa finestra`);
 
   const { rows } = await pool.query(`
     SELECT
@@ -189,7 +199,9 @@ async function assembleProductData(tenantId, sellerName) {
     LEFT JOIN LATERAL (
       SELECT
         COUNT(DISTINCT oi.order_id) as tp_orders,
-        SUM(oi.row_total) as tp_revenue,
+        -- row_total e' IVA ESCLUSA mentre tp_cogs esce da erp_cost IVA INCLUSA:
+        -- confrontarli sottostimava il fatturato del ~12,7% (mig/legge IVA 6/8).
+        SUM(oi.row_total_incl_tax) as tp_revenue,
         -- COGS col COSTO VERO della sorgente (mig 066, ordine capo 16/7):
         -- magazzino farmacia -> erp_purchase_cost; grossista -> erp_cost MIN_COST.
         -- Prima erp_cost secco -> margini negativi FINTI e burner classificati male.
@@ -206,7 +218,7 @@ async function assembleProductData(tenantId, sellerName) {
       WHERE oi.tenant_id = $1
         AND oi.sku = p.sku
         AND o.order_date >= $3::date
-        AND o.order_status NOT IN ('canceled','closed','pending_payment')
+        AND o.order_status IN ('processing','pending','complete','ritiro_farmacia','Ritirato')
     ) oa ON true
 
     WHERE p.tenant_id = $1
@@ -870,7 +882,7 @@ async function getGlobalPnl(tenantId) {
       COALESCE(SUM(grand_total), 0) as store_revenue
     FROM orders
     WHERE tenant_id = $1
-      AND order_status NOT IN ('canceled','closed','pending_payment')
+      AND order_status IN ('processing','pending','complete','ritiro_farmacia','Ritirato')
       AND order_date >= NOW() - INTERVAL '30 days'
   `, [tenantId]);
 
@@ -1010,11 +1022,11 @@ async function getWeeklyBreakdown(tenantId) {
       SELECT
         date_trunc('week', o.order_date)::date as week_start,
         COUNT(DISTINCT o.id) as orders,
-        SUM(oi.row_total) as revenue
+        SUM(COALESCE(NULLIF(oi.row_total_incl_tax,0), oi.row_total)) as revenue
       FROM orders o
       JOIN order_items oi ON oi.order_id = o.id AND oi.tenant_id = o.tenant_id
       WHERE o.tenant_id = $1
-        AND o.order_status NOT IN ('canceled','closed','pending_payment')
+        AND o.order_status IN ('processing','pending','complete','ritiro_farmacia','Ritirato')
         AND o.order_date >= CURRENT_DATE - INTERVAL '4 weeks'
       GROUP BY date_trunc('week', o.order_date)
     )

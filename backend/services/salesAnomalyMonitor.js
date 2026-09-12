@@ -24,7 +24,12 @@ async function runSalesAnomalyMonitor() {
     WITH enabled AS (
       SELECT t.id, t.name,
         COALESCE((SELECT hc2.config_value FROM health_config hc2
-                  WHERE hc2.tenant_id = t.id AND hc2.config_key = 'tp_budget_exhausted'), '0') AS budget_out
+                  WHERE hc2.tenant_id = t.id AND hc2.config_key = 'tp_budget_exhausted'
+                    -- FIX 6/8/2026: la scadenza va onorata come negli altri 5 consumatori
+                    -- (mantraLoop, sellerGuard, burnerIncidence, pcDecay, alertMonitor).
+                    -- Senza, un flag scaduto silenzia per sempre: Procaccini fuori dal
+                    -- monitor dal 21/7 con expires_at 22/7 e 3.942 click in 7 giorni.
+                    AND (hc2.expires_at IS NULL OR hc2.expires_at > NOW())), '0') AS budget_out
       FROM tenants t
       JOIN health_config hc ON hc.tenant_id = t.id
         AND hc.config_key = 'sales_monitor' AND hc.config_value = 'on'

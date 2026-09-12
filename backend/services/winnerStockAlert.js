@@ -19,7 +19,7 @@ async function checkWinnersAtRisk() {
   const { rows } = await pool.query(`
     WITH winner_sales AS (
       SELECT o.tenant_id, oi.sku, COUNT(DISTINCT o.id) AS ord_30d,
-             SUM(oi.row_total) AS rev_30d
+             SUM(COALESCE(NULLIF(oi.row_total_incl_tax,0), oi.row_total)) AS rev_30d
       FROM orders o JOIN order_items oi ON oi.order_id = o.id
       WHERE o.order_date >= NOW() - INTERVAL '30 days'
         AND o.order_status NOT IN ('canceled','closed','pending_payment')

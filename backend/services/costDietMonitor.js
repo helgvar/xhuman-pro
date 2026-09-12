@@ -39,7 +39,10 @@ async function runCostDietMonitor() {
       // Budget TP esaurito: cali di ordini ambigui, non attribuibili al taglio
       const { rows: silenced } = await pool.query(`
         SELECT 1 FROM health_config
-        WHERE tenant_id = $1 AND config_key = 'tp_budget_exhausted' AND config_value = '1'`, [t.id]);
+        WHERE tenant_id = $1 AND config_key = 'tp_budget_exhausted' AND config_value = '1'
+          -- FIX 6/8/2026: la scadenza va onorata come negli altri consumatori.
+          -- Senza, un flag scaduto sospende la valutazione per sempre.
+          AND (expires_at IS NULL OR expires_at > NOW())`, [t.id]);
       if (silenced.length > 0) {
         righe.push(`⏸ ${t.name}: budget TP esaurito, valutazione sospesa`);
         continue;

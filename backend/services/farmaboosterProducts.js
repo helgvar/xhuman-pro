@@ -345,6 +345,124 @@ async function importProducts(tenantId, jobId = null) {
         console.error('[Products] Civetta audit error:', civErr.message);
       }
 
+      // Step 5: REGISTRO COSTI (6/8/2026). Farmabooster ci manda una
+      // fotografia: `products` porta il costo di adesso e basta, senza data.
+      // A ogni sync la fotografia precedente veniva sovrascritta e persa, cosi'
+      // il costo di ieri non esisteva piu' da nessuna parte. Non e' un limite
+      // dell'API: e' che non lo salvavamo.
+      //
+      // Qui si fissa il costo del giorno, una riga per (sku, giorno, fonte).
+      // La chiave primaria assorbe i sync successivi dello stesso giorno:
+      // l'ultimo passaggio della giornata vince, niente gonfiaggio.
+      //
+      // Tre fonti separate perche' rispondono a domande diverse:
+      //   erp_acquisto = quanto ha PAGATO la farmacia (il floor vero quando
+      //                  c'e' stock fisico)
+      //   grossista_min = il miglior grossista del momento (costo di riacquisto)
+      //   min_blended  = il minimo fra i due, quello su cui FB calcola il markup
+      // Il costo 0 non si registra: e' assenza di dato, non un costo.
+      //
+      // Si scrive SOLO QUANDO IL COSTO CAMBIA. Un costo e' una funzione a
+      // gradini, non un campionamento: scrivere ogni giorno tutto il catalogo
+      // farebbe 896.000 righe al giorno (27 milioni in un mese) per ripetere
+      // sempre lo stesso numero. Con il gradino la serie e' identica — il costo
+      // di un giorno qualunque e' l'ultima riga con data <= quel giorno — e il
+      // volume dopo la prima passata scende a qualche migliaio.
+      let costiRegistrati = 0;
+      try {
+        const { rowCount } = await pool.query(`
+          WITH nuovo AS (
+            SELECT p.tenant_id, p.sku, f.source, f.costo
+            FROM products p
+            CROSS JOIN LATERAL (VALUES
+              ('erp_acquisto',  p.erp_purchase_cost),
+              ('grossista_min', p.supplier_min_cost),
+              ('min_blended',   p.erp_cost)
+            ) AS f(source, costo)
+            WHERE p.tenant_id = $1 AND f.costo IS NOT NULL AND f.costo > 0
+          ),
+          ultimo AS (
+            SELECT DISTINCT ON (h.sku, h.source) h.sku, h.source, h.costo
+            FROM product_cost_history h
+            WHERE h.tenant_id = $1
+            ORDER BY h.sku, h.source, h.data DESC
+          )
+          INSERT INTO product_cost_history (tenant_id, sku, data, source, costo, updated_at)
+          SELECT n.tenant_id, n.sku, (NOW() AT TIME ZONE 'Europe/Rome')::date, n.source, n.costo, NOW()
+          FROM nuovo n
+          LEFT JOIN ultimo u ON u.sku = n.sku AND u.source = n.source
+          WHERE u.costo IS NULL OR u.costo <> n.costo
+          ON CONFLICT (tenant_id, sku, data, source)
+          DO UPDATE SET costo = EXCLUDED.costo, updated_at = NOW()
+        `, [tenantId]);
+        costiRegistrati = rowCount;
+      } catch (costErr) {
+        // Il registro non deve mai far cadere il sync: e' una scatola nera,
+        // non un ingranaggio.
+        console.error('[Products] Registro costi error:', costErr.message);
+      }
+      // Step 6: REGISTRO PREZZI (6/8/2026, mig 094). Stessa medicina, altra
+      // gamba. Un margine retroattivo sbagliato si fa in due modi: col costo di
+      // oggi su un prezzo di ieri (il bug che ha inventato 54 sotto-costo su
+      // MPF) oppure col prezzo di oggi su un costo di ieri. Registrare solo i
+      // costi avrebbe chiuso una porta e lasciato aperta l'altra.
+      //
+      // Tre fonti, perche' "il prezzo" non e' un numero solo. Su LACTOFLORENE
+      // 988039778 il 6/8: sell_price 16,20 (listino FB), applied_price 8,85 —
+      // ed 8,85 e' la cifra a cui ha davvero venduto il 13/7. Chi confondesse
+      // le due rifarebbe l'errore con un altro nome.
+      //   fb_pubblico -> sell_price, il Prezzo al Pubblico: e' la serie che il
+      //                  backfill di /pricehistory copre all'indietro, e questo
+      //                  gradino la prosegue in avanti
+      //   applicato   -> applied_price, quello che incassa
+      //   esportato   -> exported_price, quello che vede Trovaprezzi
+      //
+      // NB: FB manda 4 decimali (16,1950) mentre sell_price ne tiene 2 (16,20).
+      // Nel punto in cui il backfill passa il testimone al gradino esce un
+      // gradino da mezzo centesimo, una volta sola per SKU. Non vale la pena
+      // buttare la precisione di FB per evitarlo.
+      let prezziRegistrati = 0;
+      try {
+        const { rowCount } = await pool.query(`
+          WITH nuovo AS (
+            SELECT p.tenant_id, p.sku, f.source, f.prezzo
+            FROM products p
+            CROSS JOIN LATERAL (VALUES
+              ('fb_pubblico', p.sell_price),
+              ('applicato',   p.applied_price),
+              ('esportato',   p.exported_price)
+            ) AS f(source, prezzo)
+            WHERE p.tenant_id = $1 AND f.prezzo IS NOT NULL AND f.prezzo > 0
+          ),
+          ultimo AS (
+            SELECT DISTINCT ON (h.sku, h.source) h.sku, h.source, h.prezzo
+            FROM product_price_history h
+            WHERE h.tenant_id = $1
+            ORDER BY h.sku, h.source, h.data DESC
+          )
+          INSERT INTO product_price_history (tenant_id, sku, data, source, prezzo, updated_at)
+          SELECT n.tenant_id, n.sku, (NOW() AT TIME ZONE 'Europe/Rome')::date, n.source, n.prezzo, NOW()
+          FROM nuovo n
+          LEFT JOIN ultimo u ON u.sku = n.sku AND u.source = n.source
+          WHERE u.prezzo IS NULL OR u.prezzo <> n.prezzo
+          ON CONFLICT (tenant_id, sku, data, source)
+          DO UPDATE SET prezzo = EXCLUDED.prezzo, updated_at = NOW()
+        `, [tenantId]);
+        prezziRegistrati = rowCount;
+      } catch (prezErr) {
+        console.error('[Products] Registro prezzi error:', prezErr.message);
+      }
+
+      // Battito per la guardia dei registri (costHistoryCron): si scrive anche
+      // con zero variazioni. Una giornata senza variazioni di costo e' normale;
+      // un registro che non viene interrogato da 4 ore no.
+      try {
+        await require('./costHistoryCron').battito(tenantId);
+      } catch (beatErr) {
+        console.error('[Products] battito registri storici:', beatErr.message);
+      }
+      console.log(`[Products] Registri storici: ${costiRegistrati} variazioni costo, ${prezziRegistrati} variazioni prezzo fissate per oggi`);
+
       // Complete
       if (jobId) {
         await pool.query(

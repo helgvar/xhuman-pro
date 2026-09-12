@@ -14,6 +14,13 @@ if (fs.existsSync(envPath)) {
 
 const { initDB } = require('./db/pool');
 
+// 💓 Battito dei loop (mig 117, ordine capo 10/09: un monitor che ogni ora
+// controlla tutti i loop e sblocca quelli bloccati). Va per PRIMO: avvolge
+// setInterval/setTimeout, quindi deve essere in piedi prima che un servizio ne
+// schedule uno. Registra ogni schedulazione da 60s in su in loop_heartbeat.
+const { startLoopHeartbeat } = require('./services/loopHeartbeat');
+startLoopHeartbeat();
+
 // Defensive: log unhandled rejections instead of crashing the process.
 // A single tenant misconfiguration (e.g. missing API permission) must not take down
 // the entire backend and bring all crons to a halt.
@@ -124,6 +131,7 @@ app.use('/api/ai-audit', aiAuditRoutes);
 app.use('/api/oblio', require('./routes/oblio'));
 app.use('/api/capo-ordini', require('./routes/capoOrdini'));
 app.use('/api/arbitro', require('./routes/arbitro'));
+app.use('/api/coda-lunga', require('./routes/codaLunga'));
 
 // Start server
 async function start() {
@@ -186,6 +194,18 @@ async function start() {
     const { start: startConformityMonitor } = require('./services/conformityMonitor');
     startConformityMonitor();
 
+    // 🔬 Test feed 24h su Papa (ordine capo 5/8): giovedì 6/8 dalle 00:00 alle
+    // 00:15 del 7 il feed civetta=1 di Papa contiene SOLO i venditori 90gg.
+    // Riconciliatore a tempo, un solo tenant, si spegne e si pulisce da solo.
+    const { start: startFeedTestPapa } = require('./services/feedTestPapa');
+    startFeedTestPapa();
+
+    // ♻️ Refresh SOLO-ADD delle whitelist forzate: chi vende negli ultimi 7
+    // giorni rientra in vetrina da solo. Misurato l'11/8 su Papa: 81 SKU fuori
+    // whitelist avevano fatto 1.909 EUR in 5 giorni. Non rimuove mai nessuno.
+    const { start: startWhitelistRefresh } = require('./services/whitelistRefresh');
+    startWhitelistRefresh();
+
     // ✂️ Lima costante (ordine permanente capo 15/7): ogni mattina 06:15 IT
     // pochi burner cliccati zero-vendite fuori dal feed — poco ma costante
     const { start: startLimaCostante } = require('./services/limaCostanteCron');
@@ -225,6 +245,20 @@ async function start() {
     const { startPcGuardian } = require('./services/pcGuardianCron');
     startPcGuardian();
 
+    // 💰 Guardia G6 sui CAMBI COSTO (ordine capo 10/09): "io farei un loop
+    // supplementare sul controllo dei costi che monitora i cambi costo".
+    // Ogni 20 min legge product_cost_history, trova i costi cambiati davvero
+    // nell'ultima ora e mezza sotto un PC vivo, li registra in
+    // cambio_costo_allarme e, se il cambio ha portato il taglio sotto il floor,
+    // lancia subito la riconferma su quel tenant. Mig 110.
+    const { startCostChangeWatch } = require('./services/costChangeWatchCron');
+    startCostChangeWatch();
+
+    // 🐕 CANE DA GUARDIA DEI LOOP (ordine capo 10/09). Mig 117: sblocca i job
+    // zombie, termina le sessioni appese, segnala i loop senza battito.
+    const { startLoopWatchdog } = require('./services/loopWatchdogCron');
+    startLoopWatchdog();
+
     // 🔬 Monitor supplementare TEST Pareto Positioning (ordine capo 24/7): ogni
     // 30 min fotografa costo/PC/margine/posizione dei PC 'pareto_positioning' in
     // pareto_test_snapshots + Telegram (heartbeat 3h, alert su anomalia costo). Mig 074.
@@ -244,6 +278,23 @@ async function start() {
     // non solo il danno.
     const { startSellerGuardCron } = require('./services/sellerGuardCron');
     startSellerGuardCron();
+
+    // 🌊 Nuovi nel traffico (ordine capo 21/8 "STACCHIAMOLI", dopo 84 tagli a
+    // mano il 20/8 e 17 il 21/8): ogni giorno alle 14:00 IT stacca chi ha
+    // debuttato nel traffico, non vende da 30gg/90gg e non ha stock fisico.
+    // Chi vende va al guinzaglio (MONITOR), non al taglio. Dopo il motore feed
+    // di proposito: prende gli avanzi del cap condanne, non li ruba. Per tenant.
+    const { startNuoviTrafficoCron } = require('./services/nuoviTrafficoCron');
+    startNuoviTrafficoCron();
+
+    // ⚖️ Verdetto sui tagli (ordine capo 21/8: "controlla che dopo i tagli il
+    // fatturato non scenda insieme alla spesa"). Ogni mattina 08:30 IT:
+    // FASE A congela il PRIMA dei tagli di ieri il giorno stesso (fra una
+    // settimana la finestra "prima" sarebbe già sporca del taglio). FASE B a
+    // 7 giorni giudica, col controfattuale della RETE — agosto scende da solo,
+    // senza paragone esterno si condanna il taglio per una stagione.
+    const { startVerdettoTagliCron } = require('./services/verdettoTagliCron');
+    startVerdettoTagliCron();
 
     // 🧭 Loop del Mantra (ordine capo 19/7): ogni mattina 07:50 IT lo stratega
     // AI legge il quadro fresco e propone 3-5 soluzioni NUOVE (mai ripetute,
@@ -312,6 +363,41 @@ async function start() {
     // avvisa su Telegram — direttiva 9/7
     const { startCostDietMonitor } = require('./services/costDietMonitor');
     startCostDietMonitor();
+
+    // Registro Costi: spazzata /costhistory di Farmabooster ogni 4h (1 tenant,
+    // il più stantio) + guardia oraria che avvisa su Telegram se il registro
+    // non si aggiorna da 4 ore. Il passato lo dà FB, il presente lo fissa il
+    // gradino dentro il sync prodotti — ordine capo 6/8 "avere i costi precisi
+    // cambia tutto"
+    const { startCostHistoryCron } = require('./services/costHistoryCron');
+    startCostHistoryCron();
+
+    // Guardiano consumo budget: ogni 4h rinfresca clicks_consumed /
+    // cost_consumed / max_click_budget / budget_pct_used su feed_actions.
+    // Prima del 15/8 nessuno li scriveva mai dopo la nascita della riga: erano
+    // 0 su tutte le righe e nessuno SKU e' mai stato marcato bruciatore. Non
+    // rimuove niente, e un cancello duro ferma il giro se un candidato ha
+    // fatturato > 0 — ordine capo "il rischio fatturato deve restare 0"
+    const { startBudgetGuardCron } = require('./services/budgetConsumptionCron');
+    startBudgetGuardCron();
+
+    // Monitor coorti di posizione (ordine capo 15/8): il rango salvato e' sul
+    // prezzo SECCO, il cliente ordina sul TOTALE. Il capo ha deciso di non
+    // correggere il misuratore — i fantasmi rendono piu' della vetrina vera —
+    // ma la misura e' di Ferragosto. Questo loop tiene il registro (scraper
+    // retention 7gg) e giudica solo nei periodi di domanda normale.
+    // SOLO MISURA: nessun motore legge queste tabelle per agire.
+    const { startCoortiPosizioneMonitor } = require('./services/coortiPosizioneMonitor');
+    startCoortiPosizioneMonitor();
+
+    // Sentinella blocchi canali (ordine capo 16/8): l'import Farmabooster e'
+    // morto il 13/8 alle 20:31 ed e' rimasto morto TRE GIORNI in silenzio,
+    // mentre i motori tagliavano prezzi su costi stantii. Questo loop guarda
+    // ogni 30 minuti i cinque canali di ingresso (FB, ordini Magento, scraper,
+    // click TP, costi) e avvisa sui CAMBI di stato — non ogni ora, o diventa
+    // rumore e il prossimo blocco passa di nuovo inosservato.
+    const { startBloccoCanaliMonitor } = require('./services/bloccoCanaliMonitor');
+    startBloccoCanaliMonitor();
 
     // Midnight Briefing: ogni notte 00:05 — piano di battaglia del giorno
     // (consuntivo ieri, posizioni, guardie, scadenze, sorvegliati) — direttiva 9/7

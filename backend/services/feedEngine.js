@@ -15,6 +15,7 @@
 const { pool } = require('../db/pool');
 const { resolveStockAndCost, calculatePriceCut, calculateCompetitivePriceCut, calculateRecoveryPriceCut } = require('./feedPriceOptimizer');
 const { loadCrossTenantPriceMap, marginFloor } = require('./crossTenantPricing');
+const { VALID_STATUSES } = require('./magentoOrders');
 
 const DEFAULT_CPC = 0.27; // EUR per click (netto, IVA esclusa)
 
@@ -299,7 +300,10 @@ async function computeFeedActions(tenantId) {
       return m && !ourSellerNames.has(m);
     });
     const externalMin = externalCompetitors.length > 0
-      ? Math.min(...externalCompetitors.map(c => parseFloat(c.total_price) || parseFloat(c.base_price) || Infinity).filter(v => v > 0 && v < Infinity))
+      // PREZZO SECCO (ordine capo 21/8): il floor si misura sul base_price, mai
+      // sul totale. Il totale gonfia del 25% medio (4,61 EUR di spedizione su
+      // 18,21 di prodotto) e il floor gonfiato blocca tagli legittimi.
+      ? Math.min(...externalCompetitors.map(c => parseFloat(c.base_price) || Infinity).filter(v => v > 0 && v < Infinity))
       : null;
 
     // SAFETY: se il min cross-tenant e' SOTTO il min external, e' una guerra interna
@@ -1178,9 +1182,27 @@ async function persistActions(tenantId, actions) {
   // Clear and rewrite — SOLO le righe del motore (arbitro 13/7, giornale n.19):
   // le azioni manuali/di sessione (manual_pepita, manual, capo_pin) e gli
   // scavalchi muro NON si toccano MAI in un rewrite di massa.
+  // 12/8: dentro anche 'agent'. Le righe dell'agente in chat finivano qui e
+  // sparivano, con l'agente convinto di aver agito; nascono con expires_at a 7
+  // giorni, quindi la scadenza le toglie comunque di mezzo.
   await pool.query(
+    // Qui mancavano anche 'pulizia_%' e 'capo_%', che nel motore giornaliero ci
+    // sono da luglio (il rerun aveva spazzato 520 REMOVE della pulizia classe A
+    // e 894 del taglio ordinato dal capo). Oggi `computeFeedActions` non e'
+    // chiamata da nessuno — e' importata da healthCron e mai eseguita — quindi
+    // il buco non ha mai sparato; ma se qualcuno la riaccende deve trovare le
+    // stesse protezioni dell'altro motore, non questa versione di luglio.
+    // `capo!_%` con ESCAPE '!': dentro un template literal JS il classico
+    // 'capo\_%' ESCAPE '\' si sbriciola — le due sequenze diventano `capo_%` e
+    // `ESCAPE ''`. Col punto esclamativo il pattern arriva a Postgres intero.
+    // COALESCE anche sui LIKE: con action_source NULL il confronto tornerebbe
+    // NULL, la riga non verrebbe cancellata e le righe del motore resterebbero
+    // dentro per sempre.
     `DELETE FROM feed_actions WHERE tenant_id = $1
-       AND COALESCE(action_source, 'engine') NOT IN ('manual_pepita', 'manual', 'capo_pin', 'muro_scavalco')`,
+       AND ((COALESCE(action_source, 'engine') NOT IN ('manual_pepita', 'manual', 'capo_pin', 'muro_scavalco', 'agent')
+             AND COALESCE(action_source, 'engine') NOT LIKE 'pulizia!_%' ESCAPE '!'
+             AND COALESCE(action_source, 'engine') NOT LIKE 'capo!_%' ESCAPE '!')
+            OR expires_at < NOW())`,
     [tenantId]);
 
   const BATCH = 100;
@@ -1395,7 +1417,8 @@ async function checkObservationWindows(tenantId) {
       FROM order_items oi
       JOIN orders o ON o.id = oi.order_id AND o.tenant_id = $1
       WHERE oi.sku = $2 AND o.order_date >= $3 AND o.order_date <= $4
-    `, [tenantId, obs.sku, obs.observation_start, obs.observation_end]);
+        AND o.order_status = ANY($5)
+    `, [tenantId, obs.sku, obs.observation_start, obs.observation_end, VALID_STATUSES]);
 
     const obsClicks = parseInt(clickData.clicks) || 0;
     const obsOrders = parseInt(orderData.orders) || 0;

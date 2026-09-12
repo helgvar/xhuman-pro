@@ -16,6 +16,21 @@ const VALID_STATUSES = [
   'Ritirato', 'ritiro_farmacia', 'ritiro_sede_tmp',
 ];
 
+// Stati che SCARICHIAMO ma che non sono vendita: servono solo a correggere
+// un ordine annullato DOPO l'import.
+// Senza di questi il filtro `status` dell'API Magento non li restituisce mai,
+// l'UPSERT di saveOrder() non scatta e l'ordine resta congelato per sempre
+// all'ultimo stato valido — continuando a contare come fatturato.
+// Misurato il 10/8/2026: 3.792 EUR fantasma in 30gg su SubitoFarma+Procaccini+MPF,
+// mentre Papa e Mandanici (che ripiegano sul filtro per sola data) erano corretti.
+const CANCELLED_STATUSES = ['canceled'];
+
+// Lista usata SOLO per costruire il filtro di download.
+// VALID_STATUSES resta l'unica verità di business: ogni conteggio di fatturato,
+// vendite o incidenza filtra su quella, quindi gli annullati sono esclusi
+// per costruzione, non per una lista ricopiata a mano.
+const FETCH_STATUSES = [...VALID_STATUSES, ...CANCELLED_STATUSES];
+
 // Stati che NON pagano spese di spedizione (cliente ritira in negozio).
 // Usato dai calcoli MOL/margine per non addebitare il costo del corriere.
 const PICKUP_STATUSES = new Set(['Ritirato', 'ritiro_farmacia', 'ritiro_sede_tmp']);
@@ -73,7 +88,7 @@ async function fetchMagentoOrders(tenantId, config, dateFrom, dateTo, page = 1) 
     // If it fails (400), fallback to date-only filter
     let statusGroupOffset = 0;
     if (!config._skipStatusFilter) {
-      VALID_STATUSES.forEach((status, i) => {
+      FETCH_STATUSES.forEach((status, i) => {
         params.append(`searchCriteria[filter_groups][0][filters][${i}][field]`, 'status');
         params.append(`searchCriteria[filter_groups][0][filters][${i}][value]`, status);
         params.append(`searchCriteria[filter_groups][0][filters][${i}][condition_type]`, 'eq');
@@ -354,4 +369,7 @@ async function importOrders(tenantId, daysBack = 365, jobId = null) {
   });
 }
 
-module.exports = { importOrders, getMagentoConfig, VALID_STATUSES, PICKUP_STATUSES };
+module.exports = {
+  importOrders, getMagentoConfig,
+  VALID_STATUSES, PICKUP_STATUSES, CANCELLED_STATUSES, FETCH_STATUSES,
+};

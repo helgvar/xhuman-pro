@@ -275,14 +275,23 @@ router.post('/:tenantId/run', async (req, res) => {
       try {
         const { runDailyFeedEngine } = require('../services/feedDailyEngine');
         const feed = await runDailyFeedEngine(tenantId);
-        log('success', `Feed: ${JSON.stringify(feed.stats)} | Incidenza: ${feed.snapshot.incidence.toFixed(1)}%`, {
-          stats: feed.stats,
-          incidence: feed.snapshot.incidence,
-          cost: feed.snapshot.totalCost,
-          revenue: feed.snapshot.totalRevenue,
-          killers: feed.killers,
-          saved: feed.savedCost,
-        });
+        // Il motore puo' tornare senza fotografia: 'no_data' se mancano i click,
+        // 'locked' se un altro ricalcolo dello stesso tenant e' gia' in volo.
+        // Senza questo ramo si andava a leggere feed.snapshot.incidence su un
+        // oggetto che non ce l'ha, e il vero motivo finiva nel catch travestito
+        // da "Feed engine fallito".
+        if (feed?.error) {
+          log('warn', `Feed engine non eseguito: ${feed.error}`);
+        } else {
+          log('success', `Feed: ${JSON.stringify(feed.stats)} | Incidenza: ${feed.snapshot.incidence.toFixed(1)}%`, {
+            stats: feed.stats,
+            incidence: feed.snapshot.incidence,
+            cost: feed.snapshot.totalCost,
+            revenue: feed.snapshot.totalRevenue,
+            killers: feed.killers,
+            saved: feed.savedCost,
+          });
+        }
       } catch (e) {
         log('error', `Feed engine fallito: ${e.message}`);
       }

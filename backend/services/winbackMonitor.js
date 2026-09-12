@@ -151,14 +151,17 @@ async function runWinback() {
                 WHERE pr2.tenant_id = p.tenant_id AND pr2.rule_id = p.price_rule_id), 0),
         tp.max_pos, 10),
         COALESCE(hcp.config_value::int, 0)) AS pos_target,
+      -- PREZZO SECCO (capo 21/8): p.sell_price e' secco, quindi landing e prezzo
+      -- target si leggono su base_price. Col totale il landing risultava sempre
+      -- ottimo (nessuno "sotto di noi") e il winback non partiva mai.
       (SELECT COUNT(*) + 1 FROM scraper_competitors sc
-        WHERE sc.product_code = p.sku AND sc.total_price > 0
+        WHERE sc.product_code = p.sku AND sc.base_price > 0
           AND sc.scraped_at >= NOW() - INTERVAL '48 hours'  -- guardrail freschezza (retention 7g)
-          AND sc.total_price < p.sell_price) AS landing,
-      (SELECT sc.total_price FROM scraper_competitors sc
-        WHERE sc.product_code = p.sku AND sc.total_price > 0
+          AND sc.base_price < p.sell_price) AS landing,
+      (SELECT sc.base_price FROM scraper_competitors sc
+        WHERE sc.product_code = p.sku AND sc.base_price > 0
           AND sc.scraped_at >= NOW() - INTERVAL '48 hours'  -- guardrail freschezza (retention 7g)
-        ORDER BY sc.total_price ASC
+        ORDER BY sc.base_price ASC
         OFFSET GREATEST(COALESCE(
           NULLIF((SELECT (pr3.rule_data->>'scraper_position')::int FROM price_rules pr3
                   WHERE pr3.tenant_id = p.tenant_id AND pr3.rule_id = p.price_rule_id), 0),

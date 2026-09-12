@@ -38,14 +38,15 @@ async function computeBasketMetrics(tenantId, opts = {}) {
   const startedAt = Date.now();
   const { rows } = await pool.query(`
     WITH recent_orders AS (
-      SELECT o.id AS order_id, o.grand_total_products AS cart_value
+      SELECT o.id AS order_id,
+             (o.grand_total - COALESCE(o.shipping_incl_tax, 0)) AS cart_value
       FROM orders o
       WHERE o.tenant_id = $1
         AND o.order_status NOT IN ('canceled','closed','pending_payment')
         AND o.order_date >= NOW() - ($2::int || ' days')::interval
     ),
     cart_items AS (
-      SELECT oi.order_id, oi.sku, oi.row_total, oi.qty_ordered, ro.cart_value
+      SELECT oi.order_id, oi.sku, COALESCE(NULLIF(oi.row_total_incl_tax,0), oi.row_total) AS row_total, oi.qty_ordered, ro.cart_value
       FROM order_items oi
       JOIN recent_orders ro ON ro.order_id = oi.order_id
     ),

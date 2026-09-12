@@ -797,16 +797,84 @@ async function recalculateStableCache(tenantId) {
        AND config_key = 'feed_drop_guard_off' AND config_value = '1'
        AND (expires_at IS NULL OR expires_at > NOW())`, [tenantId]);
     if (guardOff.length === 0 && prevN > 1000 && feedCodes.length < prevN * 0.90) {
+      // 🪂 v2 (capo 12/09, ordine 'procedi su tutti e 3 i punti'): il congelamento
+      // tutto-o-niente non si scioglieva da solo. Misurato il 12/09: Farmacri
+      // fermo a 39.737 codici dal 31/07 (43 giorni), San Vito a 47.363, Ospedale
+      // a 6.270 — il paracadute rientrava a OGNI giro da 30 minuti e la lista
+      // servita non si muoveva più. Ora: primo scatto congela e avvisa; dopo 24h
+      // si concede UNO scalino controllato fino a esattamente -10%, rimpiazzando
+      // il buco con i superstiti del feed precedente che passano ancora le uscite
+      // dure. Il crollo resta limitato al 10% AL GIORNO, non al 10% per rebuild
+      // (a 30 minuti di cadenza un clamp per-rebuild svuoterebbe il feed in un
+      // giorno). Farmacri converge in ~10 giorni restando sempre osservabile.
+      const { rows: sinceRows } = await pool.query(
+        `SELECT EXTRACT(EPOCH FROM (NOW() - config_value::timestamptz)) / 3600 AS ore
+         FROM health_config WHERE tenant_id = $1 AND config_key = 'feed_guard_since'`, [tenantId]);
+      const oreCongelato = sinceRows.length > 0 ? parseFloat(sinceRows[0].ore) : null;
+      const prevCfg = JSON.parse(guardPrev[0].config_value);
+      const prevCodes = prevCfg.codes || [];
+
+      if (oreCongelato !== null && oreCongelato >= 24) {
+        // SCALINO: si scende al massimo a -10% del precedente, ripescando dal
+        // feed vecchio chi supera ancora stock/prezzo/REMOVE/quarantena/oblio/killer.
+        const target = Math.floor(prevN * 0.90);
+        const mancano = target - feedCodes.length;
+        let ripescati = [];
+        if (mancano > 0) {
+          const dentroOra = new Set(feedCodes);
+          const candidati = prevCodes.filter(c => !dentroOra.has(c));
+          if (candidati.length > 0) {
+            const { rows: ripRows } = await pool.query(`
+              SELECT p.sku FROM products p
+              LEFT JOIN feed_actions fa ON fa.tenant_id = p.tenant_id AND fa.sku = p.sku
+              WHERE p.tenant_id = $1 AND p.sku = ANY($2::text[])
+                AND (COALESCE(p.erp_stock, 0) + COALESCE(p.supplier_stock, 0)) > 0
+                AND COALESCE(p.sell_price, 0) > 0
+                AND (fa.action IS NULL OR fa.action <> 'REMOVE')
+                AND NOT EXISTS (SELECT 1 FROM feed_quarantine q
+                                WHERE q.tenant_id = p.tenant_id AND q.sku = p.sku AND NOT q.reactivated)
+                AND NOT EXISTS (SELECT 1 FROM cross_tenant_oblio o
+                                WHERE o.sku = p.sku AND o.status = 'active')
+                AND NOT EXISTS (SELECT 1 FROM feed_killers fk
+                                WHERE fk.tenant_id = p.tenant_id AND fk.sku = p.sku AND fk.is_active)
+              ORDER BY COALESCE(p.sales_30d_seller, 0) DESC, COALESCE(p.margin_pct, 0) DESC
+              LIMIT $3`, [tenantId, candidati, mancano]);
+            ripescati = ripRows.map(r => r.sku);
+          }
+        }
+        feedCodes = feedCodes.concat(ripescati);
+        entry.feedCodes = feedCodes;
+        await pool.query(
+          `INSERT INTO health_config (tenant_id, config_key, config_value)
+           VALUES ($1, 'feed_guard_since', NOW()::text)
+           ON CONFLICT (tenant_id, config_key)
+           DO UPDATE SET config_value = NOW()::text, updated_at = NOW()`, [tenantId]);
+        console.warn(`[FeedStable][T:${tenantId.slice(0, 8)}] 🪂 SCALINO dopo ${Math.round(oreCongelato)}h: ${prevN} → ${feedCodes.length} (tetto ${target}, ripescati ${ripescati.length})`);
+        try {
+          const { sendTelegram } = require('../services/telegramNotifier');
+          await sendTelegram(
+            `🪂 <b>PARACADUTE — SCALINO</b>: feed sceso da ${prevN} a ${feedCodes.length} codici (tetto -10%/giorno, ${ripescati.length} ripescati dal feed precedente). ` +
+            `Prossimo scalino non prima di 24h.`,
+            { key: `feed_guard_step_${tenantId}`, parseMode: 'HTML', throttleMs: 6 * 3600 * 1000 });
+        } catch {}
+        // si prosegue: la lista clampata viene salvata normalmente
+      } else {
+
       console.error(`[FeedStable][T:${tenantId.slice(0, 8)}] 🪂 PARACADUTE: build ${feedCodes.length} vs precedente ${prevN} (oltre -10%) — feed precedente MANTENUTO`);
+      if (oreCongelato === null) {
+        await pool.query(
+          `INSERT INTO health_config (tenant_id, config_key, config_value)
+           VALUES ($1, 'feed_guard_since', NOW()::text)
+           ON CONFLICT (tenant_id, config_key) DO NOTHING`, [tenantId]);
+      }
       try {
         const { sendTelegram } = require('../services/telegramNotifier');
         await sendTelegram(
           `🪂 <b>PARACADUTE FEED</b>: la build voleva ridurre un CSV da ${prevN} a ${feedCodes.length} prodotti (oltre -10%). ` +
-          `Feed precedente MANTENUTO — verificare la causa prima di autorizzare (bypass: feed_drop_guard_off=1).`,
+          `Feed precedente MANTENUTO — fra 24h scatta uno scalino automatico a -10% se la causa resta (bypass immediato: feed_drop_guard_off=1).`,
           { key: `feed_guard_${tenantId}`, parseMode: 'HTML', throttleMs: 2 * 3600 * 1000 });
       } catch {}
-      const prevCfg = JSON.parse(guardPrev[0].config_value);
-      const prevEntry = { feedCodes: prevCfg.codes || [], removeCodes: prevCfg.removeCodes || [], priceCuts, updatedAt };
+      const prevEntry = { feedCodes: prevCodes, removeCodes: prevCfg.removeCodes || [], priceCuts, updatedAt };
       // ⚠️ Ordine capo 10/09: "per niente al mondo i prezzi ai possono andare
       // sotto floor. non esiste nessun veto o nessun ordine manuale che può
       // bloccare il ricalcolo di un prezzo ai che va sotto floor".
@@ -828,6 +896,11 @@ async function recalculateStableCache(tenantId) {
       }
       stableCache.set(tenantId, prevEntry);
       return prevEntry;
+      }
+    } else if (guardOff.length === 0) {
+      // build sana: il contatore del congelamento riparte da zero
+      await pool.query(
+        `DELETE FROM health_config WHERE tenant_id = $1 AND config_key = 'feed_guard_since'`, [tenantId]);
     }
   } catch (e) { console.error('[FeedStable] paracadute err:', e.message); }
 

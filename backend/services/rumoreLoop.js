@@ -104,10 +104,21 @@ async function censisci(tenantId, cpcGross) {
            COALESCE(p.erp_stock, 0) erp_stock,
            COALESCE(NULLIF(p.exported_price,0), NULLIF(p.sell_price,0), 0) prezzo,
            ROUND(cl.click30 * $6::numeric, 2) spesa30,
-           -- larghezza del danno: su quanti tenant fa rumore lo stesso SKU
-           (SELECT COUNT(DISTINCT z.tenant_id) FROM zombie_clicks z
-             WHERE z.product_code = cl.sku AND z.fetch_date >= CURRENT_DATE - 30
-             GROUP BY z.product_code)::int n_tenant_click
+           -- Larghezza del danno: su quanti tenant lo stesso SKU fa RUMORE,
+           -- cioe' sta nella banda 1-4 click. Un tenant dove prende 40 click e'
+           -- un portatore di traffico, non rumore: non deve trascinare lo SKU
+           -- nell'oblio globale (i click >=5 non si tagliano mai in blocco).
+           (SELECT COUNT(*) FROM (
+              SELECT z.tenant_id FROM zombie_clicks z
+               WHERE z.product_code = cl.sku AND z.fetch_date >= CURRENT_DATE - 30
+               GROUP BY z.tenant_id
+              HAVING SUM(z.clicks) BETWEEN $3 AND $4) q)::int n_tenant_rumore,
+           -- e su quanti tenant e' invece esposto sopra la banda
+           (SELECT COUNT(*) FROM (
+              SELECT z.tenant_id FROM zombie_clicks z
+               WHERE z.product_code = cl.sku AND z.fetch_date >= CURRENT_DATE - 30
+               GROUP BY z.tenant_id
+              HAVING SUM(z.clicks) > $4) q)::int n_tenant_sopra_banda
       FROM cl
       JOIN products p ON p.tenant_id = $1 AND p.sku = cl.sku
      WHERE COALESCE(NULLIF(p.exported_price,0), NULLIF(p.sell_price,0), 0) > 0
@@ -155,8 +166,9 @@ async function trattaTenant(tenant, cpcGross, dry) {
 
   const spesa = cand.reduce((s, r) => s + parseFloat(r.spesa30 || 0), 0);
   if (dry) {
-    return { cand: cand.length, oblio: cand.filter(r => r.n_tenant_click >= 2).length,
-      remove: cand.filter(r => r.n_tenant_click < 2).length,
+    const globale = r => r.n_tenant_rumore >= 2 && r.n_tenant_sopra_banda === 0;
+    return { cand: cand.length, oblio: cand.filter(globale).length,
+      remove: cand.filter(r => !globale(r)).length,
       spesa: Math.round(spesa * 100) / 100, dry: true };
   }
 
@@ -172,7 +184,7 @@ async function trattaTenant(tenant, cpcGross, dry) {
       const perche = `rumore: ${r.click30} click 30gg (${r.click90} su 90gg, ${r.settimane} settimane), `
         + `0 vendite OVUNQUE in rete da ${GIORNI_VENDITA}gg. ${r.spesa30} EUR/30gg bruciati.`;
 
-      if (r.n_tenant_click >= 2) {
+      if (r.n_tenant_rumore >= 2 && r.n_tenant_sopra_banda === 0) {
         // Danno di rete: fuori da tutti i negozi in un colpo solo.
         const ins = await client.query(`
           INSERT INTO cross_tenant_oblio (sku, product_name, brand, added_reason,
@@ -180,8 +192,8 @@ async function trattaTenant(tenant, cpcGross, dry) {
           VALUES ($1, $2, $3, $4, $5, $6, $7, 'active')
           ON CONFLICT DO NOTHING`,
           [r.sku, r.prodotto, r.brand,
-           `Rumore di rete: ${r.n_tenant_click} tenant, ${perche}`,
-           r.n_tenant_click, r.click30, r.spesa30]);
+           `Rumore di rete: ${r.n_tenant_rumore} tenant, ${perche}`,
+           r.n_tenant_rumore, r.click30, r.spesa30]);
         oblio += ins.rowCount;
         continue;
       }

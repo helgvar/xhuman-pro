@@ -66,6 +66,23 @@ async function getCfg(key, dflt) {
 // ---------------------------------------------------------------------------
 // FASE A — il bivio: riposiziona o stacca
 // ---------------------------------------------------------------------------
+// Cancello di freschezza sugli ORDINI (13/09): un tenant il cui orders_sync e'
+// vecchio non si giudica. Senza questo, un prodotto venduto dopo l'ultimo sync
+// risulta "mai venduto qui" e viene tagliato — successo davvero su XIOGLICAN,
+// venduto alle 11:22 con sync fermo alle 10:34.
+const ORE_MAX_SYNC_ORDINI = 3;
+
+async function ordiniFreschi(tenantId) {
+  const { rows } = await pool.query(`
+    SELECT MAX(completed_at) ultimo,
+           EXTRACT(EPOCH FROM (NOW() - MAX(completed_at))) / 3600 ore
+      FROM import_jobs
+     WHERE tenant_id = $1 AND job_type = 'orders_sync' AND status = 'completed'`,
+    [tenantId]);
+  const ore = rows[0]?.ore == null ? null : parseFloat(rows[0].ore);
+  return { ok: ore !== null && ore <= ORE_MAX_SYNC_ORDINI, ore };
+}
+
 async function faseA(tenant, cpcGross, capBucket, dry) {
   const client = await pool.connect();
   try {
@@ -105,7 +122,14 @@ async function faseA(tenant, cpcGross, capBucket, dry) {
           -- legge del costo (25/08): niente giudizi su dati stantii
           AND p.updated_at >= NOW() - INTERVAL '12 hours'
           AND vende_in_rete_15g(c.sku)
-          AND NOT vende_su_tenant_15g($1, c.sku)
+          -- "MAI venduto qui" (ordine capo 13/09): 90 giorni, non 15. Con 15gg
+          -- passavano venditori da 25-30 giorni fa e venivano tagliati a torto:
+          -- 116 su 252 al primo giro su Procaccini.
+          AND NOT EXISTS (
+                SELECT 1 FROM order_items oi JOIN orders o ON o.id = oi.order_id
+                 WHERE oi.tenant_id = $1 AND o.tenant_id = $1 AND oi.sku = c.sku
+                   AND o.order_status = ANY($4)
+                   AND o.order_date >= NOW() - INTERVAL '90 days')
           AND NOT is_brand_protected($1, c.sku)
           AND NOT is_basket_protected($1, c.sku)
           AND NOT porta_carrelli_sani($1, c.sku)
@@ -146,7 +170,7 @@ async function faseA(tenant, cpcGross, capBucket, dry) {
          AND (nuovo - costo_v) / costo_v * 100 >= floor_pct) riposizionabile
       FROM calc
       ORDER BY spesa30 DESC`,
-      [tenant.id, cpcGross, MERCHANT_RETE]);
+      [tenant.id, cpcGross, MERCHANT_RETE, ORDER_STATUS]);
 
     // Il bivio. Chi ha spazio prezzo entra in osservazione fino a capienza del
     // tetto di bucket; chi non ne ha esce subito (non c'e' niente da provare).
@@ -173,14 +197,15 @@ async function faseA(tenant, cpcGross, capBucket, dry) {
     }
 
     // --- PRICE_CUT + orologio ---
+    let pcVetati = 0;
     for (const r of daRiposizionare) {
-      await client.query(`
+      const ins = await client.query(`
         INSERT INTO feed_actions (tenant_id, sku, action, action_reason, action_source,
           current_price, recommended_price, erp_cost, cost_source,
           erp_stock, supplier_stock, stock_source, computed_at, expires_at, status)
         VALUES ($1, $2, 'PRICE_CUT', $3, 'pulizia_rete_only', $4, $5, $6, 'guardia',
           $7, $8, CASE WHEN $7 > 0 THEN 'erp' ELSE 'supplier' END,
-          NOW(), NOW() + ($9 || ' days')::interval, 'pending')
+          NOW(), NOW() + make_interval(days => $9::int), 'pending')
         ON CONFLICT ON CONSTRAINT uq_feed_action_tenant_sku DO UPDATE SET
           action = 'PRICE_CUT', action_source = 'pulizia_rete_only',
           action_reason = EXCLUDED.action_reason,
@@ -192,14 +217,19 @@ async function faseA(tenant, cpcGross, capBucket, dry) {
         [tenant.id, r.sku,
          `rete-only (capo 13/09): vende in rete, non qui. ${r.click30} click 30gg = ${r.spesa30} EUR, pos ${r.pos ?? 'n/d'}. PC a ${r.nuovo} (min esterno ${r.p1}), ricarico post ${r.ric_post}% >= floor ${r.floor_pct}%. Orologio ${GIORNI_OSSERVAZIONE}gg.`,
          r.prezzo_vivo, r.nuovo, r.costo_v, r.erp_stock || 0, r.supplier_stock || 0,
-         String(GIORNI_OSSERVAZIONE)]);
+         GIORNI_OSSERVAZIONE]);
+
+      // Il PC vetato non esiste: niente orologio su un riposizionamento mai
+      // avvenuto, altrimenti fra 3 giorni lo si condanna per non aver venduto
+      // a un prezzo che non ha mai avuto.
+      if (ins.rowCount === 0) { pcVetati++; continue; }
 
       await client.query(`
         INSERT INTO rete_only_osservazioni (tenant_id, sku, fase, prezzo_prima, prezzo_dopo,
           costo_prima, ricarico_post_pct, pos_prima, click_prima_30g, spesa_prima_30g,
           activated_at, osservazione_giorni, osservazione_end)
         VALUES ($1, $2, 'riposizionato', $3, $4, $5, $6, $7, $8, $9,
-          NOW(), $10, NOW() + ($10 || ' days')::interval)
+          NOW(), $10::int, NOW() + make_interval(days => $10::int))
         ON CONFLICT (tenant_id, sku) DO UPDATE SET
           fase = 'riposizionato', prezzo_prima = EXCLUDED.prezzo_prima,
           prezzo_dopo = EXCLUDED.prezzo_dopo, costo_prima = EXCLUDED.costo_prima,
@@ -210,7 +240,7 @@ async function faseA(tenant, cpcGross, capBucket, dry) {
           pezzi_dopo = NULL, netto_dopo = NULL, click_dopo = NULL,
           spesa_dopo = NULL, incidenza_dopo = NULL`,
         [tenant.id, r.sku, r.prezzo_vivo, r.nuovo, r.costo_v, r.ric_post,
-         r.pos, r.click30, r.spesa30, String(GIORNI_OSSERVAZIONE)]);
+         r.pos, r.click30, r.spesa30, GIORNI_OSSERVAZIONE]);
     }
 
     // --- REMOVE subito: nessuno spazio prezzo, niente da provare ---
@@ -251,7 +281,7 @@ async function faseA(tenant, cpcGross, capBucket, dry) {
     await client.query('COMMIT');
     return {
       cand: cand.length,
-      pc: land.pc, pcChiesti: daRiposizionare.length,
+      pc: land.pc, pcChiesti: daRiposizionare.length, pcVetati,
       rem: land.rem, remChiesti: daTagliare.length,
       spesaPc: somma(daRiposizionare), spesaRem: somma(daTagliare),
       aperte: imp.aperte
@@ -340,19 +370,13 @@ async function faseB(tenant, cpcGross, incidenzaMax, dry) {
           AND action = 'PRICE_CUT'`, [tenant.id, g.sku]);
     }
 
+    let remVetati = 0;
     for (const g of bocciati) {
       const perche = g.pezzi === 0
         ? `zero pezzi in ${GIORNI_OSSERVAZIONE}gg dopo il riposizionamento (${g.click} click, ${g.spesa} EUR bruciati)`
         : `incidenza ${g.incidenza}% oltre il ${incidenzaMax}% (${g.pezzi} pezzi, ${g.spesa} EUR di click)`;
 
-      await client.query(`
-        UPDATE rete_only_osservazioni SET esito = 'bocciato',
-          motivo_esito = $3, closed_at = NOW(),
-          pezzi_dopo = $4, netto_dopo = $5, click_dopo = $6, spesa_dopo = $7, incidenza_dopo = $8
-        WHERE tenant_id = $1 AND sku = $2`,
-        [tenant.id, g.sku, perche, g.pezzi, g.netto, g.click, g.spesa, g.incidenza]);
-
-      await client.query(`
+      const rem = await client.query(`
         INSERT INTO feed_actions (tenant_id, sku, action, action_reason, action_source,
           current_price, erp_cost, cost_source, computed_at, expires_at, status)
         VALUES ($1, $2, 'REMOVE', $3, 'pulizia_rete_only', $4, $5, 'guardia',
@@ -364,6 +388,27 @@ async function faseB(tenant, cpcGross, incidenzaMax, dry) {
         [tenant.id, g.sku,
          `rete-only BOCCIATO (capo 13/09): ${perche}. Riposizionato da ${g.prezzo_prima} a ${g.prezzo_dopo} il ${new Date(g.activated_at).toLocaleDateString('it-IT')}.`,
          g.prezzo_dopo, g.costo_prima]);
+
+      // Uno scudo ancora in piedi (L2/L4) ha l'ultima parola: il verdetto resta
+      // agli atti, ma il taglio non c'e' stato e non va raccontato come fatto.
+      if (rem.rowCount === 0) {
+        remVetati++;
+        await client.query(`
+          UPDATE rete_only_osservazioni SET esito = 'bocciato_ma_salvato',
+            motivo_esito = $3 || ' | REMOVE respinto da uno scudo ancora attivo (L2/L4): resta nel feed',
+            closed_at = NOW(), pezzi_dopo = $4, netto_dopo = $5,
+            click_dopo = $6, spesa_dopo = $7, incidenza_dopo = $8
+          WHERE tenant_id = $1 AND sku = $2`,
+          [tenant.id, g.sku, perche, g.pezzi, g.netto, g.click, g.spesa, g.incidenza]);
+        continue;
+      }
+
+      await client.query(`
+        UPDATE rete_only_osservazioni SET esito = 'bocciato',
+          motivo_esito = $3, closed_at = NOW(),
+          pezzi_dopo = $4, netto_dopo = $5, click_dopo = $6, spesa_dopo = $7, incidenza_dopo = $8
+        WHERE tenant_id = $1 AND sku = $2`,
+        [tenant.id, g.sku, perche, g.pezzi, g.netto, g.click, g.spesa, g.incidenza]);
 
       await client.query(`
         INSERT INTO feed_quarantine (tenant_id, sku, reason, quarantine_start, quarantine_end,
@@ -391,7 +436,7 @@ async function faseB(tenant, cpcGross, incidenzaMax, dry) {
 
     await client.query('COMMIT');
     return { n: giudizi.length, promossi: promossi.length, bocciati: bocciati.length,
-      tagliati: land.n, spesaBocciati: somma(bocciati, 'spesa_prima_30g') };
+      remVetati, tagliati: land.n, spesaBocciati: somma(bocciati, 'spesa_prima_30g') };
   } catch (e) {
     await client.query('ROLLBACK').catch(() => {});
     console.error(`[ReteOnly] fase B ${tenant.name} err:`, e.message);
@@ -414,6 +459,13 @@ async function runReteOnlyLoop({ dry = false, soloTenant = null } = {}) {
   const esiti = [];
   for (const t of tenants) {
     const cpc = await getTenantCpcGross(t.id);
+    // Fail-closed: senza ordini freschi non si condanna nessuno.
+    const fr = await ordiniFreschi(t.id);
+    if (!fr.ok) {
+      console.log(`[ReteOnly]${dry ? ' DRY' : ''} ${t.name} — SALTATO: orders_sync vecchio di ${fr.ore == null ? 'MAI' : fr.ore.toFixed(1) + 'h'} (max ${ORE_MAX_SYNC_ORDINI}h)`);
+      esiti.push({ tenant: t.name, saltato: true, ore: fr.ore });
+      continue;
+    }
     // Prima il verdetto (chiude i conti aperti), poi il bivio (ne apre di nuovi).
     const b = await faseB(t, cpc, incidenzaMax, dry);
     const a = await faseA(t, cpc, capBucket, dry);

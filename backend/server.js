@@ -238,6 +238,17 @@ async function start() {
     const { startCodaLungaLoop } = require('./services/codaLungaLoop');
     startCodaLungaLoop();
 
+    // 🔁 Loop rete-only (ordine capo 13/09): "se vende nella rete e non sul
+    // singolo tenant, o va riposizionato e monitorato per massimo 3 giorni o va
+    // staccato subito. Se dopo i 3 giorni comunque non vende o non ha
+    // un'incidenza giusta deve essere tagliato". Copre il buco misurato il
+    // 13/09 (546 SKU Procaccini, 293 EUR/30gg, zero pezzi che li toccavano:
+    // tetto lima per-SKU 80 EUR, banco di test solo per i gia' bloccati, scudo
+    // L2-rete senza orologio). Gira 04:45 UTC / 06:45 IT, dopo la lima.
+    // Tetto sul BUCKET, non per SKU: il PASS 4 della lima resta dov'e'. Mig 133.
+    const { start: startReteOnly } = require('./services/reteOnlyLoop');
+    startReteOnly();
+
     // 🛡️ Guardiano PC (ordine capo 24/7): "ogni PC va confermato a ogni loop".
     // Ogni 2h ricalcola costo_vero del momento su ogni PC attivo; se il costo è
     // salito (tipico switch magazzino→grossista) e il margine sfonda il floor,

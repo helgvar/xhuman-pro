@@ -249,6 +249,14 @@ async function start() {
     const { start: startReteOnly } = require('./services/reteOnlyLoop');
     startReteOnly();
 
+    // 🔇 Loop rumore (ordine capo 13/09): "1/4 click e 0 vendite ovunque vanno
+    // in oblio". Settimanale lunedi' 05:15 UTC / 07:15 IT, tetto 400/tenant.
+    // Chi fa rumore su 2+ tenant finisce nell'OBLIO globale, gli altri in
+    // REMOVE locale. Tre cancelli fail-closed: ordini freschi, click freschi,
+    // e nessun conflitto con i dati vendita di Farmabooster.
+    const { start: startRumore } = require('./services/rumoreLoop');
+    startRumore();
+
     // 🛡️ Guardiano PC (ordine capo 24/7): "ogni PC va confermato a ogni loop".
     // Ogni 2h ricalcola costo_vero del momento su ogni PC attivo; se il costo è
     // salito (tipico switch magazzino→grossista) e il margine sfonda il floor,
